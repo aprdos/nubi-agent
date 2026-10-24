@@ -132,6 +132,7 @@ mod tests {
                     text: Some(text.to_string()),
                 }],
                 mentions: None,
+                metadata: None,
             },
         }
     }

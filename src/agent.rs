@@ -264,8 +264,10 @@ impl Agent {
         // Skip posting short confirmations (likely after tool use)
         let trimmed = response.trim();
         let trimmed_lower = trimmed.to_lowercase();
-        let skip_words = ["ok", "done", "sent", "yes", "no", "(empty)", "empty", ".", "*(no response)*", "(no response)"];
-        if trimmed_lower.len() <= 20 && skip_words.iter().any(|w| trimmed_lower == *w) {
+        // Strip trailing punctuation for matching
+        let trimmed_clean = trimmed_lower.trim_end_matches(|c| c == '.' || c == '!' || c == ',');
+        let skip_words = ["ok", "done", "sent", "yes", "no", "empty", "understood", "got it", "will do", "on it"];
+        if trimmed_lower.len() <= 30 && skip_words.iter().any(|w| trimmed_clean == *w || trimmed_lower.contains("(no response)") || trimmed_lower.contains("(empty)")) {
             eprintln!("[nubi-agent] Short confirmation '{}', skipping post", trimmed);
             return Ok(());
         }

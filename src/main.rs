@@ -42,7 +42,8 @@ struct Args {
     #[arg(long, default_value = "5000")]
     rate_limit_ms: u64,
 
-    /// MCP server URL for nubi tools (enables cross-room messaging)
+    /// MCP server URL for nubi tools. Defaults to the engine host on port 8089
+    /// at /mcp (the standard nubi-mcp deployment).
     #[arg(long, env = "NUBI_MCP_URL")]
     mcp_url: Option<String>,
 
@@ -51,11 +52,25 @@ struct Args {
     heartbeat_secs: u64,
 }
 
+/// Derive the standard nubi-mcp URL from the engine URL: same host, port 8089,
+/// path /mcp. Falls back to a localhost default if the engine URL has no host.
+fn default_mcp_url(engine_url: &str) -> String {
+    let (scheme, rest) = engine_url
+        .split_once("://")
+        .unwrap_or(("http", engine_url));
+    let authority = rest.split('/').next().unwrap_or(rest);
+    let host = authority.split(':').next().unwrap_or(authority);
+    let host = if host.is_empty() { "localhost" } else { host };
+    format!("{}://{}:8089/mcp", scheme, host)
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
 
     let nubi = NubiClient::new(&args.url, &args.token, &args.space);
+
+    let mcp_url = Some(args.mcp_url.unwrap_or_else(|| default_mcp_url(&args.url)));
 
     let config = AgentConfig {
         agent_id: args.agent,
@@ -64,10 +79,35 @@ async fn main() -> anyhow::Result<()> {
         skip_permissions: args.skip_permissions,
         context_size: args.context_size,
         rate_limit_ms: args.rate_limit_ms,
-        mcp_url: args.mcp_url,
+        mcp_url,
         heartbeat_interval_secs: args.heartbeat_secs,
     };
 
     let mut agent = Agent::new(nubi, config);
     agent.run().await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::default_mcp_url;
+
+    #[test]
+    fn derives_mcp_url_from_engine() {
+        assert_eq!(
+            default_mcp_url("http://52.205.133.174:9099"),
+            "http://52.205.133.174:8089/mcp"
+        );
+        assert_eq!(
+            default_mcp_url("http://localhost:9099"),
+            "http://localhost:8089/mcp"
+        );
+        assert_eq!(
+            default_mcp_url("https://nubi.example.com"),
+            "https://nubi.example.com:8089/mcp"
+        );
+        assert_eq!(
+            default_mcp_url("http://localhost:9099/"),
+            "http://localhost:8089/mcp"
+        );
+    }
 }
