@@ -73,7 +73,10 @@ impl RoomBuffer {
 
     /// Add a message to the room buffer
     pub fn push(&mut self, room_id: &str, entry: &LogEntry) {
-        let state = self.rooms.entry(room_id.to_string()).or_insert_with(RoomState::new);
+        let state = self
+            .rooms
+            .entry(room_id.to_string())
+            .or_insert_with(RoomState::new);
 
         state.messages.push_back(BufferedMessage {
             sender: entry.sender.clone(),
@@ -94,7 +97,13 @@ impl RoomBuffer {
                 let len = state.messages.len();
                 let skip = len.saturating_sub(self.context_size + 1);
                 let take = len.saturating_sub(1).saturating_sub(skip);
-                state.messages.iter().skip(skip).take(take).cloned().collect()
+                state
+                    .messages
+                    .iter()
+                    .skip(skip)
+                    .take(take)
+                    .cloned()
+                    .collect()
             })
             .unwrap_or_default()
     }
@@ -110,7 +119,10 @@ impl RoomBuffer {
 
     /// Mark that we responded in this room
     pub fn mark_responded(&mut self, room_id: &str) {
-        let state = self.rooms.entry(room_id.to_string()).or_insert_with(RoomState::new);
+        let state = self
+            .rooms
+            .entry(room_id.to_string())
+            .or_insert_with(RoomState::new);
         state.last_response = Some(Instant::now());
     }
 }
@@ -118,7 +130,7 @@ impl RoomBuffer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{Payload, Part};
+    use crate::types::{Part, Payload};
 
     fn make_entry(sender: &str, text: &str, ts: u64) -> LogEntry {
         LogEntry {
@@ -142,7 +154,10 @@ mod tests {
         let mut buffer = RoomBuffer::new().with_context_size(3);
 
         for i in 0..5 {
-            buffer.push("room1", &make_entry("alice", &format!("msg{}", i), i as u64));
+            buffer.push(
+                "room1",
+                &make_entry("alice", &format!("msg{}", i), i as u64),
+            );
         }
 
         let ctx = buffer.context("room1");
@@ -157,7 +172,10 @@ mod tests {
         let mut buffer = RoomBuffer::new().with_buffer_size(3);
 
         for i in 0..10 {
-            buffer.push("room1", &make_entry("alice", &format!("msg{}", i), i as u64));
+            buffer.push(
+                "room1",
+                &make_entry("alice", &format!("msg{}", i), i as u64),
+            );
         }
 
         let state = buffer.rooms.get("room1").unwrap();

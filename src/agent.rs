@@ -53,15 +53,18 @@ pub struct Agent {
     claude: Claude,
     buffer: RoomBuffer,
     start_time_ms: u64,
+    /// Kept to ensure the temp config file isn't deleted while agent runs
+    #[allow(dead_code)]
     mcp_config_path: Option<PathBuf>,
 }
 
 impl Agent {
     pub fn new(nubi: NubiClient, config: AgentConfig) -> Self {
         // Generate MCP config if mcp_url is provided
-        let mcp_config_path = config.mcp_url.as_ref().map(|mcp_url| {
-            Self::generate_mcp_config(&config.agent_id, nubi.token(), mcp_url)
-        });
+        let mcp_config_path = config
+            .mcp_url
+            .as_ref()
+            .map(|mcp_url| Self::generate_mcp_config(&config.agent_id, nubi.token(), mcp_url));
 
         let claude = Claude::new(&config.agent_id)
             .with_skip_permissions(config.skip_permissions)
@@ -269,26 +272,50 @@ impl Agent {
         let trimmed = response.trim();
         let trimmed_lower = trimmed.to_lowercase();
         // Strip trailing punctuation for matching
-        let trimmed_clean = trimmed_lower.trim_end_matches(|c| c == '.' || c == '!' || c == ',');
-        let skip_words = ["ok", "done", "sent", "yes", "no", "empty", "understood", "got it", "will do", "on it"];
-        if trimmed_lower.len() <= 30 && skip_words.iter().any(|w| trimmed_clean == *w || trimmed_lower.contains("(no response)") || trimmed_lower.contains("(empty)")) {
-            eprintln!("[nubi-agent] Short confirmation '{}', skipping post", trimmed);
+        let trimmed_clean = trimmed_lower.trim_end_matches(['.', '!', ',']);
+        let skip_words = [
+            "ok",
+            "done",
+            "sent",
+            "yes",
+            "no",
+            "empty",
+            "understood",
+            "got it",
+            "will do",
+            "on it",
+        ];
+        if trimmed_lower.len() <= 30
+            && skip_words.iter().any(|w| {
+                trimmed_clean == *w
+                    || trimmed_lower.contains("(no response)")
+                    || trimmed_lower.contains("(empty)")
+            })
+        {
+            eprintln!(
+                "[nubi-agent] Short confirmation '{}', skipping post",
+                trimmed
+            );
             return Ok(());
         }
 
         // Skip responses with prompt format leaking at start
         if trimmed.starts_with("Human:") || trimmed.starts_with("Assistant:") {
-            eprintln!("[nubi-agent] Prompt format leaked '{}', skipping post", &trimmed[..trimmed.len().min(50)]);
+            eprintln!(
+                "[nubi-agent] Prompt format leaked '{}', skipping post",
+                &trimmed[..trimmed.len().min(50)]
+            );
             return Ok(());
         }
 
         // Truncate at "Human:" if it appears mid-response (model continuing past its turn)
-        let response = if let Some(idx) = trimmed.find("\nHuman:").or_else(|| trimmed.find(" Human:")) {
-            eprintln!("[nubi-agent] Truncating at leaked 'Human:' (pos {})", idx);
-            trimmed[..idx].trim().to_string()
-        } else {
-            trimmed.to_string()
-        };
+        let response =
+            if let Some(idx) = trimmed.find("\nHuman:").or_else(|| trimmed.find(" Human:")) {
+                eprintln!("[nubi-agent] Truncating at leaked 'Human:' (pos {})", idx);
+                trimmed[..idx].trim().to_string()
+            } else {
+                trimmed.to_string()
+            };
 
         if response.is_empty() {
             eprintln!("[nubi-agent] Response empty after truncation, skipping");

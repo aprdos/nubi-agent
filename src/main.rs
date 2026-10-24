@@ -53,7 +53,11 @@ struct Args {
 
     /// LLM backend for the spawned claude. Defaults to the local gateway on
     /// :5000, which is less aggressive than the raw Anthropic API.
-    #[arg(long, env = "NUBI_LLM_BASE_URL", default_value = "http://localhost:5000")]
+    #[arg(
+        long,
+        env = "NUBI_LLM_BASE_URL",
+        default_value = "http://localhost:5000"
+    )]
     llm_base_url: String,
 
     /// API key for the LLM backend (the gateway's kg- prefixed key).
@@ -69,9 +73,7 @@ struct Args {
 /// Derive the standard nubi-mcp URL from the engine URL: same host, port 8089,
 /// path /mcp. Falls back to a localhost default if the engine URL has no host.
 fn default_mcp_url(engine_url: &str) -> String {
-    let (scheme, rest) = engine_url
-        .split_once("://")
-        .unwrap_or(("http", engine_url));
+    let (scheme, rest) = engine_url.split_once("://").unwrap_or(("http", engine_url));
     let authority = rest.split('/').next().unwrap_or(rest);
     let host = authority.split(':').next().unwrap_or(authority);
     let host = if host.is_empty() { "localhost" } else { host };

@@ -80,9 +80,9 @@ Rules:
 
     pub fn with_system_prompt(mut self, prompt: Option<String>) -> Self {
         // If custom prompt provided, prepend identity
-        self.system_prompt = prompt.map(|p| {
-            format!("You are '{}'. {}", self.agent_id, p)
-        }).or(self.system_prompt);
+        self.system_prompt = prompt
+            .map(|p| format!("You are '{}'. {}", self.agent_id, p))
+            .or(self.system_prompt);
         self
     }
 
@@ -140,7 +140,10 @@ Rules:
             prompt.push('\n');
         }
 
-        prompt.push_str(&format!("[New message from {}]\n{}\n\n[Your response]", sender, message));
+        prompt.push_str(&format!(
+            "[New message from {}]\n{}\n\n[Your response]",
+            sender, message
+        ));
         prompt
     }
 
@@ -178,10 +181,7 @@ Rules:
             cmd.env("ANTHROPIC_API_KEY", key);
         }
 
-        let mut child = cmd
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()?;
+        let mut child = cmd.stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()?;
 
         let mut stdout = String::new();
         if let Some(ref mut out) = child.stdout {
