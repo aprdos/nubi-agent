@@ -64,18 +64,31 @@ sequenceDiagram
     participant N as nubi
     participant A as nubi-agent
     participant C as Claude Code
+    participant M as nubi-mcp
 
     N->>A: SSE: @bot help me debug this
     A->>A: Build prompt + context
-    A->>C: claude -p "..."
+    A->>N: Set typing indicator
+    A->>C: claude -p "..." --mcp-config
     
-    loop Every 30s while processing
-        A-->>N: "still working..."
+    loop Every 5s while processing
+        A-->>N: Refresh typing indicator
+    end
+    
+    opt Claude uses MCP tools
+        C->>M: nubi_send, nubi_poll, etc
+        M->>N: API calls
     end
     
     C->>A: Response
     A->>N: POST response to room
 ```
+
+**Flow:**
+1. nubi-agent listens to nubi's SSE stream for @mentions
+2. When mentioned, builds prompt with conversation context and spawns Claude Code CLI
+3. Claude Code connects to nubi-mcp via generated MCP config for tool access
+4. Claude can respond via stdout (posted by nubi-agent) or use nubi-mcp tools directly
 
 ---
 
@@ -134,7 +147,8 @@ nubi-agent \
 nubi-agent/
 ├── src/
 │   ├── main.rs      # CLI entry point
-│   ├── agent.rs     # Core agent loop + heartbeat
+│   ├── lib.rs       # Library exports
+│   ├── agent.rs     # Core agent loop + typing indicator
 │   ├── claude.rs    # Claude Code invocation
 │   ├── nubi.rs      # Nubi API client
 │   ├── buffer.rs    # Message context buffer
