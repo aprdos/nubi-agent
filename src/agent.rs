@@ -23,6 +23,9 @@ pub struct AgentConfig {
     pub rate_limit_ms: u64,
     pub mcp_url: Option<String>,
     pub heartbeat_interval_secs: u64,
+    pub llm_base_url: Option<String>,
+    pub llm_api_key: Option<String>,
+    pub llm_model: Option<String>,
 }
 
 impl Default for AgentConfig {
@@ -36,6 +39,9 @@ impl Default for AgentConfig {
             rate_limit_ms: 5000,
             mcp_url: None,
             heartbeat_interval_secs: 30,
+            llm_base_url: None,
+            llm_api_key: None,
+            llm_model: None,
         }
     }
 }
@@ -60,7 +66,10 @@ impl Agent {
         let claude = Claude::new(&config.agent_id)
             .with_skip_permissions(config.skip_permissions)
             .with_system_prompt(config.system_prompt.clone())
-            .with_mcp_config(mcp_config_path.as_deref());
+            .with_mcp_config(mcp_config_path.as_deref())
+            .with_llm_base_url(config.llm_base_url.clone())
+            .with_llm_api_key(config.llm_api_key.clone())
+            .with_model(config.llm_model.clone());
 
         let buffer = RoomBuffer::new()
             .with_context_size(config.context_size)
@@ -139,32 +148,24 @@ impl Agent {
         Ok(())
     }
 
-    /// Run Claude with periodic heartbeat messages
-    async fn run_with_heartbeat(&self, room_id: &str, prompt: &str) -> anyhow::Result<String> {
-        let heartbeat_secs = self.config.heartbeat_interval_secs;
-
-        // If heartbeat disabled, just run normally
-        if heartbeat_secs == 0 {
-            return self.claude.run(prompt).await;
-        }
+    /// Run Claude with typing indicator instead of heartbeat messages
+    async fn run_with_typing(&self, room_id: &str, prompt: &str) -> anyhow::Result<String> {
+        let typing_interval_secs = 5;
 
         let done = Arc::new(AtomicBool::new(false));
         let done_clone = done.clone();
         let nubi = self.nubi.clone();
         let room_id_owned = room_id.to_string();
 
-        // Spawn heartbeat task
-        let heartbeat_handle = tokio::spawn(async move {
-            let mut ticker = interval(Duration::from_secs(heartbeat_secs));
-            ticker.tick().await; // Skip first immediate tick
+        // Start typing indicator
+        if let Err(e) = self.nubi.set_typing(room_id, true).await {
+            eprintln!("[nubi-agent] Failed to set typing: {}", e);
+        }
 
-            let messages = [
-                "still working on it...",
-                "thinking...",
-                "processing...",
-                "hang on...",
-            ];
-            let mut i = 0;
+        // Spawn typing refresh task
+        let typing_handle = tokio::spawn(async move {
+            let mut ticker = interval(Duration::from_secs(typing_interval_secs));
+            ticker.tick().await; // Skip first immediate tick
 
             loop {
                 ticker.tick().await;
@@ -173,21 +174,24 @@ impl Agent {
                     break;
                 }
 
-                let msg = messages[i % messages.len()];
-                eprintln!("[nubi-agent] Heartbeat: {}", msg);
-                if let Err(e) = nubi.post(&room_id_owned, msg).await {
-                    eprintln!("[nubi-agent] Heartbeat post failed: {}", e);
+                // Refresh typing indicator
+                if let Err(e) = nubi.set_typing(&room_id_owned, true).await {
+                    eprintln!("[nubi-agent] Failed to refresh typing: {}", e);
                 }
-                i += 1;
             }
         });
 
         // Run Claude
         let result = self.claude.run(prompt).await;
 
-        // Signal heartbeat to stop
+        // Signal typing to stop
         done.store(true, Ordering::Relaxed);
-        heartbeat_handle.abort();
+        typing_handle.abort();
+
+        // Clear typing indicator
+        if let Err(e) = self.nubi.set_typing(room_id, false).await {
+            eprintln!("[nubi-agent] Failed to clear typing: {}", e);
+        }
 
         result
     }
@@ -252,9 +256,9 @@ impl Agent {
             &context,
         );
 
-        // Run Claude with periodic heartbeat
+        // Run Claude with typing indicator
         eprintln!("[nubi-agent] Running claude...");
-        let response = self.run_with_heartbeat(room_id, &prompt).await?;
+        let response = self.run_with_typing(room_id, &prompt).await?;
 
         if response.is_empty() {
             eprintln!("[nubi-agent] Empty response, skipping");

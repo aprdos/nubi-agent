@@ -50,6 +50,20 @@ struct Args {
     /// Heartbeat interval in seconds (0 to disable)
     #[arg(long, default_value = "30")]
     heartbeat_secs: u64,
+
+    /// LLM backend for the spawned claude. Defaults to the local gateway on
+    /// :5000, which is less aggressive than the raw Anthropic API.
+    #[arg(long, env = "NUBI_LLM_BASE_URL", default_value = "http://localhost:5000")]
+    llm_base_url: String,
+
+    /// API key for the LLM backend (the gateway's kg- prefixed key).
+    #[arg(long, env = "NUBI_LLM_KEY")]
+    llm_key: Option<String>,
+
+    /// Model for the spawned claude. The gateway needs dotted IDs
+    /// (e.g. claude-opus-4.5), not the dashed form.
+    #[arg(long, env = "NUBI_LLM_MODEL", default_value = "claude-opus-4.5")]
+    model: String,
 }
 
 /// Derive the standard nubi-mcp URL from the engine URL: same host, port 8089,
@@ -81,6 +95,9 @@ async fn main() -> anyhow::Result<()> {
         rate_limit_ms: args.rate_limit_ms,
         mcp_url,
         heartbeat_interval_secs: args.heartbeat_secs,
+        llm_base_url: Some(args.llm_base_url),
+        llm_api_key: args.llm_key,
+        llm_model: Some(args.model),
     };
 
     let mut agent = Agent::new(nubi, config);

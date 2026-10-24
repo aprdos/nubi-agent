@@ -84,6 +84,28 @@ impl NubiClient {
     pub fn token(&self) -> &str {
         &self.token
     }
+
+    /// Set typing status in a room
+    pub async fn set_typing(&self, room_id: &str, typing: bool) -> anyhow::Result<()> {
+        let resp = self
+            .client
+            .post(format!(
+                "{}/v1/spaces/{}/rooms/{}/typing",
+                self.base_url, self.space, room_id
+            ))
+            .header("Authorization", format!("Bearer {}", self.token))
+            .json(&serde_json::json!({ "typing": typing }))
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            anyhow::bail!("Failed to set typing: {} - {}", status, body);
+        }
+
+        Ok(())
+    }
 }
 
 #[cfg(test)]
