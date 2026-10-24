@@ -45,6 +45,10 @@ struct Args {
     /// MCP server URL for nubi tools (enables cross-room messaging)
     #[arg(long, env = "NUBI_MCP_URL")]
     mcp_url: Option<String>,
+
+    /// Heartbeat interval in seconds (0 to disable)
+    #[arg(long, default_value = "30")]
+    heartbeat_secs: u64,
 }
 
 #[tokio::main]
@@ -61,6 +65,7 @@ async fn main() -> anyhow::Result<()> {
         context_size: args.context_size,
         rate_limit_ms: args.rate_limit_ms,
         mcp_url: args.mcp_url,
+        heartbeat_interval_secs: args.heartbeat_secs,
     };
 
     let mut agent = Agent::new(nubi, config);
