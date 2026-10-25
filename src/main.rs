@@ -109,16 +109,12 @@ mod tests {
     #[test]
     fn derives_mcp_url_from_engine() {
         assert_eq!(
-            default_mcp_url("http://52.205.133.174:9099"),
-            "http://52.205.133.174:8089/mcp"
-        );
-        assert_eq!(
             default_mcp_url("http://localhost:9099"),
             "http://localhost:8089/mcp"
         );
         assert_eq!(
-            default_mcp_url("https://nubi.example.com"),
-            "https://nubi.example.com:8089/mcp"
+            default_mcp_url("https://chat.poimen.io"),
+            "https://chat.poimen.io:8089/mcp"
         );
         assert_eq!(
             default_mcp_url("http://localhost:9099/"),
