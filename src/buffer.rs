@@ -1,5 +1,5 @@
 use std::collections::{HashMap, VecDeque};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crate::types::LogEntry;
 
@@ -108,13 +108,13 @@ impl RoomBuffer {
             .unwrap_or_default()
     }
 
-    /// Check if we're rate limited for this room
-    pub fn is_rate_limited(&self, room_id: &str) -> bool {
+    /// How long before this room is allowed another response, if it's throttled.
+    pub fn rate_limit_remaining(&self, room_id: &str) -> Option<Duration> {
+        let limit = Duration::from_millis(self.rate_limit_ms);
         self.rooms
             .get(room_id)
             .and_then(|state| state.last_response)
-            .map(|last| last.elapsed().as_millis() < self.rate_limit_ms as u128)
-            .unwrap_or(false)
+            .and_then(|last| limit.checked_sub(last.elapsed()))
     }
 
     /// Mark that we responded in this room
@@ -187,13 +187,13 @@ mod tests {
     fn test_rate_limiting() {
         let mut buffer = RoomBuffer::new().with_rate_limit_ms(100);
 
-        assert!(!buffer.is_rate_limited("room1"));
+        assert!(buffer.rate_limit_remaining("room1").is_none());
 
         buffer.mark_responded("room1");
-        assert!(buffer.is_rate_limited("room1"));
+        assert!(buffer.rate_limit_remaining("room1").is_some());
 
-        std::thread::sleep(std::time::Duration::from_millis(150));
-        assert!(!buffer.is_rate_limited("room1"));
+        std::thread::sleep(Duration::from_millis(150));
+        assert!(buffer.rate_limit_remaining("room1").is_none());
     }
 
     #[test]

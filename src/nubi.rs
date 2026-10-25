@@ -1,7 +1,16 @@
 use reqwest::Client;
+use serde::Deserialize;
+use std::time::Duration;
 use uuid::Uuid;
 
 use crate::types::{SendMessage, SendPart};
+
+#[derive(Deserialize)]
+struct CommitResp {
+    committed: u64,
+}
+
+const POST_ATTEMPTS: u32 = 3;
 
 /// Nubi API client for posting messages
 #[derive(Clone)]
@@ -37,7 +46,10 @@ impl NubiClient {
         Ok(())
     }
 
-    /// Post a message to a room (with no_reply flag to prevent loops)
+    /// Post a message to a room (with no_reply flag to prevent loops).
+    ///
+    /// Retried on transport and 5xx failures. The message_id is generated once
+    /// up front so a retry is deduplicated server-side instead of double-posting.
     pub async fn post(&self, room_id: &str, text: &str) -> anyhow::Result<()> {
         let msg = SendMessage {
             message_id: Uuid::new_v4().to_string(),
@@ -49,24 +61,48 @@ impl NubiClient {
             metadata: Some(serde_json::json!({"no_reply": true})),
         };
 
-        let resp = self
-            .client
-            .post(format!(
-                "{}/v1/spaces/{}/rooms/{}/messages",
-                self.base_url, self.space, room_id
-            ))
-            .header("Authorization", format!("Bearer {}", self.token))
-            .json(&msg)
-            .send()
-            .await?;
+        let url = format!(
+            "{}/v1/spaces/{}/rooms/{}/messages",
+            self.base_url, self.space, room_id
+        );
 
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            anyhow::bail!("Failed to post message: {} - {}", status, body);
+        let mut last_err = String::new();
+        for attempt in 1..=POST_ATTEMPTS {
+            match self
+                .client
+                .post(&url)
+                .header("Authorization", format!("Bearer {}", self.token))
+                .json(&msg)
+                .send()
+                .await
+            {
+                Ok(resp) => {
+                    let status = resp.status();
+                    if status.is_success() {
+                        return Ok(());
+                    }
+                    let body = resp.text().await.unwrap_or_default();
+                    last_err = format!("{} - {}", status, body);
+                    if !status.is_server_error() {
+                        break;
+                    }
+                }
+                Err(e) => last_err = e.to_string(),
+            }
+
+            if attempt < POST_ATTEMPTS {
+                let backoff = Duration::from_millis(500 * (1 << (attempt - 1)));
+                eprintln!(
+                    "[nubi-agent] Post to {} failed ({}), retrying in {}ms",
+                    room_id,
+                    last_err,
+                    backoff.as_millis()
+                );
+                tokio::time::sleep(backoff).await;
+            }
         }
 
-        Ok(())
+        anyhow::bail!("Failed to post message to {}: {}", room_id, last_err)
     }
 
     /// Build SSE stream URL
@@ -83,6 +119,31 @@ impl NubiClient {
 
     pub fn token(&self) -> &str {
         &self.token
+    }
+
+    /// Commit a read offset for this room and return the server's resulting value.
+    ///
+    /// The server clamps monotonically, so committing 0 reads back the current
+    /// offset without moving it — that is how a cold room is detected.
+    pub async fn commit_offset(&self, room_id: &str, index: u64) -> anyhow::Result<u64> {
+        let resp = self
+            .client
+            .post(format!(
+                "{}/v1/spaces/{}/rooms/{}/offset",
+                self.base_url, self.space, room_id
+            ))
+            .header("Authorization", format!("Bearer {}", self.token))
+            .json(&serde_json::json!({ "index": index }))
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            anyhow::bail!("Failed to commit offset: {} - {}", status, body);
+        }
+
+        Ok(resp.json::<CommitResp>().await?.committed)
     }
 
     /// Set typing status in a room

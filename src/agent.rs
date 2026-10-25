@@ -1,16 +1,28 @@
 use eventsource_client::Client;
 use futures::StreamExt;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use tokio::sync::Semaphore;
 use tokio::time::interval;
 
 use crate::buffer::RoomBuffer;
 use crate::claude::Claude;
 use crate::nubi::NubiClient;
 use crate::types::SseData;
+
+/// How long a room's incoming burst is allowed to settle before we pick a
+/// message to answer. Collapses a backlog into one reply to the newest message.
+const COALESCE_WINDOW_MS: u64 = 500;
+
+/// How often pending read offsets are pushed to the server.
+const OFFSET_FLUSH_SECS: u64 = 2;
+
+/// Ceiling on simultaneously running claude processes across all rooms.
+const MAX_CONCURRENT_REPLIES: usize = 4;
 
 /// Configuration for the agent
 #[derive(Debug, Clone)]
@@ -46,13 +58,44 @@ impl Default for AgentConfig {
     }
 }
 
-/// The main agent that listens to nubi and responds via Claude
-pub struct Agent {
+/// The message a room worker will answer. Only the newest one per room is kept.
+struct Trigger {
+    sender: String,
+    text: String,
+}
+
+/// Which rooms have a pending message and which already have a worker running.
+#[derive(Default)]
+struct Dispatch {
+    pending: HashMap<String, Trigger>,
+    active: HashSet<String>,
+}
+
+/// Read positions: highest index delivered per room, and what the server has acked.
+#[derive(Default)]
+struct Offsets {
+    seen: HashMap<String, u64>,
+    committed: HashMap<String, u64>,
+}
+
+/// State shared between the SSE loop, the offset flusher and the room workers.
+struct Shared {
     config: AgentConfig,
     nubi: NubiClient,
     claude: Claude,
-    buffer: RoomBuffer,
+    buffer: Mutex<RoomBuffer>,
+    dispatch: Mutex<Dispatch>,
+    offsets: Mutex<Offsets>,
+    /// Whether a room had never acked an offset when we first saw it. Decided
+    /// once and never revised, so the flusher's own commits can't flip it.
+    cold: Mutex<HashMap<String, bool>>,
+    replies: Semaphore,
     start_time_ms: u64,
+}
+
+/// The main agent that listens to nubi and responds via Claude
+pub struct Agent {
+    shared: Arc<Shared>,
     /// Kept to ensure the temp config file isn't deleted while agent runs
     #[allow(dead_code)]
     mcp_config_path: Option<PathBuf>,
@@ -84,11 +127,17 @@ impl Agent {
             .as_millis() as u64;
 
         Self {
-            config,
-            nubi,
-            claude,
-            buffer,
-            start_time_ms,
+            shared: Arc::new(Shared {
+                config,
+                nubi,
+                claude,
+                buffer: Mutex::new(buffer),
+                dispatch: Mutex::new(Dispatch::default()),
+                offsets: Mutex::new(Offsets::default()),
+                cold: Mutex::new(HashMap::new()),
+                replies: Semaphore::new(MAX_CONCURRENT_REPLIES),
+                start_time_ms,
+            }),
             mcp_config_path,
         }
     }
@@ -119,16 +168,21 @@ impl Agent {
     pub async fn run(&mut self) -> anyhow::Result<()> {
         // Verify setup
         Claude::check_available().await?;
-        self.nubi.verify().await?;
+        self.shared.nubi.verify().await?;
 
         eprintln!(
             "[nubi-agent] Connected as '{}', listening for mentions...",
-            self.config.agent_id
+            self.shared.config.agent_id
         );
 
-        let sse_url = self.nubi.stream_url(&self.config.rooms);
+        let flusher = tokio::spawn(flush_offsets(Arc::clone(&self.shared)));
+
+        let sse_url = self.shared.nubi.stream_url(&self.shared.config.rooms);
         let es = eventsource_client::ClientBuilder::for_url(&sse_url)?
-            .header("Authorization", &format!("Bearer {}", self.nubi.token()))?
+            .header(
+                "Authorization",
+                &format!("Bearer {}", self.shared.nubi.token()),
+            )?
             .build();
 
         let mut stream = es.stream();
@@ -136,130 +190,186 @@ impl Agent {
         while let Some(event) = stream.next().await {
             match event {
                 Ok(eventsource_client::SSE::Event(ev)) if ev.event_type == "entry" => {
-                    if let Err(e) = self.handle_event(&ev.data).await {
+                    if let Err(e) = self.shared.ingest(&ev.data).await {
                         eprintln!("[nubi-agent] Error: {}", e);
                     }
                 }
                 Ok(_) => {}
                 Err(e) => {
                     eprintln!("[nubi-agent] SSE error: {}, reconnecting...", e);
-                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                    tokio::time::sleep(Duration::from_secs(5)).await;
                 }
             }
         }
 
+        flusher.abort();
         Ok(())
     }
+}
 
-    /// Run Claude with typing indicator instead of heartbeat messages
-    async fn run_with_typing(&self, room_id: &str, prompt: &str) -> anyhow::Result<String> {
-        let typing_interval_secs = 5;
+/// Push pending read offsets to the server so a reconnect resumes where we
+/// stopped instead of replaying the room from the first entry.
+async fn flush_offsets(shared: Arc<Shared>) {
+    let mut ticker = interval(Duration::from_secs(OFFSET_FLUSH_SECS));
+    loop {
+        ticker.tick().await;
 
-        let done = Arc::new(AtomicBool::new(false));
-        let done_clone = done.clone();
-        let nubi = self.nubi.clone();
-        let room_id_owned = room_id.to_string();
+        let due: Vec<(String, u64)> = {
+            let offsets = shared.offsets.lock().unwrap();
+            offsets
+                .seen
+                .iter()
+                .filter(|(room, idx)| {
+                    offsets.committed.get(*room).copied().unwrap_or(0) < **idx
+                })
+                .map(|(room, idx)| (room.clone(), *idx))
+                .collect()
+        };
 
-        // Start typing indicator
-        if let Err(e) = self.nubi.set_typing(room_id, true).await {
-            eprintln!("[nubi-agent] Failed to set typing: {}", e);
-        }
-
-        // Spawn typing refresh task
-        let typing_handle = tokio::spawn(async move {
-            let mut ticker = interval(Duration::from_secs(typing_interval_secs));
-            ticker.tick().await; // Skip first immediate tick
-
-            loop {
-                ticker.tick().await;
-
-                if done_clone.load(Ordering::Relaxed) {
-                    break;
+        for (room, idx) in due {
+            match shared.nubi.commit_offset(&room, idx).await {
+                Ok(committed) => {
+                    shared
+                        .offsets
+                        .lock()
+                        .unwrap()
+                        .committed
+                        .insert(room, committed);
                 }
-
-                // Refresh typing indicator
-                if let Err(e) = nubi.set_typing(&room_id_owned, true).await {
-                    eprintln!("[nubi-agent] Failed to refresh typing: {}", e);
-                }
+                Err(e) => eprintln!("[nubi-agent] Failed to commit offset for {}: {}", room, e),
             }
-        });
-
-        // Run Claude
-        let result = self.claude.run(prompt).await;
-
-        // Signal typing to stop
-        done.store(true, Ordering::Relaxed);
-        typing_handle.abort();
-
-        // Clear typing indicator
-        if let Err(e) = self.nubi.set_typing(room_id, false).await {
-            eprintln!("[nubi-agent] Failed to clear typing: {}", e);
         }
-
-        result
     }
+}
 
-    async fn handle_event(&mut self, data: &str) -> anyhow::Result<()> {
+impl Shared {
+    /// Handle one SSE entry: record its offset, buffer it for context, and
+    /// queue it as the room's next trigger if it's addressed to us.
+    async fn ingest(self: &Arc<Self>, data: &str) -> anyhow::Result<()> {
         let sse_data: SseData = serde_json::from_str(data)?;
-        let room_id = &sse_data.room_id;
-        let entry = &sse_data.entry;
+        let room_id = sse_data.room_id;
+        let entry = sse_data.entry;
 
-        // Always buffer messages for context
+        // Every delivered entry advances the read position, answered or not.
+        self.note_offset(&room_id, entry.global_index);
+
         if entry.is_message() {
-            self.buffer.push(room_id, entry);
-        }
-
-        // Skip historical messages
-        if entry.timestamp_ms < self.start_time_ms {
+            self.buffer.lock().unwrap().push(&room_id, &entry);
+        } else {
             return Ok(());
         }
 
-        // Skip own messages
-        if entry.sender == self.config.agent_id {
+        if entry.sender == self.config.agent_id || entry.no_reply() {
             return Ok(());
         }
 
-        // Skip non-message events
-        if !entry.is_message() {
-            return Ok(());
-        }
-
-        // Check if mentioned (skip check for DMs - always respond)
+        // DMs always get a reply; group rooms need an explicit mention.
         let is_dm = room_id.starts_with("dm.");
         if !is_dm && !entry.mentions(&self.config.agent_id) {
             return Ok(());
         }
 
-        // Skip messages with no_reply flag (prevents agent loops)
-        if entry.no_reply() {
+        // A room we have never acked replays its entire history on connect.
+        // Only there do we fall back to "ignore anything older than this process".
+        if entry.timestamp_ms < self.start_time_ms && self.is_cold(&room_id).await {
             return Ok(());
         }
 
-        // Check rate limit
-        if self.buffer.is_rate_limited(room_id) {
-            eprintln!("[nubi-agent] Rate limited in {}, skipping", room_id);
-            return Ok(());
+        self.enqueue(
+            &room_id,
+            Trigger {
+                sender: entry.sender.clone(),
+                text: entry.text(),
+            },
+        );
+
+        Ok(())
+    }
+
+    fn note_offset(&self, room_id: &str, index: u64) {
+        let mut offsets = self.offsets.lock().unwrap();
+        let seen = offsets.seen.entry(room_id.to_string()).or_insert(0);
+        if index > *seen {
+            *seen = index;
+        }
+    }
+
+    async fn is_cold(&self, room_id: &str) -> bool {
+        if let Some(&cold) = self.cold.lock().unwrap().get(room_id) {
+            return cold;
         }
 
-        let text = entry.text();
+        let committed = self.nubi.commit_offset(room_id, 0).await.unwrap_or(0);
+        let cold = committed == 0;
+        self.cold.lock().unwrap().insert(room_id.to_string(), cold);
+        cold
+    }
+
+    /// Make this the room's pending message, starting a worker if none runs.
+    fn enqueue(self: &Arc<Self>, room_id: &str, trigger: Trigger) {
+        let mut dispatch = self.dispatch.lock().unwrap();
+        dispatch.pending.insert(room_id.to_string(), trigger);
+        if !dispatch.active.insert(room_id.to_string()) {
+            return;
+        }
+        drop(dispatch);
+
+        let shared = Arc::clone(self);
+        let room_id = room_id.to_string();
+        tokio::spawn(async move { shared.serve_room(room_id).await });
+    }
+
+    /// Answer a room's pending messages one at a time until none are left.
+    /// Rooms run independently, so a slow reply in one doesn't stall the others.
+    async fn serve_room(self: Arc<Self>, room_id: String) {
+        loop {
+            tokio::time::sleep(Duration::from_millis(COALESCE_WINDOW_MS)).await;
+
+            let wait = self
+                .buffer
+                .lock()
+                .unwrap()
+                .rate_limit_remaining(&room_id);
+            if let Some(wait) = wait {
+                tokio::time::sleep(wait).await;
+            }
+
+            let trigger = {
+                let mut dispatch = self.dispatch.lock().unwrap();
+                match dispatch.pending.remove(&room_id) {
+                    Some(trigger) => trigger,
+                    None => {
+                        dispatch.active.remove(&room_id);
+                        return;
+                    }
+                }
+            };
+
+            if let Err(e) = self.reply(&room_id, &trigger).await {
+                eprintln!("[nubi-agent] Error in {}: {}", room_id, e);
+            }
+        }
+    }
+
+    async fn reply(&self, room_id: &str, trigger: &Trigger) -> anyhow::Result<()> {
+        let _permit = self.replies.acquire().await?;
+
         eprintln!(
             "[nubi-agent] @{} in {}: {}",
             self.config.agent_id,
             room_id,
-            text.chars().take(50).collect::<String>()
+            trigger.text.chars().take(50).collect::<String>()
         );
 
-        // Build prompt with context
-        let context = self.buffer.context(room_id);
+        let context = self.buffer.lock().unwrap().context(room_id);
         let prompt = self.claude.build_prompt(
             &self.config.agent_id,
             room_id,
-            &entry.sender,
-            &text,
+            &trigger.sender,
+            &trigger.text,
             &context,
         );
 
-        // Run Claude with typing indicator
         eprintln!("[nubi-agent] Running claude...");
         let response = self.run_with_typing(room_id, &prompt).await?;
 
@@ -322,12 +432,59 @@ impl Agent {
             return Ok(());
         }
 
-        // Post response
         eprintln!("[nubi-agent] Responding ({} chars)", response.len());
         self.nubi.post(room_id, &response).await?;
-        self.buffer.mark_responded(room_id);
+        self.buffer.lock().unwrap().mark_responded(room_id);
 
         Ok(())
+    }
+
+    /// Run Claude with typing indicator instead of heartbeat messages
+    async fn run_with_typing(&self, room_id: &str, prompt: &str) -> anyhow::Result<String> {
+        let typing_interval_secs = 5;
+
+        let done = Arc::new(AtomicBool::new(false));
+        let done_clone = done.clone();
+        let nubi = self.nubi.clone();
+        let room_id_owned = room_id.to_string();
+
+        // Start typing indicator
+        if let Err(e) = self.nubi.set_typing(room_id, true).await {
+            eprintln!("[nubi-agent] Failed to set typing: {}", e);
+        }
+
+        // Spawn typing refresh task
+        let typing_handle = tokio::spawn(async move {
+            let mut ticker = interval(Duration::from_secs(typing_interval_secs));
+            ticker.tick().await; // Skip first immediate tick
+
+            loop {
+                ticker.tick().await;
+
+                if done_clone.load(Ordering::Relaxed) {
+                    break;
+                }
+
+                // Refresh typing indicator
+                if let Err(e) = nubi.set_typing(&room_id_owned, true).await {
+                    eprintln!("[nubi-agent] Failed to refresh typing: {}", e);
+                }
+            }
+        });
+
+        // Run Claude
+        let result = self.claude.run(prompt).await;
+
+        // Signal typing to stop
+        done.store(true, Ordering::Relaxed);
+        typing_handle.abort();
+
+        // Clear typing indicator
+        if let Err(e) = self.nubi.set_typing(room_id, false).await {
+            eprintln!("[nubi-agent] Failed to clear typing: {}", e);
+        }
+
+        result
     }
 }
 
