@@ -7,12 +7,8 @@ use nubi_agent::{Agent, AgentConfig, NubiClient};
 #[command(version)]
 struct Args {
     /// Nubi server URL
-    #[arg(long, env = "NUBI_URL", default_value = "http://localhost:9099")]
+    #[arg(long, env = "NUBI_URL", default_value = "https://chat.poimen.io")]
     url: String,
-
-    /// Agent ID (your identity in the room)
-    #[arg(long, env = "NUBI_AGENT")]
-    agent: String,
 
     /// API token
     #[arg(long, env = "NUBI_TOKEN")]
@@ -68,11 +64,18 @@ struct Args {
 
 /// Derive the standard nubi-mcp URL from the engine URL: same host, port 8089,
 /// path /mcp. Falls back to a localhost default if the engine URL has no host.
+/// For the production domain (chat.poimen.io), uses mcp.poimen.io instead.
 fn default_mcp_url(engine_url: &str) -> String {
     let (scheme, rest) = engine_url.split_once("://").unwrap_or(("http", engine_url));
     let authority = rest.split('/').next().unwrap_or(rest);
     let host = authority.split(':').next().unwrap_or(authority);
     let host = if host.is_empty() { "localhost" } else { host };
+
+    // Production uses dedicated subdomains instead of port-based routing
+    if host == "chat.poimen.io" {
+        return format!("{}://mcp.poimen.io/mcp", scheme);
+    }
+
     format!("{}://{}:8089/mcp", scheme, host)
 }
 
@@ -82,10 +85,11 @@ async fn main() -> anyhow::Result<()> {
 
     let nubi = NubiClient::connect(&args.url, &args.token).await?;
 
+    let agent_id = nubi.agent_id().to_string();
     let mcp_url = Some(args.mcp_url.unwrap_or_else(|| default_mcp_url(&args.url)));
 
     let config = AgentConfig {
-        agent_id: args.agent,
+        agent_id,
         rooms: args.rooms,
         system_prompt: args.system_prompt,
         skip_permissions: args.skip_permissions,
@@ -119,6 +123,11 @@ mod tests {
         assert_eq!(
             default_mcp_url("http://localhost:9099/"),
             "http://localhost:8089/mcp"
+        );
+        // Production domain uses dedicated subdomain
+        assert_eq!(
+            default_mcp_url("https://chat.poimen.io"),
+            "https://mcp.poimen.io/mcp"
         );
     }
 }
