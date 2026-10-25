@@ -7,7 +7,7 @@ use nubi_agent::{Agent, AgentConfig, NubiClient};
 #[command(version)]
 struct Args {
     /// Nubi server URL
-    #[arg(long, env = "NUBI_URL", default_value = "http://localhost:9099")]
+    #[arg(long, env = "NUBI_URL", default_value = "https://chat.poimen.io")]
     url: String,
 
     /// Agent ID (your identity in the room)
@@ -68,11 +68,18 @@ struct Args {
 
 /// Derive the standard nubi-mcp URL from the engine URL: same host, port 8089,
 /// path /mcp. Falls back to a localhost default if the engine URL has no host.
+/// For the production domain (chat.poimen.io), uses mcp.poimen.io instead.
 fn default_mcp_url(engine_url: &str) -> String {
     let (scheme, rest) = engine_url.split_once("://").unwrap_or(("http", engine_url));
     let authority = rest.split('/').next().unwrap_or(rest);
     let host = authority.split(':').next().unwrap_or(authority);
     let host = if host.is_empty() { "localhost" } else { host };
+
+    // Production uses dedicated subdomains instead of port-based routing
+    if host == "chat.poimen.io" {
+        return format!("{}://mcp.poimen.io/mcp", scheme);
+    }
+
     format!("{}://{}:8089/mcp", scheme, host)
 }
 
@@ -123,6 +130,11 @@ mod tests {
         assert_eq!(
             default_mcp_url("http://localhost:9099/"),
             "http://localhost:8089/mcp"
+        );
+        // Production domain uses dedicated subdomain
+        assert_eq!(
+            default_mcp_url("https://chat.poimen.io"),
+            "https://mcp.poimen.io/mcp"
         );
     }
 }
