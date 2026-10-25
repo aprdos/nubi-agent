@@ -408,13 +408,9 @@ impl Shared {
         );
 
         let context = self.buffer.lock().unwrap().context(room_id);
-        let prompt = self.claude.build_prompt(
-            &self.config.agent_id,
-            room_id,
-            &trigger.sender,
-            &trigger.text,
-            &context,
-        );
+        let prompt = self
+            .claude
+            .build_prompt(room_id, &trigger.sender, &trigger.text, &context);
 
         eprintln!("[nubi-agent] Running claude...");
         let response = self.run_with_typing(room_id, &prompt).await?;

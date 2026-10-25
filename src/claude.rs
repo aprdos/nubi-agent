@@ -167,7 +167,6 @@ Rules:
     /// Build prompt with conversation context
     pub fn build_prompt(
         &self,
-        _agent_id: &str,
         room_id: &str,
         sender: &str,
         message: &str,
@@ -283,7 +282,7 @@ mod tests {
     #[test]
     fn test_build_prompt_no_context() {
         let claude = Claude::new("bot");
-        let prompt = claude.build_prompt("bot", "general", "alice", "hello", &[]);
+        let prompt = claude.build_prompt("general", "alice", "hello", &[]);
         assert_eq!(
             prompt,
             "[Group room — room_id: general]\n\n[New message from alice]\nhello\n\n[Your response]"
@@ -293,14 +292,14 @@ mod tests {
     #[test]
     fn group_prompt_carries_the_room_id() {
         let claude = Claude::new("bot");
-        let prompt = claude.build_prompt("bot", "room-watercooler", "alice", "hi", &[]);
+        let prompt = claude.build_prompt("room-watercooler", "alice", "hi", &[]);
         assert!(prompt.starts_with("[Group room — room_id: room-watercooler]"));
     }
 
     #[test]
     fn dm_prompt_names_the_other_side() {
         let claude = Claude::new("bot");
-        let prompt = claude.build_prompt("bot", "dm.alice.bot", "alice", "hi", &[]);
+        let prompt = claude.build_prompt("dm.alice.bot", "alice", "hi", &[]);
         assert!(prompt.starts_with("[DM with alice — room_id: dm.alice.bot]"));
         assert!(!prompt.contains("Group room"));
     }
@@ -320,7 +319,7 @@ mod tests {
                 timestamp_ms: 2000,
             },
         ];
-        let prompt = claude.build_prompt("bot", "general", "alice", "hello", &context);
+        let prompt = claude.build_prompt("general", "alice", "hello", &context);
         assert!(prompt.contains("bob: hey everyone"));
         assert!(prompt.contains("[New message from alice]\nhello"));
     }
