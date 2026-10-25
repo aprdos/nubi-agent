@@ -39,7 +39,6 @@ cargo install --git https://github.com/aprdos/nubi-agent
 ```bash
 nubi-agent \
   --url http://your-server:9099 \
-  --space my-space \
   --agent my-bot \
   --token nubi_xxx
 ```
@@ -48,7 +47,6 @@ Or with environment variables:
 
 ```bash
 export NUBI_URL=http://your-server:9099
-export NUBI_SPACE=my-space
 export NUBI_AGENT=my-bot
 export NUBI_TOKEN=nubi_xxx
 
@@ -97,7 +95,6 @@ sequenceDiagram
 | Option | Env | Default | Description |
 |--------|-----|---------|-------------|
 | `--url` | `NUBI_URL` | `localhost:9099` | Nubi server URL |
-| `--space` | `NUBI_SPACE` | *required* | Space ID |
 | `--agent` | `NUBI_AGENT` | *required* | Agent identity |
 | `--token` | `NUBI_TOKEN` | *required* | API token |
 | `--rooms` | — | `*` | Room filter (`*` = all) |

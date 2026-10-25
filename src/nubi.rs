@@ -10,6 +10,11 @@ struct CommitResp {
     committed: u64,
 }
 
+#[derive(Deserialize)]
+struct Me {
+    space_id: String,
+}
+
 const POST_ATTEMPTS: u32 = 3;
 
 /// Nubi API client for posting messages
@@ -31,19 +36,36 @@ impl NubiClient {
         }
     }
 
-    /// Verify the token is valid
-    pub async fn verify(&self) -> anyhow::Result<()> {
-        let resp = self
-            .client
-            .get(format!("{}/v1/me", self.base_url))
-            .header("Authorization", format!("Bearer {}", self.token))
+    /// Build a client whose space comes from the token itself.
+    ///
+    /// The space id sits in every request path, so one that disagrees with the
+    /// key 403s every call while the key itself is perfectly fine — a failure
+    /// that reads like a permissions problem and isn't. The server already
+    /// knows which space a key belongs to, so ask it rather than being told.
+    ///
+    /// The server's own error body is passed through: "key has been revoked"
+    /// is worth far more than a generic "invalid token".
+    pub async fn connect(base_url: &str, token: &str) -> anyhow::Result<Self> {
+        let base_url = base_url.trim_end_matches('/');
+        let resp = Client::new()
+            .get(format!("{}/v1/me", base_url))
+            .header("Authorization", format!("Bearer {}", token))
             .send()
-            .await?;
+            .await
+            .map_err(|e| anyhow::anyhow!("Cannot reach nubi at {}: {}", base_url, e))?;
 
         if !resp.status().is_success() {
-            anyhow::bail!("Invalid token or cannot reach nubi at {}", self.base_url);
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            anyhow::bail!("Rejected by nubi at {}: {} {}", base_url, status, body);
         }
-        Ok(())
+
+        let me: Me = resp.json().await?;
+        Ok(Self::new(base_url, token, &me.space_id))
+    }
+
+    pub fn space(&self) -> &str {
+        &self.space
     }
 
     /// Post a message to a room.

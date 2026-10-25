@@ -10,10 +10,6 @@ struct Args {
     #[arg(long, env = "NUBI_URL", default_value = "http://localhost:9099")]
     url: String,
 
-    /// Space ID
-    #[arg(long, env = "NUBI_SPACE")]
-    space: String,
-
     /// Agent ID (your identity in the room)
     #[arg(long, env = "NUBI_AGENT")]
     agent: String,
@@ -84,7 +80,7 @@ fn default_mcp_url(engine_url: &str) -> String {
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
 
-    let nubi = NubiClient::new(&args.url, &args.token, &args.space);
+    let nubi = NubiClient::connect(&args.url, &args.token).await?;
 
     let mcp_url = Some(args.mcp_url.unwrap_or_else(|| default_mcp_url(&args.url)));
 

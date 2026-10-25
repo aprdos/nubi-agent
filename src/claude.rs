@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use tokio::io::AsyncReadExt;
 use tokio::process::Command;
@@ -11,6 +11,7 @@ pub struct Claude {
     system_prompt: Option<String>,
     agent_id: String,
     mcp_config: Option<String>,
+    workspace: Option<PathBuf>,
     llm_base_url: Option<String>,
     llm_api_key: Option<String>,
     model: Option<String>,
@@ -23,6 +24,7 @@ impl Claude {
             system_prompt: None,
             agent_id: agent_id.to_string(),
             mcp_config: None,
+            workspace: None,
             llm_base_url: None,
             llm_api_key: None,
             model: None,
@@ -42,6 +44,25 @@ impl Claude {
             ""
         };
 
+        let memory_section = if self.workspace.is_some() {
+            r#"
+
+Memory — you start from zero on every message:
+- Each message spawns a fresh session. Nothing carries over from the last one.
+- Your working directory does persist, and CLAUDE.md in it is loaded into every
+  run. That file is your memory.
+- When a message contains something worth keeping — who someone is, a decision,
+  a standing instruction, something you were told to stop doing — edit CLAUDE.md
+  in this same turn, before you answer. Saving is an action you take, not
+  something you offer to do. Never mention that you saved it.
+- Keep it short. It is re-read on every single message, so it costs you tokens
+  forever. Prune what stopped being true.
+- Do not copy conversations into it. The room already holds the full history —
+  use nubi_poll or nubi_get_room to scroll back."#
+        } else {
+            ""
+        };
+
         format!(
             r#"You are '{}', a member of this team in a nubi chat room. You work alongside
 the other people here — as a peer, as an employee, as a manager when you're leading.
@@ -55,7 +76,7 @@ How nubi works — mentions decide who reads what:
   enough.
 - DMs need no mention; everything in a DM is addressed to the other side.
 - Plain text you write back gets posted as a message that asks nobody to reply.
-  It is an answer, not a new thread.{}
+  It is an answer, not a new thread.{}{}
 
 Voice — talk like a human coworker in a work chat:
 - Write the way a competent colleague types: direct, plain, normal punctuation, short sentences.
@@ -76,7 +97,7 @@ Rules:
 2. Never describe yourself as an AI, model, bot, or assistant — you're a teammate
 3. Never prefix your response with "Human:" or any name followed by colon
 4. Just respond naturally with your message content only"#,
-            self.agent_id, tools_section
+            self.agent_id, tools_section, memory_section
         )
     }
 
@@ -95,6 +116,15 @@ Rules:
 
     pub fn with_mcp_config(mut self, path: Option<&Path>) -> Self {
         self.mcp_config = path.map(|p| p.to_string_lossy().to_string());
+        self
+    }
+
+    /// Directory the spawned claude runs in. It persists across runs, so a
+    /// CLAUDE.md there is the agent's memory between one-shot invocations.
+    /// It also keeps a `--dangerously-skip-permissions` agent from writing
+    /// into whatever directory nubi-agent happened to be launched from.
+    pub fn with_workspace(mut self, dir: Option<PathBuf>) -> Self {
+        self.workspace = dir;
         self
     }
 
@@ -181,6 +211,9 @@ Rules:
 
         let mut cmd = Command::new("claude");
         cmd.args(&args);
+        if let Some(ref dir) = self.workspace {
+            cmd.current_dir(dir);
+        }
         if let Some(ref url) = self.llm_base_url {
             cmd.env("ANTHROPIC_BASE_URL", url);
         }

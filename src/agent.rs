@@ -2,7 +2,7 @@ use eventsource_client::Client;
 use futures::StreamExt;
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -109,10 +109,13 @@ impl Agent {
             .as_ref()
             .map(|mcp_url| Self::generate_mcp_config(&config.agent_id, nubi.token(), mcp_url));
 
+        let workspace = Self::prepare_workspace(&config.agent_id);
+
         let claude = Claude::new(&config.agent_id)
             .with_skip_permissions(config.skip_permissions)
             .with_system_prompt(config.system_prompt.clone())
             .with_mcp_config(mcp_config_path.as_deref())
+            .with_workspace(workspace)
             .with_llm_base_url(config.llm_base_url.clone())
             .with_llm_api_key(config.llm_api_key.clone())
             .with_model(config.llm_model.clone());
@@ -164,15 +167,58 @@ impl Agent {
         path
     }
 
+    /// A stable per-agent directory for the spawned claude to run in.
+    ///
+    /// Each message is a one-shot `claude -p` that remembers nothing, so the
+    /// directory is the only thing that survives: CLAUDE.md in it is reloaded
+    /// on every run. Agents get their own so one cannot read another's notes.
+    ///
+    /// Returns None if there is no home directory to anchor to, which just
+    /// leaves claude in the launching cwd as before.
+    fn prepare_workspace(agent_id: &str) -> Option<PathBuf> {
+        let path = std::env::home_dir()?.join(".nubi-agents").join(agent_id);
+        if let Err(e) = fs::create_dir_all(&path) {
+            eprintln!("[nubi-agent] Cannot create workspace {:?}: {}", path, e);
+            return None;
+        }
+        Self::seed_memory_file(&path, agent_id);
+        eprintln!("[nubi-agent] Workspace at {:?}", path);
+        Some(path)
+    }
+
+    /// Create CLAUDE.md on first run only.
+    ///
+    /// Seeded rather than left to the agent because a file that already exists
+    /// and is visible in context gets appended to, while one that has to be
+    /// created from nothing reliably doesn't get written at all.
+    fn seed_memory_file(dir: &Path, agent_id: &str) {
+        let path = dir.join("CLAUDE.md");
+        if path.exists() {
+            return;
+        }
+        let seed = format!(
+            "# {} — memory\n\n\
+             This file is reloaded at the start of every message you handle, and it is \
+             the only thing you remember between them. Keep durable facts here: who \
+             people are, what was decided, standing instructions you were given. \
+             Delete anything that stops being true, and keep it short.\n\n\
+             Nothing recorded yet.\n",
+            agent_id
+        );
+        if let Err(e) = fs::write(&path, seed) {
+            eprintln!("[nubi-agent] Cannot seed {:?}: {}", path, e);
+        }
+    }
+
     /// Run the agent (blocking)
     pub async fn run(&mut self) -> anyhow::Result<()> {
         // Verify setup
         Claude::check_available().await?;
-        self.shared.nubi.verify().await?;
 
         eprintln!(
-            "[nubi-agent] Connected as '{}', listening for mentions...",
-            self.shared.config.agent_id
+            "[nubi-agent] Connected as '{}' in space '{}', listening for mentions...",
+            self.shared.config.agent_id,
+            self.shared.nubi.space()
         );
 
         let flusher = tokio::spawn(flush_offsets(Arc::clone(&self.shared)));

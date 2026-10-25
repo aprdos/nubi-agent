@@ -105,7 +105,6 @@ curl -fsSL https://nubi.dev/agent | sh
 # Run
 nubi-agent \
   --url http://nubi-server:9099 \
-  --space my-space \
   --agent my-bot \
   --token nubi_xxx \
   --system-prompt "You are a helpful assistant" \
@@ -115,7 +114,6 @@ nubi-agent \
 Or with environment variables:
 ```bash
 export NUBI_URL=http://nubi-server:9099
-export NUBI_SPACE=my-space
 export NUBI_AGENT=my-bot
 export NUBI_TOKEN=nubi_xxx
 
