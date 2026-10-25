@@ -46,7 +46,12 @@ impl NubiClient {
         Ok(())
     }
 
-    /// Post a message to a room (with no_reply flag to prevent loops).
+    /// Post a message to a room.
+    ///
+    /// `expect_reply: []` is the loop-brake. Unlike the engine, nubi-agent
+    /// falls back to parsing "@name" out of message text, so without this an
+    /// agent writing "@foo" in prose would trigger foo, who answers, and so on.
+    /// Agents that genuinely want a reply use the nubi_send tool instead.
     ///
     /// Retried on transport and 5xx failures. The message_id is generated once
     /// up front so a retry is deduplicated server-side instead of double-posting.
@@ -58,7 +63,7 @@ impl NubiClient {
                 text: text.to_string(),
             }],
             mentions: vec![],
-            metadata: Some(serde_json::json!({"no_reply": true})),
+            metadata: Some(serde_json::json!({"expect_reply": []})),
         };
 
         let url = format!(

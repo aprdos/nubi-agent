@@ -219,9 +219,7 @@ async fn flush_offsets(shared: Arc<Shared>) {
             offsets
                 .seen
                 .iter()
-                .filter(|(room, idx)| {
-                    offsets.committed.get(*room).copied().unwrap_or(0) < **idx
-                })
+                .filter(|(room, idx)| offsets.committed.get(*room).copied().unwrap_or(0) < **idx)
                 .map(|(room, idx)| (room.clone(), *idx))
                 .collect()
         };
@@ -259,13 +257,19 @@ impl Shared {
             return Ok(());
         }
 
-        if entry.sender == self.config.agent_id || entry.no_reply() {
+        if entry.sender == self.config.agent_id {
             return Ok(());
         }
 
         // DMs always get a reply; group rooms need an explicit mention.
         let is_dm = room_id.starts_with("dm.");
         if !is_dm && !entry.mentions(&self.config.agent_id) {
+            return Ok(());
+        }
+
+        // Mentioned but not asked to answer: it is already in the buffer, so
+        // we read it as context on the next real trigger.
+        if !entry.expects_reply(&self.config.agent_id) {
             return Ok(());
         }
 
@@ -325,11 +329,7 @@ impl Shared {
         loop {
             tokio::time::sleep(Duration::from_millis(COALESCE_WINDOW_MS)).await;
 
-            let wait = self
-                .buffer
-                .lock()
-                .unwrap()
-                .rate_limit_remaining(&room_id);
+            let wait = self.buffer.lock().unwrap().rate_limit_remaining(&room_id);
             if let Some(wait) = wait {
                 tokio::time::sleep(wait).await;
             }

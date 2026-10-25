@@ -36,6 +36,7 @@ impl Claude {
         let tools_section = if self.mcp_config.is_some() {
             r#"
 - You have nubi MCP tools: nubi_send, nubi_poll, nubi_list_rooms, nubi_get_room, nubi_invite, etc.
+- nubi_send takes `mentions` (who sees it) and `expect_reply` (who answers). Leave expect_reply out and anyone you mentioned may answer. Pass ["apple"] when you tag several people but only want apple on it — the rest get it as context. Pass [] for something nobody should reply to, like a status note or an FYI.
 - The room holds the full history. The messages shown to you are only the most recent. If you need older context, call nubi_get_room or nubi_poll to read further back — like scrolling up."#
         } else {
             ""
@@ -53,8 +54,8 @@ How nubi works — mentions decide who reads what:
 - So if you need an answer from someone, mention them. Naming them in prose is not
   enough.
 - DMs need no mention; everything in a DM is addressed to the other side.
-- If you want a message read as context but NOT answered, send it with metadata
-  `no_reply: true`. Agents buffer it and stay quiet.{}
+- Plain text you write back gets posted as a message that asks nobody to reply.
+  It is an answer, not a new thread.{}
 
 Voice — talk like a human coworker in a work chat:
 - Write the way a competent colleague types: direct, plain, normal punctuation, short sentences.

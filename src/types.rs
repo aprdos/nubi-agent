@@ -97,20 +97,52 @@ impl LogEntry {
         self.payload.payload_type == "message"
     }
 
-    /// Check if message has no_reply flag set
-    pub fn no_reply(&self) -> bool {
-        self.payload
+    /// Whether this agent is expected to answer.
+    ///
+    /// Fails open: anything missing or malformed means "go ahead". A wrong
+    /// `false` is a silent deadlock — the sender waits for an answer that
+    /// never comes and nothing logs why — while a wrong `true` is just noise.
+    /// Only a well-formed list that leaves us out keeps us quiet, plus the
+    /// explicit empty list, which means nobody should reply.
+    pub fn expects_reply(&self, agent_id: &str) -> bool {
+        let Some(value) = self
+            .payload
             .metadata
             .as_ref()
-            .and_then(|m| m.get("no_reply"))
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false)
+            .and_then(|m| m.get("expect_reply"))
+        else {
+            return true;
+        };
+        let Some(arr) = value.as_array() else {
+            return true;
+        };
+        if arr.is_empty() {
+            return false;
+        }
+
+        let ids: Vec<&str> = arr
+            .iter()
+            .filter_map(|v| v.as_str())
+            .map(normalize_id)
+            .filter(|s| !s.is_empty())
+            .collect();
+        if ids.is_empty() {
+            return true;
+        }
+
+        let me = normalize_id(agent_id);
+        ids.iter().any(|id| id.eq_ignore_ascii_case(me))
     }
+}
+
+fn normalize_id(raw: &str) -> &str {
+    raw.trim().trim_start_matches('@').trim()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     fn make_entry(sender: &str, text: &str, mentions: Option<Vec<&str>>) -> LogEntry {
         LogEntry {
@@ -127,6 +159,47 @@ mod tests {
                 metadata: None,
             },
         }
+    }
+
+    fn with_metadata(metadata: Value) -> LogEntry {
+        let mut entry = make_entry("alice", "hey bot", Some(vec!["bot"]));
+        entry.payload.metadata = Some(metadata);
+        entry
+    }
+
+    #[test]
+    fn test_expects_reply_absent_or_malformed() {
+        // No metadata at all.
+        assert!(make_entry("alice", "hey bot", Some(vec!["bot"])).expects_reply("bot"));
+        // Metadata present but no expect_reply key.
+        assert!(with_metadata(json!({"other": 1})).expects_reply("bot"));
+        assert!(with_metadata(json!({"expect_reply": null})).expects_reply("bot"));
+        // Wrong type, and a list with nothing usable in it: fail open.
+        assert!(with_metadata(json!({"expect_reply": "yes"})).expects_reply("bot"));
+        assert!(with_metadata(json!({"expect_reply": [""]})).expects_reply("bot"));
+        assert!(with_metadata(json!({"expect_reply": [7]})).expects_reply("bot"));
+    }
+
+    #[test]
+    fn test_expects_reply_empty_list_silences_everyone() {
+        let entry = with_metadata(json!({"expect_reply": []}));
+        assert!(!entry.expects_reply("bot"));
+        assert!(!entry.expects_reply("other"));
+    }
+
+    #[test]
+    fn test_expects_reply_targets_named_agent() {
+        let entry = with_metadata(json!({"expect_reply": ["bot"]}));
+        assert!(entry.expects_reply("bot"));
+        assert!(!entry.expects_reply("other"));
+    }
+
+    #[test]
+    fn test_expects_reply_normalizes_ids() {
+        let entry = with_metadata(json!({"expect_reply": [" @Bot "]}));
+        assert!(entry.expects_reply("bot"));
+        assert!(entry.expects_reply("@bot"));
+        assert!(!entry.expects_reply("other"));
     }
 
     #[test]
