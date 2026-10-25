@@ -10,10 +10,6 @@ struct Args {
     #[arg(long, env = "NUBI_URL", default_value = "https://chat.poimen.io")]
     url: String,
 
-    /// Agent ID (your identity in the room)
-    #[arg(long, env = "NUBI_AGENT")]
-    agent: String,
-
     /// API token
     #[arg(long, env = "NUBI_TOKEN")]
     token: String,
@@ -89,10 +85,11 @@ async fn main() -> anyhow::Result<()> {
 
     let nubi = NubiClient::connect(&args.url, &args.token).await?;
 
+    let agent_id = nubi.agent_id().to_string();
     let mcp_url = Some(args.mcp_url.unwrap_or_else(|| default_mcp_url(&args.url)));
 
     let config = AgentConfig {
-        agent_id: args.agent,
+        agent_id,
         rooms: args.rooms,
         system_prompt: args.system_prompt,
         skip_permissions: args.skip_permissions,

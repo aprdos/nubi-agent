@@ -13,6 +13,7 @@ struct CommitResp {
 #[derive(Deserialize)]
 struct Me {
     space_id: String,
+    agent_id: String,
 }
 
 const POST_ATTEMPTS: u32 = 3;
@@ -24,19 +25,21 @@ pub struct NubiClient {
     base_url: String,
     token: String,
     space: String,
+    agent_id: String,
 }
 
 impl NubiClient {
-    pub fn new(base_url: &str, token: &str, space: &str) -> Self {
+    pub fn new(base_url: &str, token: &str, space: &str, agent_id: &str) -> Self {
         Self {
             client: Client::new(),
             base_url: base_url.trim_end_matches('/').to_string(),
             token: token.to_string(),
             space: space.to_string(),
+            agent_id: agent_id.to_string(),
         }
     }
 
-    /// Build a client whose space comes from the token itself.
+    /// Build a client whose space and agent_id come from the token itself.
     ///
     /// The space id sits in every request path, so one that disagrees with the
     /// key 403s every call while the key itself is perfectly fine — a failure
@@ -61,11 +64,15 @@ impl NubiClient {
         }
 
         let me: Me = resp.json().await?;
-        Ok(Self::new(base_url, token, &me.space_id))
+        Ok(Self::new(base_url, token, &me.space_id, &me.agent_id))
     }
 
     pub fn space(&self) -> &str {
         &self.space
+    }
+
+    pub fn agent_id(&self) -> &str {
+        &self.agent_id
     }
 
     /// Post a message to a room.
@@ -202,7 +209,7 @@ mod tests {
 
     #[test]
     fn test_stream_url_all_rooms() {
-        let client = NubiClient::new("http://localhost:9099", "token", "space1");
+        let client = NubiClient::new("http://localhost:9099", "token", "space1", "agent1");
         assert_eq!(
             client.stream_url("*"),
             "http://localhost:9099/v1/spaces/space1/stream"
@@ -211,7 +218,7 @@ mod tests {
 
     #[test]
     fn test_stream_url_specific_room() {
-        let client = NubiClient::new("http://localhost:9099", "token", "space1");
+        let client = NubiClient::new("http://localhost:9099", "token", "space1", "agent1");
         assert_eq!(
             client.stream_url("general"),
             "http://localhost:9099/v1/spaces/space1/rooms/general/stream"
@@ -220,7 +227,7 @@ mod tests {
 
     #[test]
     fn test_base_url_trailing_slash() {
-        let client = NubiClient::new("http://localhost:9099/", "token", "space1");
+        let client = NubiClient::new("http://localhost:9099/", "token", "space1", "agent1");
         assert_eq!(
             client.stream_url("*"),
             "http://localhost:9099/v1/spaces/space1/stream"
