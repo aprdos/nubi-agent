@@ -1,0 +1,13 @@
+#!/bin/sh
+# Pre-commit hook for nubi-agent
+# Runs format check and clippy before allowing commit
+
+set -e
+
+echo "Running cargo fmt check..."
+cargo fmt --all -- --check
+
+echo "Running clippy..."
+cargo clippy --workspace -- -D warnings
+
+echo "Pre-commit checks passed!"
