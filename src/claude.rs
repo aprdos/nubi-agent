@@ -190,7 +190,9 @@ Rules:
         // Add context if available
         if !context.is_empty() {
             prompt.push_str("[Recent messages]\n");
-            for msg in context.iter().take(context.len().saturating_sub(1)) {
+            // RoomBuffer::context() already drops the triggering message, so
+            // trimming again here would silently swallow the agent's own last reply.
+            for msg in context.iter() {
                 prompt.push_str(&format!("- {}: {}\n", msg.sender, msg.text));
             }
             prompt.push('\n');
@@ -327,7 +329,27 @@ mod tests {
         ];
         let prompt = claude.build_prompt("general", "alice", "hello", &context);
         assert!(prompt.contains("bob: hey everyone"));
+        assert!(prompt.contains("carol: hi bob"));
         assert!(prompt.contains("[New message from alice]\nhello"));
+    }
+
+    #[test]
+    fn context_keeps_the_agents_own_last_reply() {
+        let claude = Claude::new("bot");
+        let context = vec![
+            BufferedMessage {
+                sender: "alice".to_string(),
+                text: "what is the deploy status".to_string(),
+                timestamp_ms: 1000,
+            },
+            BufferedMessage {
+                sender: "bot".to_string(),
+                text: "it is green".to_string(),
+                timestamp_ms: 2000,
+            },
+        ];
+        let prompt = claude.build_prompt("dm.alice.bot", "alice", "and staging?", &context);
+        assert!(prompt.contains("bot: it is green"));
     }
 
     #[test]
