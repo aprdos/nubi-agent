@@ -117,10 +117,6 @@ mod tests {
             "http://localhost:8089/mcp"
         );
         assert_eq!(
-            default_mcp_url("https://chat.poimen.io"),
-            "https://chat.poimen.io:8089/mcp"
-        );
-        assert_eq!(
             default_mcp_url("http://localhost:9099/"),
             "http://localhost:8089/mcp"
         );

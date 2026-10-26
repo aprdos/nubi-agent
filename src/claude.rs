@@ -37,9 +37,10 @@ impl Claude {
     fn default_system_prompt(&self) -> String {
         let tools_section = if self.mcp_config.is_some() {
             r#"
-- You have nubi MCP tools: nubi_send, nubi_poll, nubi_get_room, nubi_search, nubi_list_rooms, nubi_list_agents, nubi_dm, nubi_invite.
+- You have nubi MCP tools: nubi_send, nubi_poll, nubi_get_room, nubi_search, nubi_list_rooms, nubi_list_agents, nubi_dm, nubi_create_room, nubi_invite.
 - nubi_send takes `mentions` (who sees it) and `expect_reply` (who answers). Leave expect_reply out and anyone you mentioned may answer. Pass ["apple"] when you tag several people but only want apple on it — the rest get it as context. Pass [] for something nobody should reply to, like a status note or an FYI.
-- Look it up before you ask. The messages shown to you are only the most recent; the room holds everything. nubi_get_room and nubi_poll scroll back, nubi_search finds a specific thing in a room, nubi_list_rooms and nubi_list_agents show what exists and who is around.
+- Look it up before you ask. The messages shown to you are only the most recent; the room holds everything. nubi_poll with before_index walks backwards through older messages, nubi_search finds a specific thing in a room, nubi_get_room shows who is in one, nubi_list_rooms and nubi_list_agents show what exists and who is around.
+- When a topic deserves its own thread, open a room for it with nubi_create_room and nubi_invite the people who need to be in it, then say in the original room that you moved it. Do that instead of letting a long side-discussion take over an unrelated room.
 - "What were we talking about", "who is that", "which room was that in", "what did we decide" — you answer those yourself with those tools. Making a person re-type something nubi already stores wastes their time, and storing it is the entire point of nubi. Ask a human only for what nubi cannot hold: a decision not yet made, a preference, something never written down."#
         } else {
             ""
@@ -115,11 +116,13 @@ Rules:
         self
     }
 
+    /// A custom prompt is appended to the defaults, not swapped in for them.
+    /// Replacing them used to drop the tool list and the mention rules, leaving
+    /// an agent that could not tell who was meant to answer it.
     pub fn with_system_prompt(mut self, prompt: Option<String>) -> Self {
-        // If custom prompt provided, prepend identity
-        self.system_prompt = prompt
-            .map(|p| format!("You are '{}'. {}", self.agent_id, p))
-            .or(self.system_prompt);
+        if let Some(p) = prompt {
+            self.system_prompt = Some(p);
+        }
         self
     }
 
@@ -213,10 +216,11 @@ Rules:
             args.push(model.clone());
         }
 
-        let system_prompt = self
-            .system_prompt
-            .clone()
-            .unwrap_or_else(|| self.default_system_prompt());
+        let mut system_prompt = self.default_system_prompt();
+        if let Some(ref extra) = self.system_prompt {
+            system_prompt.push_str("\n\nAbout you specifically:\n");
+            system_prompt.push_str(extra);
+        }
         args.push("--system-prompt".to_string());
         args.push(system_prompt);
 
