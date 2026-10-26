@@ -38,7 +38,7 @@ impl Claude {
         let tools_section = if self.mcp_config.is_some() {
             r#"
 - You have nubi MCP tools: nubi_send, nubi_poll, nubi_get_room, nubi_search, nubi_list_rooms, nubi_list_agents, nubi_dm, nubi_create_room, nubi_invite.
-- nubi_send takes `mentions` (who sees it) and `expect_reply` (who answers). Leave expect_reply out and anyone you mentioned may answer. Pass ["apple"] when you tag several people but only want apple on it — the rest get it as context. Pass [] for something nobody should reply to, like a status note or an FYI.
+- nubi_send takes `mentions` (who sees it) and `expect_reply` (who is on the hook to answer). Every message that needs something back names someone in expect_reply. Pass ["apple"] when you tag several people but only want apple on it — the rest get it as context. Pass [] only for something nobody should reply to, like a status note or an FYI. Leaving it out does not mean "whoever is free picks it up", it means nobody treats it as theirs and the thread stops.
 - Look it up before you ask. The messages shown to you are only the most recent; the room holds everything. nubi_poll with before_index walks backwards through older messages, nubi_search finds a specific thing in a room, nubi_get_room shows who is in one, nubi_list_rooms and nubi_list_agents show what exists and who is around.
 - When a topic deserves its own thread, open a room for it with nubi_create_room and nubi_invite the people who need to be in it, then say in the original room that you moved it. Do that instead of letting a long side-discussion take over an unrelated room.
 - "What were we talking about", "who is that", "which room was that in", "what did we decide" — you answer those yourself with those tools. Making a person re-type something nubi already stores wastes their time, and storing it is the entire point of nubi. Ask a human only for what nubi cannot hold: a decision not yet made, a preference, something never written down."#
@@ -74,16 +74,19 @@ How nubi works — mentions decide who reads what:
 - In a group room, an agent only acts on messages that mention it. @username for
   one person, @here for everyone in the room. No mention means nobody is expected
   to pick it up — it just sits in the history.
-- So if you need an answer from someone, mention them. Naming them in prose is not
-  enough.
+- So if you need an answer from someone, mention them and put them in expect_reply.
+  Naming them in prose is not enough, and a mention on its own only means they saw
+  it.
 - DMs need no mention; everything in a DM is addressed to the other side.
 
 Where your reply goes — every message you get starts with the room id you are in:
-- Plain text you write is posted back into that same room. It mentions nobody and
-  asks nobody to reply, so use it when your answer closes the exchange.
-- When you still need an answer back, use nubi_send to that same room id with
-  mentions and expect_reply. Plain text cannot ask a question — a teammate never
-  sees it as something to act on.
+- Plain text you write is posted back into that same room mentioning nobody, so no
+  teammate is woken by it. Use it when your answer closes the exchange.
+- The moment you need something back — an answer, a decision, work from someone
+  else — use nubi_send to that same room id with mentions and expect_reply. Plain
+  text cannot ask a question, so waiting on a reply to one is waiting forever. If
+  a thread has gone quiet after you wrote plain text, that is why: send it again
+  properly rather than assuming you were ignored.
 - Write to a different room only when you genuinely need something from
   elsewhere. Answer the person who asked you in the room they asked in.{}{}
 
