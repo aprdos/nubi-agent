@@ -1,18 +1,30 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::{Duration, Instant};
 
 use crate::types::LogEntry;
 
-const DEFAULT_BUFFER_SIZE: usize = 50;
-const DEFAULT_CONTEXT_SIZE: usize = 10;
+const DEFAULT_BUFFER_SIZE: usize = 100;
+const DEFAULT_CONTEXT_SIZE: usize = 30;
 const DEFAULT_RATE_LIMIT_MS: u64 = 5000;
 
 /// Buffered message for context
 #[derive(Debug, Clone)]
 pub struct BufferedMessage {
+    pub global_index: u64,
     pub sender: String,
     pub text: String,
     pub timestamp_ms: u64,
+}
+
+impl BufferedMessage {
+    fn from_entry(entry: &LogEntry) -> Self {
+        Self {
+            global_index: entry.global_index,
+            sender: entry.sender.clone(),
+            text: entry.text(),
+            timestamp_ms: entry.timestamp_ms,
+        }
+    }
 }
 
 /// Per-room state
@@ -61,8 +73,11 @@ impl RoomBuffer {
         self
     }
 
+    /// A buffer smaller than the context window silently caps it, so grow it
+    /// to fit. The extra slot is the triggering message, which context() drops.
     pub fn with_context_size(mut self, size: usize) -> Self {
         self.context_size = size;
+        self.buffer_size = self.buffer_size.max(size + 1);
         self
     }
 
@@ -78,11 +93,35 @@ impl RoomBuffer {
             .entry(room_id.to_string())
             .or_insert_with(RoomState::new);
 
-        state.messages.push_back(BufferedMessage {
-            sender: entry.sender.clone(),
-            text: entry.text(),
-            timestamp_ms: entry.timestamp_ms,
-        });
+        state.messages.push_back(BufferedMessage::from_entry(entry));
+
+        while state.messages.len() > self.buffer_size {
+            state.messages.pop_front();
+        }
+    }
+
+    /// Seed a room with history fetched from the server, oldest first.
+    ///
+    /// The buffer only ever held what arrived over SSE during this process, so
+    /// a restart left the agent answering with no idea what was already said.
+    /// Entries already buffered are skipped by index, which makes this safe to
+    /// call once live messages have started landing.
+    pub fn prime(&mut self, room_id: &str, entries: &[LogEntry]) {
+        let state = self
+            .rooms
+            .entry(room_id.to_string())
+            .or_insert_with(RoomState::new);
+
+        let known: HashSet<u64> = state.messages.iter().map(|m| m.global_index).collect();
+
+        for entry in entries.iter().rev() {
+            if !entry.is_message() || known.contains(&entry.global_index) {
+                continue;
+            }
+            state
+                .messages
+                .push_front(BufferedMessage::from_entry(entry));
+        }
 
         while state.messages.len() > self.buffer_size {
             state.messages.pop_front();
@@ -133,8 +172,12 @@ mod tests {
     use crate::types::{Part, Payload};
 
     fn make_entry(sender: &str, text: &str, ts: u64) -> LogEntry {
+        make_indexed_entry(1, sender, text, ts)
+    }
+
+    fn make_indexed_entry(index: u64, sender: &str, text: &str, ts: u64) -> LogEntry {
         LogEntry {
-            global_index: 1,
+            global_index: index,
             sender: sender.to_string(),
             timestamp_ms: ts,
             payload: Payload {
@@ -194,6 +237,74 @@ mod tests {
 
         std::thread::sleep(Duration::from_millis(150));
         assert!(buffer.rate_limit_remaining("room1").is_none());
+    }
+
+    #[test]
+    fn prime_puts_history_before_live_messages() {
+        let mut buffer = RoomBuffer::new().with_context_size(10);
+
+        buffer.push("room1", &make_indexed_entry(3, "alice", "live", 3));
+        buffer.prime(
+            "room1",
+            &[
+                make_indexed_entry(1, "alice", "oldest", 1),
+                make_indexed_entry(2, "bob", "older", 2),
+            ],
+        );
+
+        let texts: Vec<_> = buffer
+            .rooms
+            .get("room1")
+            .unwrap()
+            .messages
+            .iter()
+            .map(|m| m.text.as_str())
+            .collect();
+        assert_eq!(texts, vec!["oldest", "older", "live"]);
+    }
+
+    #[test]
+    fn prime_skips_entries_already_buffered() {
+        let mut buffer = RoomBuffer::new().with_context_size(10);
+
+        buffer.push("room1", &make_indexed_entry(2, "alice", "live", 2));
+        buffer.prime(
+            "room1",
+            &[
+                make_indexed_entry(1, "bob", "older", 1),
+                make_indexed_entry(2, "alice", "live", 2),
+            ],
+        );
+
+        let texts: Vec<_> = buffer
+            .rooms
+            .get("room1")
+            .unwrap()
+            .messages
+            .iter()
+            .map(|m| m.text.as_str())
+            .collect();
+        assert_eq!(texts, vec!["older", "live"]);
+    }
+
+    #[test]
+    fn prime_respects_the_buffer_size() {
+        let mut buffer = RoomBuffer::new().with_buffer_size(2);
+
+        let entries: Vec<_> = (1..=5)
+            .map(|i| make_indexed_entry(i, "alice", &format!("msg{}", i), i))
+            .collect();
+        buffer.prime("room1", &entries);
+
+        let texts: Vec<_> = buffer
+            .rooms
+            .get("room1")
+            .unwrap()
+            .messages
+            .iter()
+            .map(|m| m.text.as_str())
+            .collect();
+        assert_eq!(texts, vec!["msg4", "msg5"]);
     }
 
     #[test]

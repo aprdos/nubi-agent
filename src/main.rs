@@ -27,7 +27,7 @@ struct Args {
     skip_permissions: bool,
 
     /// Number of recent messages to include as context
-    #[arg(long, default_value = "10")]
+    #[arg(long, default_value = "30")]
     context_size: usize,
 
     /// Rate limit between responses per room (ms)
