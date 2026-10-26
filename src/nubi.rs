@@ -3,11 +3,16 @@ use serde::Deserialize;
 use std::time::Duration;
 use uuid::Uuid;
 
-use crate::types::{SendMessage, SendPart};
+use crate::types::{LogEntry, SendMessage, SendPart};
 
 #[derive(Deserialize)]
 struct CommitResp {
     committed: u64,
+}
+
+#[derive(Deserialize)]
+struct PollResp {
+    entries: Vec<LogEntry>,
 }
 
 #[derive(Deserialize)]
@@ -220,6 +225,42 @@ impl NubiClient {
         }
 
         Ok(resp.json::<CommitResp>().await?.committed)
+    }
+
+    /// Fetch the newest entries in a room, oldest first.
+    ///
+    /// Uses `before_index` rather than a forward poll on purpose: a forward
+    /// poll starts at the committed offset, so a room the agent has already
+    /// read reads back empty. The server clamps `before_index` to the head,
+    /// so the sentinel below means "the last `limit` entries". Neither form
+    /// moves the read offset — committing is a separate call.
+    pub async fn history(&self, room_id: &str, limit: usize) -> anyhow::Result<Vec<LogEntry>> {
+        let resp = self
+            .client
+            .get(format!(
+                "{}/v1/spaces/{}/rooms/{}/messages",
+                self.base_url, self.space, room_id
+            ))
+            .header("Authorization", format!("Bearer {}", self.token))
+            .query(&[
+                ("before_index", u64::MAX.to_string()),
+                ("limit", limit.to_string()),
+            ])
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            anyhow::bail!(
+                "Failed to fetch history for {}: {} - {}",
+                room_id,
+                status,
+                body
+            );
+        }
+
+        Ok(resp.json::<PollResp>().await?.entries)
     }
 
     /// Set typing status in a room

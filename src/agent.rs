@@ -47,7 +47,7 @@ impl Default for AgentConfig {
             rooms: "*".to_string(),
             system_prompt: None,
             skip_permissions: false,
-            context_size: 10,
+            context_size: 30,
             rate_limit_ms: 5000,
             mcp_url: None,
             heartbeat_interval_secs: 30,
@@ -89,6 +89,8 @@ struct Shared {
     /// Whether a room had never acked an offset when we first saw it. Decided
     /// once and never revised, so the flusher's own commits can't flip it.
     cold: Mutex<HashMap<String, bool>>,
+    /// Rooms whose buffer has already been seeded with server history.
+    primed: Mutex<HashSet<String>>,
     replies: Semaphore,
     start_time_ms: u64,
 }
@@ -138,6 +140,7 @@ impl Agent {
                 dispatch: Mutex::new(Dispatch::default()),
                 offsets: Mutex::new(Offsets::default()),
                 cold: Mutex::new(HashMap::new()),
+                primed: Mutex::new(HashSet::new()),
                 replies: Semaphore::new(MAX_CONCURRENT_REPLIES),
                 start_time_ms,
             }),
@@ -355,6 +358,25 @@ impl Shared {
         cold
     }
 
+    /// Load the room's recent history into the buffer, once per process.
+    ///
+    /// The buffer is memory-only, so without this the first reply after every
+    /// restart is written as if the room had just begun. A failure here is not
+    /// fatal — answering with a thin context beats not answering at all.
+    async fn prime_buffer(&self, room_id: &str) {
+        if !self.primed.lock().unwrap().insert(room_id.to_string()) {
+            return;
+        }
+
+        match self.nubi.history(room_id, self.config.context_size).await {
+            Ok(entries) => self.buffer.lock().unwrap().prime(room_id, &entries),
+            Err(e) => {
+                eprintln!("[nubi-agent] Could not load history for {}: {}", room_id, e);
+                self.primed.lock().unwrap().remove(room_id);
+            }
+        }
+    }
+
     /// Make this the room's pending message, starting a worker if none runs.
     fn enqueue(self: &Arc<Self>, room_id: &str, trigger: Trigger) {
         let mut dispatch = self.dispatch.lock().unwrap();
@@ -406,6 +428,8 @@ impl Shared {
             room_id,
             trigger.text.chars().take(50).collect::<String>()
         );
+
+        self.prime_buffer(room_id).await;
 
         let context = self.buffer.lock().unwrap().context(room_id);
         let prompt = self
@@ -538,7 +562,7 @@ mod tests {
     fn test_agent_config_default() {
         let config = AgentConfig::default();
         assert_eq!(config.rooms, "*");
-        assert_eq!(config.context_size, 10);
+        assert_eq!(config.context_size, 30);
         assert_eq!(config.rate_limit_ms, 5000);
         assert!(!config.skip_permissions);
     }
