@@ -18,6 +18,25 @@ struct Me {
 
 const POST_ATTEMPTS: u32 = 3;
 
+/// Without these a single unroutable DNS answer hangs a request forever: the
+/// OS retries the SYN for ~75s, reqwest starts over, and the agent never gets
+/// an error it can act on.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+
+const CONNECT_BACKOFF_START: Duration = Duration::from_secs(1);
+const CONNECT_BACKOFF_MAX: Duration = Duration::from_secs(60);
+
+/// Every request here is short — the SSE stream runs on its own
+/// eventsource-client, so a whole-request timeout is safe.
+fn http_client() -> Client {
+    Client::builder()
+        .connect_timeout(CONNECT_TIMEOUT)
+        .timeout(REQUEST_TIMEOUT)
+        .build()
+        .expect("reqwest client builds with rustls")
+}
+
 /// Nubi API client for posting messages
 #[derive(Clone)]
 pub struct NubiClient {
@@ -31,7 +50,7 @@ pub struct NubiClient {
 impl NubiClient {
     pub fn new(base_url: &str, token: &str, space: &str, agent_id: &str) -> Self {
         Self {
-            client: Client::new(),
+            client: http_client(),
             base_url: base_url.trim_end_matches('/').to_string(),
             token: token.to_string(),
             space: space.to_string(),
@@ -48,14 +67,37 @@ impl NubiClient {
     ///
     /// The server's own error body is passed through: "key has been revoked"
     /// is worth far more than a generic "invalid token".
+    ///
+    /// A transport failure here is waited out, not fatal. The SSE loop already
+    /// reconnects forever, so an agent that exits because the engine happened
+    /// to be unreachable at startup is one that silently stays dead long after
+    /// the outage is over. A rejection still aborts — no amount of waiting
+    /// fixes a revoked key.
     pub async fn connect(base_url: &str, token: &str) -> anyhow::Result<Self> {
         let base_url = base_url.trim_end_matches('/');
-        let resp = Client::new()
-            .get(format!("{}/v1/me", base_url))
-            .header("Authorization", format!("Bearer {}", token))
-            .send()
-            .await
-            .map_err(|e| anyhow::anyhow!("Cannot reach nubi at {}: {}", base_url, e))?;
+        let client = http_client();
+        let mut backoff = CONNECT_BACKOFF_START;
+
+        let resp = loop {
+            match client
+                .get(format!("{}/v1/me", base_url))
+                .header("Authorization", format!("Bearer {}", token))
+                .send()
+                .await
+            {
+                Ok(resp) => break resp,
+                Err(e) => {
+                    eprintln!(
+                        "[nubi-agent] Cannot reach nubi at {}: {}, retrying in {}s",
+                        base_url,
+                        e,
+                        backoff.as_secs()
+                    );
+                    tokio::time::sleep(backoff).await;
+                    backoff = (backoff * 2).min(CONNECT_BACKOFF_MAX);
+                }
+            }
+        };
 
         if !resp.status().is_success() {
             let status = resp.status();
