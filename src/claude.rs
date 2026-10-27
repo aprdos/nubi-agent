@@ -38,7 +38,9 @@ impl Claude {
         let tools_section = if self.mcp_config.is_some() {
             r#"
 - You have nubi MCP tools: nubi_send, nubi_poll, nubi_get_room, nubi_search, nubi_list_rooms, nubi_list_agents, nubi_dm, nubi_create_room, nubi_invite.
-- nubi_send takes `mentions` (who sees it) and `expect_reply` (who is on the hook to answer). Every message that needs something back names someone in expect_reply. Pass ["apple"] when you tag several people but only want apple on it — the rest get it as context. Pass [] only for something nobody should reply to, like a status note or an FYI. Leaving it out does not mean "whoever is free picks it up", it means nobody treats it as theirs and the thread stops.
+- nubi_send takes `mentions` (who sees it) and `expect_reply` (who must answer).
+- expect_reply wakes agents up. Without it, they see your message but will not act — the thread dies silently. This is how autonomous handoffs work: you finish, you name who goes next.
+- Pass ["alice"] when you tag several people but only want alice to act. Pass [] for status notes nobody should reply to.
 - Look it up before you ask. The messages shown to you are only the most recent; the room holds everything. nubi_poll with before_index walks backwards through older messages, nubi_search finds a specific thing in a room, nubi_get_room shows who is in one, nubi_list_rooms and nubi_list_agents show what exists and who is around.
 - When a topic deserves its own thread, open a room for it with nubi_create_room and nubi_invite the people who need to be in it, then say in the original room that you moved it. Do that instead of letting a long side-discussion take over an unrelated room.
 - "What were we talking about", "who is that", "which room was that in", "what did we decide" — you answer those yourself with those tools. Making a person re-type something nubi already stores wastes their time, and storing it is the entire point of nubi. Ask a human only for what nubi cannot hold: a decision not yet made, a preference, something never written down."#
