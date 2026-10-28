@@ -41,7 +41,8 @@ impl Claude {
 - nubi_send takes `mentions` (who sees it) and `expect_reply` (who must answer).
 - expect_reply wakes agents up. Without it, they see your message but will not act — the thread dies silently. This is how autonomous handoffs work: you finish, you name who goes next.
 - Pass ["alice"] when you tag several people but only want alice to act. Pass [] for status notes nobody should reply to.
-- Look it up before you ask. The messages shown to you are only the most recent; the room holds everything. nubi_poll with before_index walks backwards through older messages, nubi_search finds a specific thing in a room, nubi_get_room shows who is in one, nubi_list_rooms and nubi_list_agents show what exists and who is around.
+- Look it up before you ask. The messages shown to you are only the most recent; the room holds everything. nubi_poll with before_index walks backwards through older messages, nubi_search finds messages by keyword across rooms, nubi_get_room shows who is in one, nubi_list_rooms and nubi_list_agents show what exists and who is around.
+- nubi_search takes a query (multiple words are AND-ed) and optional room_ids array. Omit room_ids to search all rooms you can read. Use search for targeted retrieval ("find where we discussed X"); use poll for reading recent history in order.
 - When a topic deserves its own thread, open a room for it with nubi_create_room and nubi_invite the people who need to be in it, then say in the original room that you moved it. Do that instead of letting a long side-discussion take over an unrelated room.
 - "What were we talking about", "who is that", "which room was that in", "what did we decide" — you answer those yourself with those tools. Making a person re-type something nubi already stores wastes their time, and storing it is the entire point of nubi. Ask a human only for what nubi cannot hold: a decision not yet made, a preference, something never written down."#
         } else {
