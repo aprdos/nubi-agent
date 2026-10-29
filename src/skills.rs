@@ -1,6 +1,10 @@
+use reqwest::Client;
+use serde::Deserialize;
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, RwLock};
+use std::time::Duration;
 
 /// Parsed skill metadata from frontmatter
 #[derive(Debug, Clone, Default)]
@@ -245,6 +249,248 @@ impl SkillLoader {
         }
 
         section
+    }
+}
+
+// =============================================================================
+// Room-based skill loading (fetches from nubi API)
+// =============================================================================
+
+/// API response for listing rooms
+#[derive(Debug, Deserialize)]
+struct RoomsResponse {
+    rooms: Vec<RoomData>,
+}
+
+/// Room data from API
+#[derive(Debug, Clone, Deserialize)]
+struct RoomData {
+    id: String,
+    kind: Option<RoomKind>,
+}
+
+/// Room kind with skill metadata
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum RoomKind {
+    Dm,
+    Group,
+    Thread(ThreadMeta),
+    Skill(ApiSkillMeta),
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct ThreadMeta {
+    #[allow(dead_code)]
+    parent_room_id: String,
+}
+
+/// Skill metadata from the API
+#[derive(Debug, Clone, Deserialize)]
+struct ApiSkillMeta {
+    #[allow(dead_code)]
+    owner: Option<String>,
+    description: Option<String>,
+    content: Option<String>,
+    version: i32,
+    #[serde(default)]
+    trigger_patterns: Vec<String>,
+    status: Option<SkillStatus>,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(rename_all = "lowercase")]
+enum SkillStatus {
+    Draft,
+    Published,
+    Archived,
+}
+
+/// Cached skill with version for invalidation
+#[derive(Debug, Clone)]
+struct CachedSkill {
+    skill: Skill,
+    version: i32,
+}
+
+/// Loads skills from the nubi room API.
+///
+/// Fetches rooms with `kind=skill`, caches by version, and supports
+/// SSE-triggered cache invalidation.
+pub struct RoomSkillLoader {
+    client: Client,
+    base_url: String,
+    token: String,
+    space: String,
+    cache: Arc<RwLock<HashMap<String, CachedSkill>>>,
+}
+
+impl RoomSkillLoader {
+    /// Create a new room skill loader.
+    pub fn new(base_url: &str, token: &str, space: &str) -> Self {
+        let client = Client::builder()
+            .connect_timeout(Duration::from_secs(10))
+            .timeout(Duration::from_secs(30))
+            .build()
+            .expect("reqwest client builds");
+
+        Self {
+            client,
+            base_url: base_url.trim_end_matches('/').to_string(),
+            token: token.to_string(),
+            space: space.to_string(),
+            cache: Arc::new(RwLock::new(HashMap::new())),
+        }
+    }
+
+    /// Load all published skills from the API.
+    pub async fn load_all(&self) -> Result<Vec<Skill>, String> {
+        let url = format!(
+            "{}/v1/spaces/{}/rooms?kind=skill",
+            self.base_url, self.space
+        );
+
+        let resp = self
+            .client
+            .get(&url)
+            .header("Authorization", format!("Bearer {}", self.token))
+            .send()
+            .await
+            .map_err(|e| format!("Failed to fetch skill rooms: {}", e))?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            return Err(format!("Failed to fetch skill rooms: {} - {}", status, body));
+        }
+
+        let rooms: RoomsResponse = resp
+            .json()
+            .await
+            .map_err(|e| format!("Failed to parse skill rooms response: {}", e))?;
+
+        let mut skills = Vec::new();
+        let mut cache = self.cache.write().unwrap();
+
+        for room in rooms.rooms {
+            if let Some(RoomKind::Skill(meta)) = room.kind {
+                // Only load published skills
+                if meta.status != Some(SkillStatus::Published) {
+                    continue;
+                }
+
+                // Check cache
+                if let Some(cached) = cache.get(&room.id) {
+                    if cached.version == meta.version {
+                        skills.push(cached.skill.clone());
+                        continue;
+                    }
+                }
+
+                // Convert to Skill
+                let skill = self.convert_to_skill(&room.id, &meta);
+                cache.insert(
+                    room.id.clone(),
+                    CachedSkill {
+                        skill: skill.clone(),
+                        version: meta.version,
+                    },
+                );
+                skills.push(skill);
+            }
+        }
+
+        Ok(skills)
+    }
+
+    /// Check if a skill needs refresh based on version.
+    pub fn needs_refresh(&self, room_id: &str, new_version: i32) -> bool {
+        let cache = self.cache.read().unwrap();
+        match cache.get(room_id) {
+            Some(cached) => cached.version < new_version,
+            None => true,
+        }
+    }
+
+    /// Invalidate a specific skill in the cache.
+    pub fn invalidate(&self, room_id: &str) {
+        let mut cache = self.cache.write().unwrap();
+        cache.remove(room_id);
+    }
+
+    /// Get cached version for a skill room.
+    pub fn cached_version(&self, room_id: &str) -> Option<i32> {
+        let cache = self.cache.read().unwrap();
+        cache.get(room_id).map(|c| c.version)
+    }
+
+    fn convert_to_skill(&self, room_id: &str, meta: &ApiSkillMeta) -> Skill {
+        // Use first trigger pattern as the trigger hint
+        let trigger = meta.trigger_patterns.first().cloned();
+
+        Skill {
+            meta: SkillMeta {
+                name: room_id.to_string(), // Room ID as name for now
+                description: meta.description.clone(),
+                trigger,
+                enabled: true,
+            },
+            content: meta.content.clone().unwrap_or_default(),
+            path: PathBuf::from(format!("room://{}", room_id)),
+        }
+    }
+}
+
+/// Composite loader: tries room API first, falls back to filesystem.
+pub struct CompositeSkillLoader {
+    room_loader: Option<RoomSkillLoader>,
+    fs_loader: SkillLoader,
+}
+
+impl CompositeSkillLoader {
+    /// Create a composite loader.
+    ///
+    /// If room_loader is None, only filesystem loading is used.
+    pub fn new(room_loader: Option<RoomSkillLoader>, fs_loader: SkillLoader) -> Self {
+        Self {
+            room_loader,
+            fs_loader,
+        }
+    }
+
+    /// Load all skills: room-based first, then filesystem for anything not covered.
+    pub async fn load_all(&self) -> Vec<Skill> {
+        let mut skills = Vec::new();
+        let mut seen_names: HashMap<String, usize> = HashMap::new();
+
+        // Try room-based loading first
+        if let Some(ref loader) = self.room_loader {
+            match loader.load_all().await {
+                Ok(room_skills) => {
+                    for skill in room_skills {
+                        seen_names.insert(skill.meta.name.clone(), skills.len());
+                        skills.push(skill);
+                    }
+                }
+                Err(e) => {
+                    eprintln!("[nubi-agent] Room skill loading failed, falling back to filesystem: {}", e);
+                }
+            }
+        }
+
+        // Load filesystem skills (won't override room-based ones with same name)
+        for skill in self.fs_loader.load_all() {
+            if !seen_names.contains_key(&skill.meta.name) {
+                skills.push(skill);
+            }
+        }
+
+        skills
+    }
+
+    /// Get the room loader for cache operations.
+    pub fn room_loader(&self) -> Option<&RoomSkillLoader> {
+        self.room_loader.as_ref()
     }
 }
 

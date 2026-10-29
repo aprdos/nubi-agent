@@ -102,7 +102,7 @@ async fn main() -> anyhow::Result<()> {
         llm_model: Some(args.model),
     };
 
-    let mut agent = Agent::new(nubi, config);
+    let mut agent = Agent::connect(nubi, config).await;
     agent.run().await
 }
 
