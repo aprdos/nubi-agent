@@ -10,5 +10,5 @@ pub use agent::{Agent, AgentConfig};
 pub use buffer::RoomBuffer;
 pub use nubi::NubiClient;
 pub use runtime::AgentRuntime;
-pub use skills::{Skill, SkillLoader, SkillMeta};
+pub use skills::{CompositeSkillLoader, RoomSkillLoader, Skill, SkillLoader, SkillMeta};
 pub use types::*;

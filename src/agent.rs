@@ -13,7 +13,7 @@ use crate::buffer::RoomBuffer;
 use crate::claude::Claude;
 use crate::nubi::NubiClient;
 use crate::runtime::AgentRuntime;
-use crate::skills::{Skill, SkillLoader};
+use crate::skills::{CompositeSkillLoader, RoomSkillLoader, Skill, SkillLoader};
 use crate::types::SseData;
 
 /// How long a room's incoming burst is allowed to settle before we pick a
@@ -106,6 +106,9 @@ struct Shared {
     primed: Mutex<HashSet<String>>,
     replies: Semaphore,
     start_time_ms: u64,
+    /// Room skill loader for cache invalidation on SSE updates.
+    #[allow(dead_code)]
+    room_skill_loader: Option<RoomSkillLoader>,
 }
 
 /// The main agent that listens to nubi and responds via Claude
@@ -120,6 +123,8 @@ pub struct Agent {
 }
 
 impl Agent {
+    /// Create a new agent with synchronous filesystem-only skill loading.
+    /// Use `connect` for full room-based skill loading.
     pub fn new(nubi: NubiClient, config: AgentConfig) -> Self {
         // Generate MCP config if mcp_url is provided
         let mcp_config_path = config
@@ -129,8 +134,8 @@ impl Agent {
 
         let workspace = Self::prepare_workspace(&config.agent_id);
 
-        // Load skills
-        let (skills, skill_prompt) = Self::load_skills(&config.agent_id);
+        // Load skills from filesystem only (sync)
+        let (skills, skill_prompt) = Self::load_skills_sync(&config.agent_id);
 
         let mut claude = Claude::new(&config.agent_id)
             .with_skip_permissions(config.skip_permissions)
@@ -168,14 +173,73 @@ impl Agent {
                 primed: Mutex::new(HashSet::new()),
                 replies: Semaphore::new(MAX_CONCURRENT_REPLIES),
                 start_time_ms,
+                room_skill_loader: None,
             }),
             mcp_config_path,
             skills,
         }
     }
 
-    /// Load skills from shared and per-agent directories
-    fn load_skills(agent_id: &str) -> (Vec<Skill>, String) {
+    /// Create a new agent with async room-based skill loading.
+    /// Falls back to filesystem if room API fails.
+    pub async fn connect(nubi: NubiClient, config: AgentConfig) -> Self {
+        // Generate MCP config if mcp_url is provided
+        let mcp_config_path = config
+            .mcp_url
+            .as_ref()
+            .map(|mcp_url| Self::generate_mcp_config(&config.agent_id, nubi.token(), mcp_url));
+
+        let workspace = Self::prepare_workspace(&config.agent_id);
+
+        // Load skills with room-based loader (async)
+        let (skills, skill_prompt, room_skill_loader) =
+            Self::load_skills_async(&config.agent_id, &nubi).await;
+
+        let mut claude = Claude::new(&config.agent_id)
+            .with_skip_permissions(config.skip_permissions)
+            .with_system_prompt(config.system_prompt.clone())
+            .with_mcp_config(mcp_config_path.as_deref())
+            .with_workspace(workspace)
+            .with_llm_base_url(config.llm_base_url.clone())
+            .with_llm_api_key(config.llm_api_key.clone())
+            .with_model(config.llm_model.clone());
+
+        // Inject skills into the runtime
+        if !skill_prompt.is_empty() {
+            claude.inject_context(&skill_prompt);
+            eprintln!("[nubi-agent] Loaded {} skill(s)", skills.len());
+        }
+
+        let buffer = RoomBuffer::new()
+            .with_context_size(config.context_size)
+            .with_rate_limit_ms(config.rate_limit_ms);
+
+        let start_time_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+
+        Self {
+            shared: Arc::new(Shared {
+                config,
+                nubi,
+                runtime: Box::new(claude),
+                buffer: Mutex::new(buffer),
+                dispatch: Mutex::new(Dispatch::default()),
+                offsets: Mutex::new(Offsets::default()),
+                cold: Mutex::new(HashMap::new()),
+                primed: Mutex::new(HashSet::new()),
+                replies: Semaphore::new(MAX_CONCURRENT_REPLIES),
+                start_time_ms,
+                room_skill_loader,
+            }),
+            mcp_config_path,
+            skills,
+        }
+    }
+
+    /// Load skills from filesystem only (synchronous).
+    fn load_skills_sync(agent_id: &str) -> (Vec<Skill>, String) {
         let home = match dirs::home_dir() {
             Some(h) => h,
             None => return (Vec::new(), String::new()),
@@ -202,6 +266,52 @@ impl Agent {
         let prompt = SkillLoader::build_prompt_section(&skills);
 
         (skills, prompt)
+    }
+
+    /// Load skills with room-based loader, falling back to filesystem.
+    async fn load_skills_async(
+        agent_id: &str,
+        nubi: &NubiClient,
+    ) -> (Vec<Skill>, String, Option<RoomSkillLoader>) {
+        let home = match dirs::home_dir() {
+            Some(h) => h,
+            None => return (Vec::new(), String::new(), None),
+        };
+
+        // Validate agent_id to prevent path traversal (CWE-22)
+        if !is_safe_path_segment(agent_id) {
+            eprintln!(
+                "[nubi-agent] Invalid agent_id for skills path: {}",
+                agent_id
+            );
+            return (Vec::new(), String::new(), None);
+        }
+
+        let shared_dir = home.join(".nubi").join("skills");
+        let agent_skills_dir = home.join(".nubi-agents").join(agent_id).join("skills");
+
+        // Create directories if they don't exist (for discoverability)
+        let _ = fs::create_dir_all(&shared_dir);
+        let _ = fs::create_dir_all(&agent_skills_dir);
+
+        // Create loaders
+        let fs_loader = SkillLoader::new(shared_dir, Some(agent_skills_dir));
+        let room_loader = RoomSkillLoader::new(nubi.base_url(), nubi.token(), nubi.space());
+
+        let composite = CompositeSkillLoader::new(Some(room_loader), fs_loader);
+        let skills = composite.load_all().await;
+        let prompt = SkillLoader::build_prompt_section(&skills);
+
+        // Extract room loader with cache intact for SSE invalidation
+        let room_loader = composite.into_room_loader();
+
+        (skills, prompt, room_loader)
+    }
+
+    /// Load skills from shared and per-agent directories (legacy, kept for compatibility)
+    #[allow(dead_code)]
+    fn load_skills(agent_id: &str) -> (Vec<Skill>, String) {
+        Self::load_skills_sync(agent_id)
     }
 
     /// Generate MCP config file for this agent

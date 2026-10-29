@@ -122,6 +122,10 @@ impl NubiClient {
         &self.agent_id
     }
 
+    pub fn base_url(&self) -> &str {
+        &self.base_url
+    }
+
     /// Post a message to a room.
     ///
     /// `expect_reply: []` is the loop-brake. Unlike the engine, nubi-agent
