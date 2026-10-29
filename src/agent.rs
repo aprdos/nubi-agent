@@ -26,6 +26,17 @@ const OFFSET_FLUSH_SECS: u64 = 2;
 /// Ceiling on simultaneously running claude processes across all rooms.
 const MAX_CONCURRENT_REPLIES: usize = 4;
 
+/// Check if a string is safe to use as a path segment (no traversal)
+fn is_safe_path_segment(s: &str) -> bool {
+    !s.is_empty()
+        && !s.contains('/')
+        && !s.contains('\\')
+        && !s.contains('\0')
+        && s != "."
+        && s != ".."
+        && !s.starts_with("..")
+}
+
 /// Configuration for the agent
 #[derive(Debug, Clone)]
 pub struct AgentConfig {
@@ -170,6 +181,15 @@ impl Agent {
             None => return (Vec::new(), String::new()),
         };
 
+        // Validate agent_id to prevent path traversal (CWE-22)
+        if !is_safe_path_segment(agent_id) {
+            eprintln!(
+                "[nubi-agent] Invalid agent_id for skills path: {}",
+                agent_id
+            );
+            return (Vec::new(), String::new());
+        }
+
         let shared_dir = home.join(".nubi").join("skills");
         let agent_skills_dir = home.join(".nubi-agents").join(agent_id).join("skills");
 
@@ -186,6 +206,13 @@ impl Agent {
 
     /// Generate MCP config file for this agent
     fn generate_mcp_config(agent_id: &str, token: &str, mcp_url: &str) -> PathBuf {
+        // Validate agent_id to prevent path traversal (CWE-22)
+        let safe_id = if is_safe_path_segment(agent_id) {
+            agent_id
+        } else {
+            "default"
+        };
+
         let config = serde_json::json!({
             "mcpServers": {
                 "nubi": {
@@ -198,7 +225,7 @@ impl Agent {
             }
         });
 
-        let path = PathBuf::from(format!("/tmp/mcp-{}.json", agent_id));
+        let path = PathBuf::from(format!("/tmp/mcp-{}.json", safe_id));
         fs::write(&path, serde_json::to_string_pretty(&config).unwrap())
             .expect("Failed to write MCP config");
 
@@ -215,6 +242,12 @@ impl Agent {
     /// Returns None if there is no home directory to anchor to, which just
     /// leaves claude in the launching cwd as before.
     fn prepare_workspace(agent_id: &str) -> Option<PathBuf> {
+        // Validate agent_id to prevent path traversal (CWE-22)
+        if !is_safe_path_segment(agent_id) {
+            eprintln!("[nubi-agent] Invalid agent_id for workspace: {}", agent_id);
+            return None;
+        }
+
         let path = dirs::home_dir()?.join(".nubi-agents").join(agent_id);
         if let Err(e) = fs::create_dir_all(&path) {
             eprintln!("[nubi-agent] Cannot create workspace {:?}: {}", path, e);

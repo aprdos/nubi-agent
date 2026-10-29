@@ -339,19 +339,6 @@ impl Default for Claude {
     }
 }
 
-/// For backward compatibility - static method version
-impl Claude {
-    pub async fn check_available_static() -> anyhow::Result<()> {
-        let output = Command::new("claude").arg("--version").output().await;
-        if output.is_err() {
-            anyhow::bail!(
-                "'claude' not found. Install Claude Code first:\n  npm install -g @anthropic-ai/claude-code"
-            );
-        }
-        Ok(())
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
