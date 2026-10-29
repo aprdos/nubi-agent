@@ -276,6 +276,7 @@ struct RoomData {
 enum RoomKind {
     Dm,
     Group,
+    #[allow(dead_code)]
     Thread(ThreadMeta),
     Skill(ApiSkillMeta),
 }
@@ -362,7 +363,10 @@ impl RoomSkillLoader {
         if !resp.status().is_success() {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
-            return Err(format!("Failed to fetch skill rooms: {} - {}", status, body));
+            return Err(format!(
+                "Failed to fetch skill rooms: {} - {}",
+                status, body
+            ));
         }
 
         let rooms: RoomsResponse = resp
@@ -425,7 +429,12 @@ impl RoomSkillLoader {
         cache.get(room_id).map(|c| c.version)
     }
 
-    fn convert_to_skill(&self, room_id: &str, room_name: Option<&str>, meta: &ApiSkillMeta) -> Skill {
+    fn convert_to_skill(
+        &self,
+        room_id: &str,
+        room_name: Option<&str>,
+        meta: &ApiSkillMeta,
+    ) -> Skill {
         // Use first trigger pattern as the trigger hint
         let trigger = meta.trigger_patterns.first().cloned();
 
@@ -474,7 +483,10 @@ impl CompositeSkillLoader {
                     }
                 }
                 Err(e) => {
-                    eprintln!("[nubi-agent] Room skill loading failed, falling back to filesystem: {}", e);
+                    eprintln!(
+                        "[nubi-agent] Room skill loading failed, falling back to filesystem: {}",
+                        e
+                    );
                 }
             }
         }

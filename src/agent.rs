@@ -107,6 +107,7 @@ struct Shared {
     replies: Semaphore,
     start_time_ms: u64,
     /// Room skill loader for cache invalidation on SSE updates.
+    #[allow(dead_code)]
     room_skill_loader: Option<RoomSkillLoader>,
 }
 
@@ -295,11 +296,7 @@ impl Agent {
 
         // Create loaders
         let fs_loader = SkillLoader::new(shared_dir, Some(agent_skills_dir));
-        let room_loader = RoomSkillLoader::new(
-            &format!("{}", nubi.base_url()),
-            nubi.token(),
-            nubi.space(),
-        );
+        let room_loader = RoomSkillLoader::new(nubi.base_url(), nubi.token(), nubi.space());
 
         let composite = CompositeSkillLoader::new(Some(room_loader), fs_loader);
         let skills = composite.load_all().await;
@@ -312,6 +309,7 @@ impl Agent {
     }
 
     /// Load skills from shared and per-agent directories (legacy, kept for compatibility)
+    #[allow(dead_code)]
     fn load_skills(agent_id: &str) -> (Vec<Skill>, String) {
         Self::load_skills_sync(agent_id)
     }
