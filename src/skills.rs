@@ -266,6 +266,7 @@ struct RoomsResponse {
 #[derive(Debug, Clone, Deserialize)]
 struct RoomData {
     id: String,
+    name: Option<String>,
     kind: Option<RoomKind>,
 }
 
@@ -388,7 +389,7 @@ impl RoomSkillLoader {
                 }
 
                 // Convert to Skill
-                let skill = self.convert_to_skill(&room.id, &meta);
+                let skill = self.convert_to_skill(&room.id, room.name.as_deref(), &meta);
                 cache.insert(
                     room.id.clone(),
                     CachedSkill {
@@ -424,13 +425,13 @@ impl RoomSkillLoader {
         cache.get(room_id).map(|c| c.version)
     }
 
-    fn convert_to_skill(&self, room_id: &str, meta: &ApiSkillMeta) -> Skill {
+    fn convert_to_skill(&self, room_id: &str, room_name: Option<&str>, meta: &ApiSkillMeta) -> Skill {
         // Use first trigger pattern as the trigger hint
         let trigger = meta.trigger_patterns.first().cloned();
 
         Skill {
             meta: SkillMeta {
-                name: room_id.to_string(), // Room ID as name for now
+                name: room_name.unwrap_or(room_id).to_string(),
                 description: meta.description.clone(),
                 trigger,
                 enabled: true,
@@ -491,6 +492,11 @@ impl CompositeSkillLoader {
     /// Get the room loader for cache operations.
     pub fn room_loader(&self) -> Option<&RoomSkillLoader> {
         self.room_loader.as_ref()
+    }
+
+    /// Consume the composite loader and return the room loader with its cache intact.
+    pub fn into_room_loader(self) -> Option<RoomSkillLoader> {
+        self.room_loader
     }
 }
 

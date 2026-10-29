@@ -305,14 +305,8 @@ impl Agent {
         let skills = composite.load_all().await;
         let prompt = SkillLoader::build_prompt_section(&skills);
 
-        // Extract room loader for SSE cache invalidation
-        let room_loader = composite
-            .room_loader()
-            .map(|_| RoomSkillLoader::new(
-                &format!("{}", nubi.base_url()),
-                nubi.token(),
-                nubi.space(),
-            ));
+        // Extract room loader with cache intact for SSE invalidation
+        let room_loader = composite.into_room_loader();
 
         (skills, prompt, room_loader)
     }
