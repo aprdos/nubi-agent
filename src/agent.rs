@@ -12,6 +12,8 @@ use tokio::time::interval;
 use crate::buffer::RoomBuffer;
 use crate::claude::Claude;
 use crate::nubi::NubiClient;
+use crate::runtime::AgentRuntime;
+use crate::skills::{Skill, SkillLoader};
 use crate::types::SseData;
 
 /// How long a room's incoming burst is allowed to settle before we pick a
@@ -23,6 +25,17 @@ const OFFSET_FLUSH_SECS: u64 = 2;
 
 /// Ceiling on simultaneously running claude processes across all rooms.
 const MAX_CONCURRENT_REPLIES: usize = 4;
+
+/// Check if a string is safe to use as a path segment (no traversal)
+fn is_safe_path_segment(s: &str) -> bool {
+    !s.is_empty()
+        && !s.contains('/')
+        && !s.contains('\\')
+        && !s.contains('\0')
+        && s != "."
+        && s != ".."
+        && !s.starts_with("..")
+}
 
 /// Configuration for the agent
 #[derive(Debug, Clone)]
@@ -82,7 +95,7 @@ struct Offsets {
 struct Shared {
     config: AgentConfig,
     nubi: NubiClient,
-    claude: Claude,
+    runtime: Box<dyn AgentRuntime>,
     buffer: Mutex<RoomBuffer>,
     dispatch: Mutex<Dispatch>,
     offsets: Mutex<Offsets>,
@@ -101,6 +114,9 @@ pub struct Agent {
     /// Kept to ensure the temp config file isn't deleted while agent runs
     #[allow(dead_code)]
     mcp_config_path: Option<PathBuf>,
+    /// Loaded skills for this agent
+    #[allow(dead_code)]
+    skills: Vec<Skill>,
 }
 
 impl Agent {
@@ -113,7 +129,10 @@ impl Agent {
 
         let workspace = Self::prepare_workspace(&config.agent_id);
 
-        let claude = Claude::new(&config.agent_id)
+        // Load skills
+        let (skills, skill_prompt) = Self::load_skills(&config.agent_id);
+
+        let mut claude = Claude::new(&config.agent_id)
             .with_skip_permissions(config.skip_permissions)
             .with_system_prompt(config.system_prompt.clone())
             .with_mcp_config(mcp_config_path.as_deref())
@@ -121,6 +140,12 @@ impl Agent {
             .with_llm_base_url(config.llm_base_url.clone())
             .with_llm_api_key(config.llm_api_key.clone())
             .with_model(config.llm_model.clone());
+
+        // Inject skills into the runtime
+        if !skill_prompt.is_empty() {
+            claude.inject_context(&skill_prompt);
+            eprintln!("[nubi-agent] Loaded {} skill(s)", skills.len());
+        }
 
         let buffer = RoomBuffer::new()
             .with_context_size(config.context_size)
@@ -135,7 +160,7 @@ impl Agent {
             shared: Arc::new(Shared {
                 config,
                 nubi,
-                claude,
+                runtime: Box::new(claude),
                 buffer: Mutex::new(buffer),
                 dispatch: Mutex::new(Dispatch::default()),
                 offsets: Mutex::new(Offsets::default()),
@@ -145,11 +170,49 @@ impl Agent {
                 start_time_ms,
             }),
             mcp_config_path,
+            skills,
         }
+    }
+
+    /// Load skills from shared and per-agent directories
+    fn load_skills(agent_id: &str) -> (Vec<Skill>, String) {
+        let home = match dirs::home_dir() {
+            Some(h) => h,
+            None => return (Vec::new(), String::new()),
+        };
+
+        // Validate agent_id to prevent path traversal (CWE-22)
+        if !is_safe_path_segment(agent_id) {
+            eprintln!(
+                "[nubi-agent] Invalid agent_id for skills path: {}",
+                agent_id
+            );
+            return (Vec::new(), String::new());
+        }
+
+        let shared_dir = home.join(".nubi").join("skills");
+        let agent_skills_dir = home.join(".nubi-agents").join(agent_id).join("skills");
+
+        // Create directories if they don't exist (for discoverability)
+        let _ = fs::create_dir_all(&shared_dir);
+        let _ = fs::create_dir_all(&agent_skills_dir);
+
+        let loader = SkillLoader::new(shared_dir, Some(agent_skills_dir));
+        let skills = loader.load_all();
+        let prompt = SkillLoader::build_prompt_section(&skills);
+
+        (skills, prompt)
     }
 
     /// Generate MCP config file for this agent
     fn generate_mcp_config(agent_id: &str, token: &str, mcp_url: &str) -> PathBuf {
+        // Validate agent_id to prevent path traversal (CWE-22)
+        let safe_id = if is_safe_path_segment(agent_id) {
+            agent_id
+        } else {
+            "default"
+        };
+
         let config = serde_json::json!({
             "mcpServers": {
                 "nubi": {
@@ -162,7 +225,7 @@ impl Agent {
             }
         });
 
-        let path = PathBuf::from(format!("/tmp/mcp-{}.json", agent_id));
+        let path = PathBuf::from(format!("/tmp/mcp-{}.json", safe_id));
         fs::write(&path, serde_json::to_string_pretty(&config).unwrap())
             .expect("Failed to write MCP config");
 
@@ -179,7 +242,13 @@ impl Agent {
     /// Returns None if there is no home directory to anchor to, which just
     /// leaves claude in the launching cwd as before.
     fn prepare_workspace(agent_id: &str) -> Option<PathBuf> {
-        let path = std::env::home_dir()?.join(".nubi-agents").join(agent_id);
+        // Validate agent_id to prevent path traversal (CWE-22)
+        if !is_safe_path_segment(agent_id) {
+            eprintln!("[nubi-agent] Invalid agent_id for workspace: {}", agent_id);
+            return None;
+        }
+
+        let path = dirs::home_dir()?.join(".nubi-agents").join(agent_id);
         if let Err(e) = fs::create_dir_all(&path) {
             eprintln!("[nubi-agent] Cannot create workspace {:?}: {}", path, e);
             return None;
@@ -216,7 +285,7 @@ impl Agent {
     /// Run the agent (blocking)
     pub async fn run(&mut self) -> anyhow::Result<()> {
         // Verify setup
-        Claude::check_available().await?;
+        self.shared.runtime.check_available().await?;
 
         eprintln!(
             "[nubi-agent] Connected as '{}' in space '{}', listening for mentions...",
@@ -433,7 +502,7 @@ impl Shared {
 
         let context = self.buffer.lock().unwrap().context(room_id);
         let prompt = self
-            .claude
+            .runtime
             .build_prompt(room_id, &trigger.sender, &trigger.text, &context);
 
         eprintln!("[nubi-agent] Running claude...");
@@ -538,8 +607,8 @@ impl Shared {
             }
         });
 
-        // Run Claude
-        let result = self.claude.run(prompt).await;
+        // Run the runtime (Claude or other)
+        let result = self.runtime.run(prompt).await;
 
         // Signal typing to stop
         done.store(true, Ordering::Relaxed);
