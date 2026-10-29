@@ -151,8 +151,8 @@ impl SkillLoader {
     fn parse_frontmatter(&self, content: &str, path: &Path) -> Option<(SkillMeta, String)> {
         let content = content.trim();
 
-        // Check for frontmatter delimiter
-        if !content.starts_with("---") {
+        // Check for frontmatter delimiter (must be followed by newline)
+        if !content.starts_with("---\n") {
             // No frontmatter, use filename as name
             let name = path.file_stem()?.to_string_lossy().to_string();
             return Some((
@@ -178,7 +178,7 @@ impl SkillLoader {
             .get("name")
             .and_then(|v| v.as_str())
             .map(String::from)
-            .unwrap_or_else(|| path.file_stem().unwrap().to_string_lossy().to_string());
+            .or_else(|| path.file_stem().map(|s| s.to_string_lossy().to_string()))?;
 
         let description = yaml
             .get("description")
