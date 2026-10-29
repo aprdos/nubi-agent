@@ -1,9 +1,11 @@
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use async_trait::async_trait;
 use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 
 use crate::buffer::BufferedMessage;
+use crate::runtime::AgentRuntime;
 
 /// Claude Code invoker
 pub struct Claude {
@@ -15,6 +17,8 @@ pub struct Claude {
     llm_base_url: Option<String>,
     llm_api_key: Option<String>,
     model: Option<String>,
+    /// Additional context injected into the system prompt (e.g., skills)
+    injected_context: Option<String>,
 }
 
 impl Claude {
@@ -28,6 +32,7 @@ impl Claude {
             llm_base_url: None,
             llm_api_key: None,
             model: None,
+            injected_context: None,
         }
     }
 
@@ -184,8 +189,26 @@ Rules:
         self
     }
 
-    /// Check if claude CLI is available
-    pub async fn check_available() -> anyhow::Result<()> {
+    /// Build the full system prompt including base, custom, and injected context
+    fn build_system_prompt(&self) -> String {
+        let mut system_prompt = self.default_system_prompt();
+
+        if let Some(ref extra) = self.system_prompt {
+            system_prompt.push_str("\n\nAbout you specifically:\n");
+            system_prompt.push_str(extra);
+        }
+
+        if let Some(ref context) = self.injected_context {
+            system_prompt.push_str(context);
+        }
+
+        system_prompt
+    }
+}
+
+#[async_trait]
+impl AgentRuntime for Claude {
+    async fn check_available(&self) -> anyhow::Result<()> {
         let output = Command::new("claude").arg("--version").output().await;
         if output.is_err() {
             anyhow::bail!(
@@ -195,8 +218,7 @@ Rules:
         Ok(())
     }
 
-    /// Build prompt with conversation context
-    pub fn build_prompt(
+    fn build_prompt(
         &self,
         room_id: &str,
         sender: &str,
@@ -216,8 +238,6 @@ Rules:
         // Add context if available
         if !context.is_empty() {
             prompt.push_str("[Recent messages]\n");
-            // RoomBuffer::context() already drops the triggering message, so
-            // trimming again here would silently swallow the agent's own last reply.
             for msg in context.iter() {
                 prompt.push_str(&format!("- {}: {}\n", msg.sender, msg.text));
             }
@@ -231,8 +251,7 @@ Rules:
         prompt
     }
 
-    /// Run claude -p with the given prompt
-    pub async fn run(&self, prompt: &str) -> anyhow::Result<String> {
+    async fn run(&self, prompt: &str) -> anyhow::Result<String> {
         let mut args = vec!["-p".to_string(), prompt.to_string()];
 
         if self.skip_permissions {
@@ -244,11 +263,7 @@ Rules:
             args.push(model.clone());
         }
 
-        let mut system_prompt = self.default_system_prompt();
-        if let Some(ref extra) = self.system_prompt {
-            system_prompt.push_str("\n\nAbout you specifically:\n");
-            system_prompt.push_str(extra);
-        }
+        let system_prompt = self.build_system_prompt();
         args.push("--system-prompt".to_string());
         args.push(system_prompt);
 
@@ -287,6 +302,21 @@ Rules:
 
         Ok(strip_thinking_tags(stdout.trim()))
     }
+
+    fn supports_mcp(&self) -> bool {
+        self.mcp_config.is_some()
+    }
+
+    fn inject_context(&mut self, context: &str) {
+        match self.injected_context {
+            Some(ref mut existing) => {
+                existing.push_str(context);
+            }
+            None => {
+                self.injected_context = Some(context.to_string());
+            }
+        }
+    }
 }
 
 /// Strip <thinking>...</thinking> tags from Claude's output
@@ -306,6 +336,19 @@ fn strip_thinking_tags(text: &str) -> String {
 impl Default for Claude {
     fn default() -> Self {
         Self::new("assistant")
+    }
+}
+
+/// For backward compatibility - static method version
+impl Claude {
+    pub async fn check_available_static() -> anyhow::Result<()> {
+        let output = Command::new("claude").arg("--version").output().await;
+        if output.is_err() {
+            anyhow::bail!(
+                "'claude' not found. Install Claude Code first:\n  npm install -g @anthropic-ai/claude-code"
+            );
+        }
+        Ok(())
     }
 }
 
