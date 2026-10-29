@@ -1,6 +1,6 @@
+use async_trait::async_trait;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use async_trait::async_trait;
 use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 

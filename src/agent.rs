@@ -13,7 +13,7 @@ use crate::buffer::RoomBuffer;
 use crate::claude::Claude;
 use crate::nubi::NubiClient;
 use crate::runtime::AgentRuntime;
-use crate::skills::{SkillLoader, Skill};
+use crate::skills::{Skill, SkillLoader};
 use crate::types::SseData;
 
 /// How long a room's incoming burst is allowed to settle before we pick a
@@ -165,7 +165,7 @@ impl Agent {
 
     /// Load skills from shared and per-agent directories
     fn load_skills(agent_id: &str) -> (Vec<Skill>, String) {
-        let home = match std::env::home_dir() {
+        let home = match dirs::home_dir() {
             Some(h) => h,
             None => return (Vec::new(), String::new()),
         };
@@ -215,7 +215,7 @@ impl Agent {
     /// Returns None if there is no home directory to anchor to, which just
     /// leaves claude in the launching cwd as before.
     fn prepare_workspace(agent_id: &str) -> Option<PathBuf> {
-        let path = std::env::home_dir()?.join(".nubi-agents").join(agent_id);
+        let path = dirs::home_dir()?.join(".nubi-agents").join(agent_id);
         if let Err(e) = fs::create_dir_all(&path) {
             eprintln!("[nubi-agent] Cannot create workspace {:?}: {}", path, e);
             return None;

@@ -68,7 +68,8 @@ impl SkillLoader {
         let content = fs::read_to_string(path).ok()?;
         let json: serde_json::Value = serde_json::from_str(&content).ok()?;
 
-        let enabled = json.get("enabled")?
+        let enabled = json
+            .get("enabled")?
             .as_array()?
             .iter()
             .filter_map(|v| v.as_str().map(String::from))
@@ -124,7 +125,7 @@ impl SkillLoader {
 
         for entry in entries.flatten() {
             let path = entry.path();
-            if path.extension().map_or(false, |ext| ext == "md") {
+            if path.extension().is_some_and(|ext| ext == "md") {
                 if let Some(skill) = self.parse_skill(&path) {
                     skills.push(skill);
                 }
@@ -173,20 +174,24 @@ impl SkillLoader {
         // Parse YAML
         let yaml: serde_yaml::Value = serde_yaml::from_str(yaml_content).ok()?;
 
-        let name = yaml.get("name")
+        let name = yaml
+            .get("name")
             .and_then(|v| v.as_str())
             .map(String::from)
             .unwrap_or_else(|| path.file_stem().unwrap().to_string_lossy().to_string());
 
-        let description = yaml.get("description")
+        let description = yaml
+            .get("description")
             .and_then(|v| v.as_str())
             .map(String::from);
 
-        let trigger = yaml.get("trigger")
+        let trigger = yaml
+            .get("trigger")
             .and_then(|v| v.as_str())
             .map(String::from);
 
-        let enabled = yaml.get("enabled")
+        let enabled = yaml
+            .get("enabled")
             .and_then(|v| v.as_bool())
             .unwrap_or(true);
 
@@ -236,7 +241,7 @@ impl SkillLoader {
             }
 
             section.push_str(&skill.content);
-            section.push_str("\n");
+            section.push('\n');
         }
 
         section
@@ -334,19 +339,29 @@ This is the skill content.
         fs::create_dir(&agent).unwrap();
 
         create_skill_file(&shared, "enabled", "---\nname: enabled\n---\nEnabled skill");
-        create_skill_file(&shared, "disabled", "---\nname: disabled\n---\nDisabled skill");
+        create_skill_file(
+            &shared,
+            "disabled",
+            "---\nname: disabled\n---\nDisabled skill",
+        );
 
         // Create manifest that only enables "enabled"
         fs::write(
-            temp.path().join("agent").parent().unwrap().join("agent/skills.json"),
+            temp.path()
+                .join("agent")
+                .parent()
+                .unwrap()
+                .join("agent/skills.json"),
             r#"{"enabled": ["enabled"]}"#,
-        ).ok();
+        )
+        .ok();
 
         // Actually write to the right place
         fs::write(
             temp.path().join("skills.json"),
             r#"{"enabled": ["enabled"]}"#,
-        ).unwrap();
+        )
+        .unwrap();
 
         // Recreate loader to pick up manifest at agent's parent
         let agent_skills = agent.join("skills");
@@ -363,18 +378,16 @@ This is the skill content.
 
     #[test]
     fn test_build_prompt_section() {
-        let skills = vec![
-            Skill {
-                meta: SkillMeta {
-                    name: "test".to_string(),
-                    description: Some("Test skill".to_string()),
-                    trigger: Some("when testing".to_string()),
-                    enabled: true,
-                },
-                content: "Do the test thing.".to_string(),
-                path: PathBuf::from("test.md"),
+        let skills = vec![Skill {
+            meta: SkillMeta {
+                name: "test".to_string(),
+                description: Some("Test skill".to_string()),
+                trigger: Some("when testing".to_string()),
+                enabled: true,
             },
-        ];
+            content: "Do the test thing.".to_string(),
+            path: PathBuf::from("test.md"),
+        }];
 
         let section = SkillLoader::build_prompt_section(&skills);
         assert!(section.contains("## Available Skills"));
