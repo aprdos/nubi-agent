@@ -478,7 +478,9 @@ fn adhoc_section(skills: &[Skill], mandate: Option<&Mandate>, allow_local: bool)
     let mandated = |skill: &Skill| {
         mandate.is_some_and(|m| {
             m.skills.iter().any(|ms| {
-                skill.room_id() == Some(ms.room_id.as_str()) || skill.meta.name == ms.name
+                // Room ids are engine identifiers; names are typed by people
+                skill.room_id() == Some(ms.room_id.as_str())
+                    || skill.meta.name.trim().eq_ignore_ascii_case(ms.name.trim())
             })
         })
     };
@@ -1228,6 +1230,7 @@ mod tests {
         let skills = vec![
             room("refund-9x2k", "Old refund name"), // same room id
             local("Tone"),                          // same name as a mandated skill
+            local(" tone "),                        // same name, other case and padding
             local("deploys"),
             room("faq-1", "FAQ"),
         ];
@@ -1235,6 +1238,7 @@ mod tests {
         let section = adhoc_section(&skills, Some(&mandate), true);
         assert!(!section.contains("Old refund name"));
         assert!(!section.contains("### Tone"));
+        assert!(!section.contains("tone from a file"));
         assert!(section.contains("### deploys"));
         assert!(section.contains("### FAQ"));
 
