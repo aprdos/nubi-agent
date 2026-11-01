@@ -3,9 +3,9 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Rust](https://img.shields.io/badge/rust-1.70%2B-orange.svg)](https://www.rust-lang.org/)
 
-> Run autonomous AI agents powered by Claude Code in your nubi chat rooms.
+> Run autonomous AI agents powered by Claude Code, Codex, Gemini CLI and friends in your nubi chat rooms.
 
-**nubi-agent** connects Claude Code to [nubi](https://github.com/aprdos/nubi), letting you deploy AI agents that respond to messages, use tools, and collaborate with humans in real-time.
+**nubi-agent** connects coding-agent CLIs to [nubi](https://github.com/aprdos/nubi), letting you deploy AI agents that respond to messages, use tools, and collaborate with humans in real-time.
 
 ---
 
@@ -25,7 +25,7 @@
 ### Prerequisites
 
 - [Rust](https://rustup.rs/) 1.70+
-- [Claude Code](https://docs.anthropic.com/en/docs/claude-code) CLI installed
+- One supported agent CLI installed (see [Harnesses](#harnesses)); Claude Code is the default
 - A nubi space with an agent token
 
 ### Install
@@ -84,9 +84,9 @@ sequenceDiagram
 
 **Flow:**
 1. nubi-agent listens to nubi's SSE stream for @mentions
-2. When mentioned, builds prompt with conversation context and spawns Claude Code CLI
-3. Claude Code connects to nubi-mcp via generated MCP config for tool access
-4. Claude can respond via stdout (posted by nubi-agent) or use nubi-mcp tools directly
+2. When mentioned, builds prompt with conversation context and spawns the harness CLI
+3. The harness connects to nubi-mcp through a per-run MCP config for tool access
+4. The agent can respond via stdout (posted by nubi-agent) or use nubi-mcp tools directly
 
 ---
 
@@ -103,7 +103,45 @@ sequenceDiagram
 | `--context-size` | — | `10` | Messages as context |
 | `--rate-limit-ms` | — | `5000` | Cooldown per room |
 | `--heartbeat-secs` | — | `30` | Status update interval |
-| `--skip-permissions` | — | `false` | Auto-approve Claude tools |
+| `--harness` | `NUBI_HARNESS` | `claude` | Which agent CLI to run, see below |
+| `--skip-permissions` | — | `false` | Auto-approve every tool call |
+| `--model` | `NUBI_LLM_MODEL` | `claude-opus-4.5` for claude, else the CLI's own | Model passed to the CLI |
+| `--llm-base-url` | `NUBI_LLM_BASE_URL` | `http://localhost:5000` for claude, else unset | LLM backend override |
+| `--llm-key` | `NUBI_LLM_KEY` | — | API key for that backend |
+
+---
+
+## Harnesses
+
+Pick one with `--harness`. Each message is a fresh one-shot run in the
+agent's workspace (`~/.nubi-agents/<agent>`), and the memory file there is
+how it remembers between messages. The nubi MCP server is wired in per run;
+nothing in your own global CLI config is touched.
+
+| `--harness` | CLI | Memory file | System prompt | `--llm-base-url` / `--llm-key` |
+|---|---|---|---|---|
+| `claude` | `claude -p` | `CLAUDE.md` | `--system-prompt` | `ANTHROPIC_BASE_URL` / `ANTHROPIC_API_KEY` |
+| `codex` | `codex exec` | `AGENTS.md` | `developer_instructions` | `openai_base_url` / `CODEX_API_KEY` |
+| `gemini` | `gemini -p` | `GEMINI.md` | `GEMINI_SYSTEM_MD` | `GOOGLE_GEMINI_BASE_URL` / `GEMINI_API_KEY` |
+| `cursor` | `cursor-agent -p` | `AGENTS.md` | leads the prompt | not supported / `CURSOR_API_KEY` |
+| `opencode` | `opencode run` | `AGENTS.md` | `instructions` | provider `baseURL` / `apiKey`; needs `--model provider/model` |
+| `amp` | `amp -x` | `AGENTS.md` | leads the prompt | not supported / `AMP_API_KEY` |
+| `copilot` | `copilot -p` | `AGENTS.md` | leads the prompt | `COPILOT_PROVIDER_BASE_URL` / `COPILOT_PROVIDER_API_KEY` |
+
+Notes:
+- The nubi token reaches the CLI through the `NUBI_MCP_TOKEN` env var, except
+  for Claude, which reads it from a 0600 temp file as before.
+- Cursor has no MCP flag, so its config goes in the workspace's `.cursor/`.
+- Amp chooses its own models; `--model` is passed as `--mode` (`low`,
+  `medium`, `high`, `ultra`).
+- Log in to the CLI first (`codex login`, `gemini`, `cursor-agent login`, ...)
+  unless you pass `--llm-key`.
+
+Try a harness without nubi:
+
+```bash
+cargo run --example harness_smoke -- gemini "say hi in three words"
+```
 
 ---
 
@@ -128,6 +166,12 @@ nubi-agent \
   --heartbeat-secs 60
 ```
 
+**Same agent on Codex:**
+
+```bash
+nubi-agent --agent reviewer --harness codex --model gpt-5-codex
+```
+
 **Quiet bot (no heartbeat):**
 
 ```bash
@@ -146,7 +190,7 @@ nubi-agent/
 │   ├── main.rs      # CLI entry point
 │   ├── lib.rs       # Library exports
 │   ├── agent.rs     # Core agent loop + typing indicator
-│   ├── claude.rs    # Claude Code invocation
+│   ├── harness/     # Agent CLIs: shared runtime + one adapter per CLI
 │   ├── nubi.rs      # Nubi API client
 │   ├── buffer.rs    # Message context buffer
 │   └── types.rs     # SSE data types

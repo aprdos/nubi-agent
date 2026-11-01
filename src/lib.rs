@@ -1,6 +1,6 @@
 pub mod agent;
 pub mod buffer;
-pub mod claude;
+pub mod harness;
 pub mod nubi;
 pub mod runtime;
 pub mod skills;
