@@ -171,16 +171,30 @@ fn toml_string(s: &str) -> String {
 /// Write a generated file only its owner can read: several of them carry the
 /// nubi token.
 fn write_private(path: &Path, contents: &str) -> anyhow::Result<()> {
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir)?;
-    }
-    std::fs::write(path, contents)?;
+    use std::io::Write;
+
+    let dir = path.parent().unwrap_or(Path::new("."));
+    std::fs::create_dir_all(dir)?;
+
+    // Created 0600 from the first byte, then renamed over the target: writing
+    // first and chmod-ing after leaves a window where the token is readable,
+    // and an existing file keeps whatever mode it already had.
+    let tmp = dir.join(format!(".{}.tmp", uuid::Uuid::new_v4()));
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
     }
-    Ok(())
+    let written = options
+        .open(&tmp)
+        .and_then(|mut f| f.write_all(contents.as_bytes()))
+        .and_then(|_| std::fs::rename(&tmp, path));
+    if written.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    Ok(written?)
 }
 
 /// Spawns a harness CLI once per message.
@@ -526,8 +540,11 @@ impl AgentRuntime for CliRuntime {
 fn strip_thinking_tags(text: &str) -> String {
     let mut result = text.to_string();
     while let Some(start) = result.find("<thinking>") {
-        if let Some(end) = result.find("</thinking>") {
-            let end = end + "</thinking>".len();
+        // Look for the close only after the open: a stray </thinking> earlier
+        // in the text would otherwise splice the string back onto itself and
+        // never terminate.
+        if let Some(rel) = result[start..].find("</thinking>") {
+            let end = start + rel + "</thinking>".len();
             result = format!("{}{}", &result[..start], &result[end..]);
         } else {
             break;
@@ -781,6 +798,39 @@ mod tests {
         token_only_in_env(&inv);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn write_private_tightens_an_existing_loose_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("nubi-private-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("cfg.json");
+        std::fs::write(&path, "old").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        write_private(&path, "new").unwrap();
+
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "new");
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        assert_eq!(
+            std::fs::read_dir(&dir).unwrap().count(),
+            1,
+            "temp file left behind"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn amp_keeps_the_token_out_of_argv() {
+        let inv = amp::Amp.invocation(&settings(), "SYS", "hi");
+        assert!(inv
+            .args
+            .iter()
+            .any(|a| a.contains("Bearer ${NUBI_MCP_TOKEN}")));
+        token_only_in_env(&inv);
+    }
+
     #[test]
     fn memory_prompt_names_the_harness_file() {
         let rt =
@@ -804,6 +854,10 @@ mod tests {
         assert_eq!(
             strip_thinking_tags("<thinking>one</thinking>A<thinking>two</thinking>B"),
             "AB"
+        );
+        assert_eq!(
+            strip_thinking_tags("a</thinking>b<thinking>c</thinking>d"),
+            "a</thinking>bd"
         );
     }
 }

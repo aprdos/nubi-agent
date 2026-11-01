@@ -1,4 +1,7 @@
-use super::{warn_unsupported, with_instructions, Harness, Invocation, Settings};
+use super::{
+    pass_mcp_token, warn_unsupported, with_instructions, Harness, Invocation, Settings,
+    MCP_TOKEN_ENV,
+};
 
 /// Sourcegraph Amp: `amp -x`.
 pub struct Amp;
@@ -24,15 +27,16 @@ impl Harness for Amp {
     fn invocation(&self, settings: &Settings, system_prompt: &str, prompt: &str) -> Invocation {
         let mut inv = Invocation::default();
         if let Some(ref mcp) = settings.mcp {
-            // Inline config needs no `amp mcp approve`. Amp only documents
-            // env interpolation for settings files, so the token is literal.
+            // Inline config needs no `amp mcp approve`. The token stays in
+            // the env: argv is visible to every local user through ps.
             let config = serde_json::json!({
                 "nubi": {
                     "url": mcp.url,
-                    "headers": { "Authorization": format!("Bearer {}", mcp.token) }
+                    "headers": { "Authorization": format!("Bearer ${{{MCP_TOKEN_ENV}}}") }
                 }
             });
             inv.arg("--mcp-config").arg(config.to_string());
+            pass_mcp_token(settings, &mut inv);
         }
         if settings.skip_permissions {
             inv.arg("--dangerously-allow-all");

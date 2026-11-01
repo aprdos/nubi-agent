@@ -130,8 +130,7 @@ nothing in your own global CLI config is touched.
 
 Notes:
 - The nubi token reaches the CLI through the `NUBI_MCP_TOKEN` env var, except
-  for Claude (a 0600 temp file, as before) and Amp (inline `--mcp-config`,
-  since Amp does not interpolate env vars there).
+  for Claude, which reads it from a 0600 temp file as before.
 - Cursor has no MCP flag, so its config goes in the workspace's `.cursor/`.
 - Amp chooses its own models; `--model` is passed as `--mode` (`low`,
   `medium`, `high`, `ultra`).
