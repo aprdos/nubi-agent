@@ -46,6 +46,6 @@ async fn main() -> anyhow::Result<()> {
         .with_mcp(mcp);
     rt.check_available().await?;
     let prompt = rt.build_prompt("dm.alice.smoke-bot", "alice", &message, &[]);
-    println!("{}", rt.run(&prompt).await?);
+    println!("{}", rt.run(&prompt).await?.text);
     Ok(())
 }

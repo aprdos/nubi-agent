@@ -2,8 +2,9 @@
 //!
 //! The engine resolves them at `GET /v1/spaces/{space}/agents/{agent}/mandate`
 //! and hashes the result. nubi-agent injects the mandate at the top of the
-//! system prompt, recomputes the hash from the text it actually injected, and
-//! refuses a turn when the two disagree.
+//! system prompt, recomputes the hash from the parsed skills it injected (the
+//! same list the section is rendered from), and refuses a turn when the two
+//! disagree.
 
 use reqwest::{Client, StatusCode};
 use serde::{Deserialize, Serialize};
@@ -184,13 +185,39 @@ fn display_name(skill: &MandateSkill) -> &str {
 /// What a fetch found.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Fetched {
-    /// 404: the engine has no mandate for this agent (or no mandates at all).
+    /// 404 and nothing cached: the engine has no mandate for this agent (or
+    /// no mandates at all).
     NoMandate,
+    /// 404 after a mandate had been served. Not taken as "no mandate": the
+    /// cached one is kept and the caller decides how far to trust it.
+    Gone,
     /// 304: the cached mandate is still current.
     Unchanged,
     /// 200 with a new body.
     Updated,
 }
+
+/// Why a fetch failed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FetchError {
+    /// The engine could not be reached or answered with an error status.
+    /// Transient: retry later and keep whatever was fetched before.
+    Transport(String),
+    /// The engine answered 200 with a body that is not a mandate. The cached
+    /// mandate (if any) is kept, but it can no longer be verified.
+    Parse(String),
+}
+
+impl std::fmt::Display for FetchError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            FetchError::Transport(e) => write!(f, "mandate fetch failed: {e}"),
+            FetchError::Parse(e) => write!(f, "cannot parse mandate: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for FetchError {}
 
 /// Fetches and caches the agent's mandate, using the ETag for conditional
 /// requests.
@@ -238,7 +265,10 @@ impl MandateLoader {
 
     /// Fetch the mandate. `conditional` sends `If-None-Match` with the cached
     /// ETag, so an unchanged mandate costs a 304.
-    pub async fn fetch(&self, conditional: bool) -> Result<Fetched, String> {
+    ///
+    /// The cache only changes on a 200 that parses, or on a 404 when nothing
+    /// was cached yet; every other outcome leaves the last good mandate.
+    pub async fn fetch(&self, conditional: bool) -> Result<Fetched, FetchError> {
         let mut req = self
             .client
             .get(&self.url)
@@ -255,12 +285,15 @@ impl MandateLoader {
         let resp = req
             .send()
             .await
-            .map_err(|e| format!("mandate fetch failed: {e}"))?;
+            .map_err(|e| FetchError::Transport(e.to_string()))?;
 
         match resp.status() {
             StatusCode::NOT_FOUND => {
-                *self.cached.lock().unwrap() = None;
-                Ok(Fetched::NoMandate)
+                if self.cached.lock().unwrap().is_some() {
+                    Ok(Fetched::Gone)
+                } else {
+                    Ok(Fetched::NoMandate)
+                }
             }
             StatusCode::NOT_MODIFIED if etag.is_some() => Ok(Fetched::Unchanged),
             status if status.is_success() => {
@@ -269,10 +302,13 @@ impl MandateLoader {
                     .get("etag")
                     .and_then(|v| v.to_str().ok())
                     .map(String::from);
-                let mandate: Mandate = resp
-                    .json()
+                let body = resp
+                    .text()
                     .await
-                    .map_err(|e| format!("cannot parse mandate: {e}"))?;
+                    .map_err(|e| FetchError::Transport(format!("reading body: {e}")))?;
+                // serde_json names the missing or mistyped field in its message.
+                let mandate: Mandate =
+                    serde_json::from_str(&body).map_err(|e| FetchError::Parse(e.to_string()))?;
                 // Echo back whatever the server sent; quote the hash otherwise.
                 let etag = header_etag.unwrap_or_else(|| format!("\"{}\"", mandate.hash));
                 *self.cached.lock().unwrap() = Some((etag, mandate));
@@ -280,7 +316,7 @@ impl MandateLoader {
             }
             status => {
                 let body = resp.text().await.unwrap_or_default();
-                Err(format!("mandate fetch failed: {status} - {body}"))
+                Err(FetchError::Transport(format!("{status} - {body}")))
             }
         }
     }
@@ -440,8 +476,62 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn unreachable_engine_is_an_error() {
+    async fn a_404_after_a_mandate_keeps_the_last_good_one() {
+        let body = resolve_body(&fixture());
+        let engine = MockEngine::start(MockState {
+            mandate: Some(body.clone()),
+            ..Default::default()
+        })
+        .await;
+        let loader = MandateLoader::new(&engine.url, "tok", "s1", "support-bot");
+        assert_eq!(loader.fetch(true).await.unwrap(), Fetched::Updated);
+
+        engine.state().mandate = None;
+        assert_eq!(loader.fetch(true).await.unwrap(), Fetched::Gone);
+        assert_eq!(
+            loader.current_hash(),
+            body["hash"].as_str().map(String::from)
+        );
+        // Still conditional on the last good ETag, so a restored mandate costs a 304.
+        engine.state().mandate = Some(body.clone());
+        assert_eq!(loader.fetch(true).await.unwrap(), Fetched::Unchanged);
+    }
+
+    #[tokio::test]
+    async fn unreachable_engine_is_a_transport_error() {
         let loader = MandateLoader::new("http://127.0.0.1:1", "tok", "s1", "a");
-        assert!(loader.fetch(true).await.is_err());
+        assert!(matches!(
+            loader.fetch(true).await,
+            Err(FetchError::Transport(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_body_that_is_not_a_mandate_is_a_parse_error_and_keeps_the_cache() {
+        let body = resolve_body(&fixture());
+        let engine = MockEngine::start(MockState {
+            mandate: Some(body.clone()),
+            ..Default::default()
+        })
+        .await;
+        let loader = MandateLoader::new(&engine.url, "tok", "s1", "support-bot");
+        assert_eq!(loader.fetch(true).await.unwrap(), Fetched::Updated);
+
+        engine.state().mandate = Some(json!({"agent_id": "support-bot", "skills": []}));
+        match loader.fetch(false).await {
+            Err(FetchError::Parse(msg)) => assert!(msg.contains("hash"), "{msg}"),
+            other => panic!("expected a parse error, got {other:?}"),
+        }
+        assert_eq!(
+            loader.current_hash(),
+            body["hash"].as_str().map(String::from)
+        );
+
+        // A 5xx is still a transport error.
+        engine.state().mandate_fail = Some(503);
+        assert!(matches!(
+            loader.fetch(true).await,
+            Err(FetchError::Transport(_))
+        ));
     }
 }

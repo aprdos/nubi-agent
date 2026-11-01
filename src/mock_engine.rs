@@ -24,6 +24,9 @@ pub struct MockState {
     pub mandate: Option<Value>,
     /// Answer every mandate request with this status instead (e.g. 500).
     pub mandate_fail: Option<u16>,
+    /// Hold every mandate response this long, to let a test interleave
+    /// something with an in-flight fetch.
+    pub mandate_delay_ms: u64,
     /// The `If-None-Match` header of every mandate request, in order.
     pub mandate_requests: Vec<Option<String>>,
     /// Query strings of every room list request.
@@ -102,13 +105,24 @@ async fn skill_prompt(State(s): Shared, Path((_space, room)): Path<(String, Stri
 }
 
 async fn mandate(State(s): Shared, headers: HeaderMap) -> Response {
-    let mut s = s.lock().unwrap();
-    let inm = headers
-        .get("if-none-match")
-        .and_then(|v| v.to_str().ok())
-        .map(String::from);
-    s.mandate_requests.push(inm.clone());
+    // Decide the answer under the lock, then release it before any delay so
+    // the test can change the state while this response is in flight.
+    let (response, delay_ms) = {
+        let mut s = s.lock().unwrap();
+        let inm = headers
+            .get("if-none-match")
+            .and_then(|v| v.to_str().ok())
+            .map(String::from);
+        s.mandate_requests.push(inm.clone());
+        (mandate_response(&s, inm.as_deref()), s.mandate_delay_ms)
+    };
+    if delay_ms > 0 {
+        tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+    }
+    response
+}
 
+fn mandate_response(s: &MockState, inm: Option<&str>) -> Response {
     if let Some(code) = s.mandate_fail {
         return StatusCode::from_u16(code)
             .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR)
@@ -119,7 +133,7 @@ async fn mandate(State(s): Shared, headers: HeaderMap) -> Response {
         return (StatusCode::NOT_FOUND, Json(json!({"error": "not found"}))).into_response();
     };
     let etag = etag_for(&body);
-    if inm.as_deref() == Some(etag.as_str()) {
+    if inm == Some(etag.as_str()) {
         return (StatusCode::NOT_MODIFIED, [("etag", etag)]).into_response();
     }
     ([("etag", etag)], Json(body)).into_response()

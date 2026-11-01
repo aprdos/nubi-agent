@@ -3,6 +3,17 @@ use async_trait::async_trait;
 use crate::buffer::BufferedMessage;
 use crate::mandate::Mandate;
 
+/// What one run of the LLM produced.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunOutput {
+    /// The model's answer.
+    pub text: String,
+    /// Hash of the mandate that was in the system prompt for this run (see
+    /// [`AgentRuntime::mandate_hash`]), read together with the prompt so the
+    /// two cannot drift apart. None when no mandate was injected.
+    pub mandate_hash: Option<String>,
+}
+
 /// A runtime that can execute LLM invocations.
 ///
 /// Different providers (Claude Code, OpenAI, Ollama, etc.) implement this trait
@@ -24,8 +35,9 @@ pub trait AgentRuntime: Send + Sync {
         context: &[BufferedMessage],
     ) -> String;
 
-    /// Run the LLM with the given prompt and return the response.
-    async fn run(&self, prompt: &str) -> anyhow::Result<String>;
+    /// Run the LLM with the given prompt and return the response, together
+    /// with the hash of the mandate that was in the system prompt it used.
+    async fn run(&self, prompt: &str) -> anyhow::Result<RunOutput>;
 
     /// Whether this runtime supports MCP tools.
     fn supports_mcp(&self) -> bool;
@@ -40,11 +52,13 @@ pub trait AgentRuntime: Send + Sync {
     /// The two are set together because ad-hoc skills are deduplicated
     /// against the mandate. Takes `&self` so a running agent can swap them
     /// between turns; a run already in flight keeps the prompt it started
-    /// with. Runtimes that write the system prompt to disk rewrite it here.
+    /// with. Runtimes that write the system prompt to disk rewrite it here,
+    /// and on an error keep the previous mandate injected, so what
+    /// [`Self::mandate_hash`] reports never runs ahead of what is on disk.
     fn inject_mandate(&self, mandate: Option<&Mandate>, adhoc_skills: &str) -> anyhow::Result<()>;
 
-    /// Hash of the mandate as currently injected, recomputed from the skill
-    /// text going into the prompt (see [`crate::mandate::mandate_hash`]).
-    /// None when no mandate is injected.
+    /// Hash of the mandate as currently injected, recomputed from the parsed
+    /// skills the prompt section was rendered from (see
+    /// [`crate::mandate::mandate_hash`]). None when no mandate is injected.
     fn mandate_hash(&self) -> Option<String>;
 }

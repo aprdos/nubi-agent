@@ -15,7 +15,7 @@ use tokio::process::Command;
 
 use crate::buffer::BufferedMessage;
 use crate::mandate::{build_mandate_section, Mandate};
-use crate::runtime::AgentRuntime;
+use crate::runtime::{AgentRuntime, RunOutput};
 
 mod amp;
 mod claude;
@@ -408,13 +408,28 @@ Rules:
         self.harness.memory_file()
     }
 
+    /// The current system prompt (see [`Self::render_system_prompt`]).
+    fn build_system_prompt(&self) -> String {
+        self.system_prompt_and_hash().0
+    }
+
+    /// The current system prompt and the hash of the mandate in it, taken
+    /// under one read of the skills lock so a swap between the two reads
+    /// cannot stamp a reply with a hash the prompt never carried.
+    fn system_prompt_and_hash(&self) -> (String, Option<String>) {
+        let skills = self.skills.read().unwrap();
+        (
+            self.render_system_prompt(&skills),
+            skills.mandate.as_ref().map(Mandate::computed_hash),
+        )
+    }
+
     /// Build the full system prompt: identity, mandate, the default
     /// instructions, the custom prompt, injected context, ad-hoc skills.
     ///
     /// The mandate sits above the custom `--system-prompt` so personality text
     /// cannot override it, and ad-hoc skills come last.
-    fn build_system_prompt(&self) -> String {
-        let skills = self.skills.read().unwrap();
+    fn render_system_prompt(&self, skills: &InjectedSkills) -> String {
         let mut system_prompt = self.identity();
 
         if !skills.mandate_section.is_empty() {
@@ -498,11 +513,12 @@ impl AgentRuntime for CliRuntime {
         prompt
     }
 
-    async fn run(&self, prompt: &str) -> anyhow::Result<String> {
+    async fn run(&self, prompt: &str) -> anyhow::Result<RunOutput> {
         let bin = self.harness.binary();
+        let (system_prompt, mandate_hash) = self.system_prompt_and_hash();
         let inv = self
             .harness
-            .invocation(&self.settings, &self.build_system_prompt(), prompt);
+            .invocation(&self.settings, &system_prompt, prompt);
 
         let mut cmd = Command::new(bin);
         cmd.args(&inv.args)
@@ -569,7 +585,10 @@ impl AgentRuntime for CliRuntime {
             None => stdout,
         };
         let answer = self.harness.parse_output(&raw)?;
-        Ok(strip_thinking_tags(answer.trim()))
+        Ok(RunOutput {
+            text: strip_thinking_tags(answer.trim()),
+            mandate_hash,
+        })
     }
 
     fn supports_mcp(&self) -> bool {
@@ -588,15 +607,21 @@ impl AgentRuntime for CliRuntime {
     }
 
     fn inject_mandate(&self, mandate: Option<&Mandate>, adhoc_skills: &str) -> anyhow::Result<()> {
-        {
-            let mut skills = self.skills.write().unwrap();
-            skills.mandate_section = mandate.map(build_mandate_section).unwrap_or_default();
-            skills.mandate = mandate.cloned();
-            skills.adhoc = adhoc_skills.to_string();
-        }
+        let next = InjectedSkills {
+            mandate_section: mandate.map(build_mandate_section).unwrap_or_default(),
+            mandate: mandate.cloned(),
+            adhoc: adhoc_skills.to_string(),
+        };
+        // Rewrite any on-disk prompt first and commit only if that worked:
+        // otherwise the hash check would pass against memory while the CLI
+        // reads the old file. The write lock is held across the rewrite so a
+        // run cannot pick up the new prompt before it is on disk.
+        let mut skills = self.skills.write().unwrap();
         if self.prepared.load(Ordering::SeqCst) {
-            self.prepare_harness()?;
+            self.harness
+                .prepare(&self.settings, &self.render_system_prompt(&next))?;
         }
+        *skills = next;
         Ok(())
     }
 
@@ -989,8 +1014,21 @@ mod tests {
         assert_eq!(rt.mandate_hash(), None);
     }
 
-    /// Records every system prompt `prepare()` is handed.
-    struct Recording(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
+    /// Records every system prompt `prepare()` is handed; fails while `fail`
+    /// is set.
+    struct Recording {
+        calls: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+        fail: std::sync::Arc<AtomicBool>,
+    }
+
+    impl Recording {
+        fn new(calls: std::sync::Arc<std::sync::Mutex<Vec<String>>>) -> Self {
+            Self {
+                calls,
+                fail: Default::default(),
+            }
+        }
+    }
 
     impl Harness for Recording {
         fn binary(&self) -> &'static str {
@@ -1003,7 +1041,10 @@ mod tests {
             "MEMORY.md"
         }
         fn prepare(&self, _settings: &Settings, system_prompt: &str) -> anyhow::Result<()> {
-            self.0.lock().unwrap().push(system_prompt.to_string());
+            if self.fail.load(Ordering::SeqCst) {
+                anyhow::bail!("disk full");
+            }
+            self.calls.lock().unwrap().push(system_prompt.to_string());
             Ok(())
         }
         fn invocation(&self, _: &Settings, _: &str, _: &str) -> Invocation {
@@ -1014,7 +1055,7 @@ mod tests {
     #[test]
     fn a_mandate_change_reruns_prepare_once_prepared() {
         let calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        let rt = CliRuntime::with_harness(Box::new(Recording(calls.clone())), "bot");
+        let rt = CliRuntime::with_harness(Box::new(Recording::new(calls.clone())), "bot");
 
         // Before the first prepare there is nothing on disk to rewrite.
         rt.inject_mandate(None, "").unwrap();
@@ -1026,6 +1067,51 @@ mod tests {
         assert_eq!(calls.len(), 2);
         assert!(!calls[0].contains(crate::mandate::MANDATE_HEADING));
         assert!(calls[1].contains(crate::mandate::MANDATE_HEADING));
+    }
+
+    #[test]
+    fn a_failed_prepare_keeps_the_previous_mandate_injected() {
+        let calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recording = Recording::new(calls.clone());
+        let fail = recording.fail.clone();
+        let rt = CliRuntime::with_harness(Box::new(recording), "bot");
+        rt.prepare_harness().unwrap();
+        let old = mandate();
+        rt.inject_mandate(Some(&old), "").unwrap();
+        assert_eq!(rt.mandate_hash(), Some(old.hash.clone()));
+
+        let mut new = old.clone();
+        new.skills[0].content = "Refund within 60 days.".into();
+        fail.store(true, Ordering::SeqCst);
+        assert!(rt.inject_mandate(Some(&new), "").is_err());
+
+        // Memory still matches what prepare() last wrote.
+        assert_eq!(rt.mandate_hash(), Some(old.hash));
+        let sp = rt.build_system_prompt();
+        assert!(sp.contains("Refund within 30 days."));
+        assert!(!sp.contains("Refund within 60 days."));
+        assert_eq!(calls.lock().unwrap().len(), 2);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_unwritable_prompt_file_leaves_the_old_prompt_in_place() {
+        use std::os::unix::fs::PermissionsExt;
+        let id = format!("mandate-ro-{}", uuid::Uuid::new_v4());
+        let rt = CliRuntime::new(HarnessKind::Gemini, &id);
+        rt.prepare_harness().unwrap();
+        let dir = rt.settings.state_dir();
+        let path = dir.join("gemini-system.md");
+        let before = std::fs::read_to_string(&path).unwrap();
+
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let result = rt.inject_mandate(Some(&mandate()), "");
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        assert!(result.is_err(), "writing into a read-only dir must fail");
+        assert_eq!(rt.mandate_hash(), None, "the mandate was not committed");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

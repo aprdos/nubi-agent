@@ -11,9 +11,9 @@ use tokio::time::interval;
 
 use crate::buffer::RoomBuffer;
 use crate::harness::{CliRuntime, HarnessKind, McpServer};
-use crate::mandate::{Fetched, Mandate, MandateLoader};
+use crate::mandate::{FetchError, Fetched, Mandate, MandateLoader};
 use crate::nubi::NubiClient;
-use crate::runtime::AgentRuntime;
+use crate::runtime::{AgentRuntime, RunOutput};
 use crate::skills::{CompositeSkillLoader, RoomSkillLoader, Skill, SkillLoader};
 use crate::types::{MandateUpdate, SseData};
 
@@ -89,12 +89,22 @@ impl Default for AgentConfig {
 }
 
 /// Where the mandate stands, as far as the agent knows.
-#[derive(Debug, Default, Clone, Copy)]
+#[derive(Debug, Default, Clone)]
 struct MandateStatus {
     /// A fetch has succeeded at least once (a 404 counts: it says "none").
     known: bool,
-    /// The engine announced a change we have not fetched yet.
+    /// The injected mandate is not known to be the engine's current one: a
+    /// change was announced and not yet fetched, or a fetched mandate could
+    /// not be injected. Turns are refused while this is set.
     dirty: bool,
+    /// The hash the engine's last `mandate_update` announced, until a fetch
+    /// returns exactly that hash. A fetch that was already in flight when the
+    /// update arrived can finish with the old mandate and must not count.
+    announced: Option<String>,
+    /// The last fetch could not confirm the held mandate: the engine answered
+    /// 404 after serving one, or 200 with a body that is not a mandate. The
+    /// last good mandate stays injected; `--mandate-strict` refuses turns.
+    unverified: bool,
 }
 
 /// The message a room worker will answer. Only the newest one per room is kept.
@@ -423,7 +433,10 @@ impl Agent {
                     }
                 }
                 Ok(eventsource_client::SSE::Event(ev)) if ev.event_type == "mandate_update" => {
-                    self.shared.on_mandate_update(&ev.data).await;
+                    // Off the SSE loop: a slow mandate endpoint must not hold
+                    // up room ingestion. Refreshes serialise on their own lock.
+                    let shared = Arc::clone(&self.shared);
+                    tokio::spawn(async move { shared.on_mandate_update(&ev.data).await });
                 }
                 Ok(_) => {}
                 Err(e) => {
@@ -471,6 +484,11 @@ async fn flush_offsets(shared: Arc<Shared>) {
     }
 }
 
+/// A hash for a log line, or "none".
+fn describe(hash: Option<&str>) -> &str {
+    hash.unwrap_or("none")
+}
+
 /// The ad-hoc skills section: skills from room membership and files, minus
 /// any that collide with a mandated skill by room id or name (so a local file
 /// cannot shadow a mandate), and minus files when local skills are off.
@@ -503,51 +521,102 @@ impl Shared {
         self.runtime.inject_mandate(mandate.as_ref(), &adhoc)
     }
 
-    /// Fetch the mandate and re-inject it if it changed. `conditional` sends
+    /// Fetch the mandate and re-inject it when needed. `conditional` sends
     /// the cached ETag; an unconditional fetch always re-injects.
+    ///
+    /// The status only moves to "current" once the new mandate is injected
+    /// (prompt file rewritten included) and its hash is the one the engine
+    /// last announced. A failed injection leaves the previous mandate in the
+    /// prompt and the status dirty, so the turn is refused and the next check
+    /// retries. A 404 after a mandate was held, or a body that does not
+    /// parse, keeps the last good mandate and marks it unverified.
     async fn refresh_mandate(&self, conditional: bool) -> Result<(), String> {
         let Some(loader) = &self.mandate else {
             return Ok(());
         };
         let _guard = self.mandate_refresh.lock().await;
 
-        let fetched = loader.fetch(conditional).await?;
-        {
-            let mut status = self.mandate_status.lock().unwrap();
-            status.known = true;
-            status.dirty = false;
+        let fetched = match loader.fetch(conditional).await {
+            Ok(f) => f,
+            Err(FetchError::Parse(e)) => {
+                self.mandate_status.lock().unwrap().unverified = true;
+                eprintln!(
+                    "[nubi-agent] ERROR: the engine's mandate body is not a mandate ({e}); \
+                     keeping the last good one {}",
+                    describe(loader.current_hash().as_deref())
+                );
+                return Err(format!("cannot parse mandate: {e}"));
+            }
+            Err(e @ FetchError::Transport(_)) => return Err(e.to_string()),
+        };
+        if fetched == Fetched::Gone {
+            self.mandate_status.lock().unwrap().unverified = true;
+            eprintln!(
+                "[nubi-agent] ERROR: the engine no longer serves the mandate (404); \
+                 keeping the last good one {}",
+                describe(loader.current_hash().as_deref())
+            );
+            return Err("the engine no longer serves the mandate (404)".into());
         }
 
-        let changed = match fetched {
+        let needs_apply = match fetched {
             Fetched::Updated => true,
             Fetched::NoMandate => self.runtime.mandate_hash().is_some(),
-            Fetched::Unchanged => false,
-        };
-        if !changed && conditional {
-            return Ok(());
+            // A dirty status after a 304 means the last injection failed (or
+            // an announced change is still pending): inject again.
+            Fetched::Unchanged | Fetched::Gone => self.mandate_status.lock().unwrap().dirty,
+        } || !conditional;
+
+        if needs_apply {
+            match loader.current() {
+                Some(m) => {
+                    let revisions: Vec<String> = m
+                        .sets
+                        .iter()
+                        .map(|s| format!("{}@{}", s.set_id, s.revision))
+                        .collect();
+                    eprintln!(
+                        "[nubi-agent] Mandate {}: {} skill(s) from [{}]",
+                        m.hash,
+                        m.skills.len(),
+                        revisions.join(", ")
+                    );
+                    for w in &m.warnings {
+                        eprintln!("[nubi-agent] Mandate warning: {}", w);
+                    }
+                }
+                None => eprintln!("[nubi-agent] No mandate"),
+            }
+            if let Err(e) = self.apply_mandate() {
+                self.mandate_status.lock().unwrap().dirty = true;
+                return Err(format!("cannot inject mandate: {e}"));
+            }
         }
 
-        match loader.current() {
-            Some(m) => {
-                let revisions: Vec<String> = m
-                    .sets
-                    .iter()
-                    .map(|s| format!("{}@{}", s.set_id, s.revision))
-                    .collect();
+        let mut status = self.mandate_status.lock().unwrap();
+        status.known = true;
+        status.unverified = false;
+        let server = loader.current_hash();
+        let outstanding = status
+            .announced
+            .as_deref()
+            .filter(|a| server.as_deref() != Some(*a))
+            .map(String::from);
+        match outstanding {
+            Some(announced) => {
+                status.dirty = true;
                 eprintln!(
-                    "[nubi-agent] Mandate {}: {} skill(s) from [{}]",
-                    m.hash,
-                    m.skills.len(),
-                    revisions.join(", ")
+                    "[nubi-agent] Engine announced mandate {} but served {}; holding replies",
+                    announced,
+                    describe(server.as_deref())
                 );
-                for w in &m.warnings {
-                    eprintln!("[nubi-agent] Mandate warning: {}", w);
-                }
             }
-            None => eprintln!("[nubi-agent] No mandate"),
+            None => {
+                status.dirty = false;
+                status.announced = None;
+            }
         }
-        self.apply_mandate()
-            .map_err(|e| format!("cannot inject mandate: {e}"))
+        Ok(())
     }
 
     /// First mandate fetch, before any room is served. A transient failure is
@@ -582,9 +651,6 @@ impl Shared {
     /// prompt file) has the new mandate. A failed refetch leaves the mandate
     /// marked stale, and turns are refused until a refetch succeeds.
     async fn on_mandate_update(&self, data: &str) {
-        let Some(loader) = &self.mandate else {
-            return;
-        };
         let update: MandateUpdate = match serde_json::from_str(data) {
             Ok(u) => u,
             Err(e) => {
@@ -592,23 +658,9 @@ impl Shared {
                 return;
             }
         };
-        if update.agent_id != self.config.agent_id {
+        if !self.announce_mandate(&update) {
             return;
         }
-        let current = loader.current_hash();
-        if current.as_deref() == Some(update.hash.as_str())
-            && self.runtime.mandate_hash() == current
-        {
-            return;
-        }
-
-        self.mandate_status.lock().unwrap().dirty = true;
-        eprintln!(
-            "[nubi-agent] Mandate changed (revision {}), refetching",
-            update
-                .revision
-                .map_or_else(|| "?".to_string(), |r| r.to_string())
-        );
         if let Err(e) = self.refresh_mandate(true).await {
             eprintln!(
                 "[nubi-agent] {}; replies are held until it can be fetched",
@@ -617,26 +669,75 @@ impl Shared {
         }
     }
 
-    /// Before a turn: make sure the mandate in the prompt is the engine's
-    /// current one. Returns the hash to stamp on the reply (None when there
-    /// is no mandate), or why the turn must be refused.
-    ///
-    /// The hash is recomputed from the skill text actually injected, so a
-    /// dropped or edited skill shows up as a mismatch. A mismatch gets one
-    /// unconditional refetch; if it persists the turn is refused.
-    async fn check_mandate(&self) -> Result<Option<String>, String> {
+    /// Record an announced mandate hash. Returns whether a refetch is due:
+    /// false for another agent's update or a hash we already hold.
+    fn announce_mandate(&self, update: &MandateUpdate) -> bool {
         let Some(loader) = &self.mandate else {
-            return Ok(None);
+            return false;
         };
+        if update.agent_id != self.config.agent_id {
+            return false;
+        }
+        let current = loader.current_hash();
+        if current.as_deref() == Some(update.hash.as_str())
+            && self.runtime.mandate_hash() == current
+            && !self.mandate_status.lock().unwrap().dirty
+        {
+            return false;
+        }
+
+        {
+            let mut status = self.mandate_status.lock().unwrap();
+            status.dirty = true;
+            status.announced = Some(update.hash.clone());
+        }
+        eprintln!(
+            "[nubi-agent] Mandate changed (revision {}), refetching",
+            update
+                .revision
+                .map_or_else(|| "?".to_string(), |r| r.to_string())
+        );
+        true
+    }
+
+    /// Whether the injected mandate is the engine's current one: its hash is
+    /// the server's, and no announced change is still outstanding.
+    fn mandate_in_sync(&self) -> bool {
+        let Some(loader) = &self.mandate else {
+            return true;
+        };
+        let status = self.mandate_status.lock().unwrap();
+        status.announced.is_none()
+            && !status.dirty
+            && self.runtime.mandate_hash() == loader.current_hash()
+    }
+
+    /// Before a turn: make sure the mandate in the prompt is the engine's
+    /// current one, or say why the turn must be refused. The hash stamped on
+    /// the reply is taken by the runtime from the prompt it actually runs.
+    ///
+    /// The injected hash is recomputed from the skills that went into the
+    /// prompt, so a dropped or edited skill shows up as a mismatch. A
+    /// mismatch, or an announced hash the conditional fetch did not deliver,
+    /// gets one unconditional refetch; if it persists the turn is refused.
+    async fn check_mandate(&self) -> Result<(), String> {
+        if self.mandate.is_none() {
+            return Ok(());
+        }
 
         if let Err(e) = self.refresh_mandate(true).await {
-            let status = *self.mandate_status.lock().unwrap();
+            let status = self.mandate_status.lock().unwrap().clone();
             if status.dirty {
                 return Err(format!("the mandate changed and cannot be refetched: {e}"));
             }
-            if !status.known && self.config.mandate_strict {
+            if self.config.mandate_strict && !status.known {
                 return Err(format!(
                     "no mandate fetched yet and --mandate-strict is on: {e}"
+                ));
+            }
+            if self.config.mandate_strict && status.unverified {
+                return Err(format!(
+                    "the mandate cannot be verified and --mandate-strict is on: {e}"
                 ));
             }
             eprintln!(
@@ -645,29 +746,35 @@ impl Shared {
             );
         }
 
-        let server = loader.current_hash();
-        if self.runtime.mandate_hash() == server {
-            return Ok(server);
+        if self.mandate_in_sync() {
+            return Ok(());
         }
 
         eprintln!(
-            "[nubi-agent] Injected mandate does not match the engine's {:?}, refetching",
-            server
+            "[nubi-agent] Injected mandate {} is not the engine's current one, refetching",
+            describe(self.runtime.mandate_hash().as_deref())
         );
         self.refresh_mandate(false)
             .await
             .map_err(|e| format!("mandate refetch failed: {e}"))?;
-        let server = loader.current_hash();
-        let local = self.runtime.mandate_hash();
-        if local == server {
-            Ok(server)
-        } else {
-            Err(format!(
-                "injected mandate hashes to {} but the engine says {}",
-                local.as_deref().unwrap_or("none"),
-                server.as_deref().unwrap_or("none")
-            ))
+        if self.mandate_in_sync() {
+            return Ok(());
         }
+        let status = self.mandate_status.lock().unwrap().clone();
+        Err(format!(
+            "injected mandate hashes to {} but the engine says {}{}",
+            describe(self.runtime.mandate_hash().as_deref()),
+            describe(
+                self.mandate
+                    .as_ref()
+                    .and_then(MandateLoader::current_hash)
+                    .as_deref()
+            ),
+            status
+                .announced
+                .map(|a| format!(" and announced {a}"))
+                .unwrap_or_default()
+        ))
     }
 
     /// Handle one SSE entry: record its offset, buffer it for context, and
@@ -802,13 +909,10 @@ impl Shared {
     async fn reply(&self, room_id: &str, trigger: &Trigger) -> anyhow::Result<()> {
         let _permit = self.replies.acquire().await?;
 
-        let mandate_hash = match self.check_mandate().await {
-            Ok(hash) => hash,
-            Err(reason) => {
-                eprintln!("[nubi-agent] Refusing to answer in {}: {}", room_id, reason);
-                return Ok(());
-            }
-        };
+        if let Err(reason) = self.check_mandate().await {
+            eprintln!("[nubi-agent] Refusing to answer in {}: {}", room_id, reason);
+            return Ok(());
+        }
 
         eprintln!(
             "[nubi-agent] @{} in {}: {}",
@@ -825,7 +929,10 @@ impl Shared {
             .build_prompt(room_id, &trigger.sender, &trigger.text, &context);
 
         eprintln!("[nubi-agent] Running {:?}...", self.config.harness);
-        let response = self.run_with_typing(room_id, &prompt).await?;
+        let output = self.run_with_typing(room_id, &prompt).await?;
+        // Stamp what the prompt really carried, not what the check saw: a
+        // refresh can land between the two.
+        let (response, mandate_hash) = (output.text, output.mandate_hash);
 
         if response.is_empty() {
             eprintln!("[nubi-agent] Empty response, skipping");
@@ -896,7 +1003,7 @@ impl Shared {
     }
 
     /// Run the harness with typing indicator instead of heartbeat messages
-    async fn run_with_typing(&self, room_id: &str, prompt: &str) -> anyhow::Result<String> {
+    async fn run_with_typing(&self, room_id: &str, prompt: &str) -> anyhow::Result<RunOutput> {
         let typing_interval_secs = 5;
 
         let done = Arc::new(AtomicBool::new(false));
@@ -973,6 +1080,21 @@ mod tests {
         adhoc: RwLock<String>,
         injections: std::sync::atomic::AtomicUsize,
         runs: std::sync::atomic::AtomicUsize,
+        /// Make `inject_mandate` fail, the way an unwritable prompt file does.
+        fail_inject: AtomicBool,
+        /// Hold every run until cleared, so a test can act between the
+        /// mandate check and the run.
+        block_runs: AtomicBool,
+    }
+
+    impl FakeState {
+        fn hash(&self) -> Option<String> {
+            self.mandate
+                .read()
+                .unwrap()
+                .as_ref()
+                .map(Mandate::computed_hash)
+        }
     }
 
     struct FakeRuntime(Arc<FakeState>);
@@ -985,31 +1107,69 @@ mod tests {
         fn build_prompt(&self, _: &str, _: &str, message: &str, _: &[BufferedMessage]) -> String {
             message.to_string()
         }
-        async fn run(&self, _prompt: &str) -> anyhow::Result<String> {
+        async fn run(&self, _prompt: &str) -> anyhow::Result<RunOutput> {
             self.0.runs.fetch_add(1, Ordering::SeqCst);
-            Ok("Refunds take 30 days from purchase.".into())
+            while self.0.block_runs.load(Ordering::SeqCst) {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            // Prompt and hash from the same read, as CliRuntime does.
+            let mandate_hash = self.0.hash();
+            Ok(RunOutput {
+                text: "Refunds take 30 days from purchase.".into(),
+                mandate_hash,
+            })
         }
         fn supports_mcp(&self) -> bool {
             false
         }
         fn inject_context(&mut self, _: &str) {}
         fn inject_mandate(&self, mandate: Option<&Mandate>, adhoc: &str) -> anyhow::Result<()> {
+            if self.0.fail_inject.load(Ordering::SeqCst) {
+                anyhow::bail!("prompt file is read-only");
+            }
             *self.0.mandate.write().unwrap() = mandate.cloned();
             *self.0.adhoc.write().unwrap() = adhoc.to_string();
             self.0.injections.fetch_add(1, Ordering::SeqCst);
             Ok(())
         }
         fn mandate_hash(&self) -> Option<String> {
-            self.0
-                .mandate
-                .read()
-                .unwrap()
-                .as_ref()
-                .map(Mandate::computed_hash)
+            self.0.hash()
         }
     }
 
     const ME: &str = "support-bot";
+
+    fn hash_of(body: &serde_json::Value) -> Option<String> {
+        body["hash"].as_str().map(String::from)
+    }
+
+    /// The fixture plus one more required skill: a different hash.
+    fn grown_body() -> serde_json::Value {
+        let mut skills = fixture();
+        skills.push(MandateSkill {
+            room_id: "escalation-2".into(),
+            name: "Escalation".into(),
+            from_set: None,
+            version_index: 4,
+            pinned: true,
+            required: true,
+            content: "Escalate refunds over $500.".into(),
+        });
+        resolve_body(&skills)
+    }
+
+    fn update_for(body: &serde_json::Value) -> String {
+        json!({"agent_id": ME, "revision": 8, "hash": body["hash"]}).to_string()
+    }
+
+    fn stamped_hashes(engine: &MockEngine) -> Vec<Option<String>> {
+        engine
+            .state()
+            .posts
+            .iter()
+            .map(|(_, body)| body["metadata"]["mandate_hash"].as_str().map(String::from))
+            .collect()
+    }
 
     /// An agent against the mock engine, mandate fetched as `connect` does.
     async fn agent(engine: &MockEngine, config: AgentConfig) -> (Agent, Arc<FakeState>) {
@@ -1114,21 +1274,9 @@ mod tests {
         agent.shared.on_mandate_update(&same.to_string()).await;
         assert_eq!(engine.state().mandate_requests.len(), 1);
 
-        let mut skills = fixture();
-        skills.push(MandateSkill {
-            room_id: "escalation-2".into(),
-            name: "Escalation".into(),
-            from_set: None,
-            version_index: 4,
-            pinned: true,
-            required: true,
-            content: "Escalate refunds over $500.".into(),
-        });
-        let new = resolve_body(&skills);
+        let new = grown_body();
         engine.state().mandate = Some(new.clone());
-
-        let update = json!({"agent_id": ME, "revision": 8, "hash": new["hash"]});
-        agent.shared.on_mandate_update(&update.to_string()).await;
+        agent.shared.on_mandate_update(&update_for(&new)).await;
 
         assert_eq!(
             engine.state().mandate_requests,
@@ -1142,23 +1290,276 @@ mod tests {
 
     #[tokio::test]
     async fn a_mandate_update_that_cannot_be_fetched_holds_replies() {
+        let old = resolve_body(&fixture());
         let engine = MockEngine::start(MockState {
-            mandate: Some(resolve_body(&fixture())),
+            mandate: Some(old.clone()),
             ..Default::default()
         })
         .await;
-        let (agent, _fake) = agent(&engine, AgentConfig::default()).await;
+        let (agent, fake) = agent(&engine, AgentConfig::default()).await;
+        let new = grown_body();
 
         engine.state().mandate_fail = Some(500);
-        let update = json!({"agent_id": ME, "revision": 8, "hash": "sha256:new"});
-        agent.shared.on_mandate_update(&update.to_string()).await;
+        agent.shared.on_mandate_update(&update_for(&new)).await;
         agent.shared.reply("general", &trigger()).await.unwrap();
         assert!(engine.state().posts.is_empty());
 
-        // Once the engine answers again, replies resume.
+        // The engine answers again but still serves the old mandate: the 304
+        // for the old ETag does not settle the announced hash. One
+        // unconditional refetch, then the turn is refused.
         engine.state().mandate_fail = None;
+        let before = engine.state().mandate_requests.len();
         agent.shared.reply("general", &trigger()).await.unwrap();
-        assert_eq!(engine.state().posts.len(), 1);
+        assert!(
+            engine.state().posts.is_empty(),
+            "old mandate is not current"
+        );
+        assert_eq!(fake.runs.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            engine.state().mandate_requests[before..],
+            [Some(etag_for(&old)), None]
+        );
+        assert!(agent.shared.mandate_status.lock().unwrap().dirty);
+
+        // Once the engine serves the announced mandate, replies resume.
+        engine.state().mandate = Some(new.clone());
+        agent.shared.reply("general", &trigger()).await.unwrap();
+        assert_eq!(stamped_hashes(&engine), vec![hash_of(&new)]);
+        assert!(!agent.shared.mandate_status.lock().unwrap().dirty);
+    }
+
+    #[tokio::test]
+    async fn a_stale_in_flight_fetch_does_not_clear_dirty() {
+        let old = resolve_body(&fixture());
+        let engine = MockEngine::start(MockState {
+            mandate: Some(old.clone()),
+            ..Default::default()
+        })
+        .await;
+        let (agent, fake) = agent(&engine, AgentConfig::default()).await;
+        let new = grown_body();
+
+        // A check-before-turn fetch is in flight (the engine holds its reply)...
+        engine.state().mandate_delay_ms = 300;
+        let shared = Arc::clone(&agent.shared);
+        let in_flight = tokio::spawn(async move { shared.refresh_mandate(true).await });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(engine.state().mandate_requests.len(), 2);
+
+        // ...when the engine announces a new mandate.
+        engine.state().mandate = Some(new.clone());
+        engine.state().mandate_delay_ms = 0;
+        let update: MandateUpdate = serde_json::from_str(&update_for(&new)).unwrap();
+        assert!(agent.shared.announce_mandate(&update));
+
+        // The stale fetch (a 304 for the old mandate) lands after the update.
+        in_flight.await.unwrap().unwrap();
+        let status = agent.shared.mandate_status.lock().unwrap().clone();
+        assert!(
+            status.dirty,
+            "a fetch started before the update cannot settle it"
+        );
+        assert_eq!(status.announced, hash_of(&new));
+        assert_eq!(fake.hash(), hash_of(&old));
+
+        // The next turn fetches the announced mandate and is stamped with it.
+        agent.shared.reply("general", &trigger()).await.unwrap();
+        assert_eq!(stamped_hashes(&engine), vec![hash_of(&new)]);
+        assert!(agent
+            .shared
+            .mandate_status
+            .lock()
+            .unwrap()
+            .announced
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn a_failed_injection_keeps_the_old_mandate_and_refuses_the_turn() {
+        let old = resolve_body(&fixture());
+        let engine = MockEngine::start(MockState {
+            mandate: Some(old.clone()),
+            ..Default::default()
+        })
+        .await;
+        let (agent, fake) = agent(&engine, AgentConfig::default()).await;
+        let new = grown_body();
+
+        // The prompt file cannot be rewritten when the new mandate arrives.
+        fake.fail_inject.store(true, Ordering::SeqCst);
+        engine.state().mandate = Some(new.clone());
+        agent.shared.on_mandate_update(&update_for(&new)).await;
+        assert_eq!(fake.hash(), hash_of(&old), "old mandate stays injected");
+        assert!(agent.shared.mandate_status.lock().unwrap().dirty);
+
+        // Not stamped with the new hash while the prompt still carries the old.
+        agent.shared.reply("general", &trigger()).await.unwrap();
+        assert!(engine.state().posts.is_empty());
+        assert_eq!(fake.runs.load(Ordering::SeqCst), 0);
+        assert_eq!(fake.hash(), hash_of(&old));
+
+        // Once the rewrite works again, the next turn injects and answers.
+        fake.fail_inject.store(false, Ordering::SeqCst);
+        agent.shared.reply("general", &trigger()).await.unwrap();
+        assert_eq!(fake.hash(), hash_of(&new));
+        assert_eq!(stamped_hashes(&engine), vec![hash_of(&new)]);
+    }
+
+    #[tokio::test]
+    async fn a_404_after_a_mandate_keeps_serving_the_last_good_one() {
+        let old = resolve_body(&fixture());
+        let engine = MockEngine::start(MockState {
+            mandate: Some(old.clone()),
+            ..Default::default()
+        })
+        .await;
+        let (agent, fake) = agent(&engine, AgentConfig::default()).await;
+
+        engine.state().mandate = None;
+        agent.shared.reply("general", &trigger()).await.unwrap();
+
+        assert_eq!(fake.hash(), hash_of(&old), "not un-injected");
+        assert_eq!(stamped_hashes(&engine), vec![hash_of(&old)]);
+        assert!(agent.shared.mandate_status.lock().unwrap().unverified);
+
+        // The engine serving it again clears the doubt.
+        engine.state().mandate = Some(old.clone());
+        agent.shared.reply("general", &trigger()).await.unwrap();
+        assert_eq!(engine.state().posts.len(), 2);
+        assert!(!agent.shared.mandate_status.lock().unwrap().unverified);
+    }
+
+    #[tokio::test]
+    async fn strict_mode_refuses_while_a_held_mandate_is_gone() {
+        let old = resolve_body(&fixture());
+        let engine = MockEngine::start(MockState {
+            mandate: Some(old.clone()),
+            ..Default::default()
+        })
+        .await;
+        let config = AgentConfig {
+            mandate_strict: true,
+            ..Default::default()
+        };
+        let (agent, fake) = agent(&engine, config).await;
+
+        engine.state().mandate = None;
+        agent.shared.reply("general", &trigger()).await.unwrap();
+        assert!(engine.state().posts.is_empty());
+        assert_eq!(fake.runs.load(Ordering::SeqCst), 0);
+        assert_eq!(fake.hash(), hash_of(&old), "kept, not wiped");
+
+        engine.state().mandate = Some(old.clone());
+        agent.shared.reply("general", &trigger()).await.unwrap();
+        assert_eq!(stamped_hashes(&engine), vec![hash_of(&old)]);
+    }
+
+    #[tokio::test]
+    async fn an_unparseable_body_keeps_the_last_good_mandate() {
+        let old = resolve_body(&fixture());
+        let engine = MockEngine::start(MockState {
+            mandate: Some(old.clone()),
+            ..Default::default()
+        })
+        .await;
+        let (agent, fake) = agent(&engine, AgentConfig::default()).await;
+
+        // 200 with a body missing `hash`: a 304 is impossible (new ETag) so
+        // every check sees the broken body.
+        engine.state().mandate = Some(json!({"agent_id": ME, "skills": []}));
+        agent.shared.reply("general", &trigger()).await.unwrap();
+
+        assert_eq!(fake.hash(), hash_of(&old));
+        assert_eq!(stamped_hashes(&engine), vec![hash_of(&old)]);
+        assert!(agent.shared.mandate_status.lock().unwrap().unverified);
+    }
+
+    #[tokio::test]
+    async fn strict_mode_refuses_an_unparseable_body() {
+        let old = resolve_body(&fixture());
+        let engine = MockEngine::start(MockState {
+            mandate: Some(old.clone()),
+            ..Default::default()
+        })
+        .await;
+        let config = AgentConfig {
+            mandate_strict: true,
+            ..Default::default()
+        };
+        let (agent, fake) = agent(&engine, config).await;
+
+        engine.state().mandate = Some(json!({"agent_id": ME, "skills": []}));
+        agent.shared.reply("general", &trigger()).await.unwrap();
+        assert!(engine.state().posts.is_empty());
+        assert_eq!(fake.runs.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            fake.hash(),
+            hash_of(&old),
+            "kept for when the engine recovers"
+        );
+
+        engine.state().mandate = Some(old.clone());
+        agent.shared.reply("general", &trigger()).await.unwrap();
+        assert_eq!(stamped_hashes(&engine), vec![hash_of(&old)]);
+    }
+
+    #[tokio::test]
+    async fn an_unparseable_body_with_no_mandate_yet_is_not_fatal_unless_strict() {
+        let engine = MockEngine::start(MockState {
+            mandate: Some(json!({"agent_id": ME, "skills": []})),
+            ..Default::default()
+        })
+        .await;
+        for strict in [false, true] {
+            let state = Arc::new(FakeState::default());
+            let agent = Agent::assemble(
+                NubiClient::new(&engine.url, "tok", "s1", ME),
+                AgentConfig {
+                    agent_id: ME.into(),
+                    mandate_strict: strict,
+                    ..Default::default()
+                },
+                Box::new(FakeRuntime(state.clone())),
+                Vec::new(),
+                None,
+                Some(MandateLoader::new(&engine.url, "tok", "s1", ME)),
+            );
+            // No init_mandate: it would back off (and in strict mode never stop).
+            agent.shared.reply("general", &trigger()).await.unwrap();
+            assert!(state.mandate.read().unwrap().is_none());
+        }
+        // Only the lenient agent answered, and without a stamp.
+        assert_eq!(stamped_hashes(&engine), vec![None]);
+    }
+
+    #[tokio::test]
+    async fn a_reply_is_stamped_with_the_hash_of_the_prompt_it_ran_with() {
+        let old = resolve_body(&fixture());
+        let engine = MockEngine::start(MockState {
+            mandate: Some(old.clone()),
+            ..Default::default()
+        })
+        .await;
+        let (agent, fake) = agent(&engine, AgentConfig::default()).await;
+        let new = grown_body();
+
+        // The turn passes its check with the old mandate and starts running...
+        fake.block_runs.store(true, Ordering::SeqCst);
+        let shared = Arc::clone(&agent.shared);
+        let turn = tokio::spawn(async move { shared.reply("general", &trigger()).await });
+        while fake.runs.load(Ordering::SeqCst) == 0 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        // ...a refresh swaps the mandate under it before the run reads the prompt.
+        engine.state().mandate = Some(new.clone());
+        agent.shared.refresh_mandate(false).await.unwrap();
+        assert_eq!(fake.hash(), hash_of(&new));
+        fake.block_runs.store(false, Ordering::SeqCst);
+        turn.await.unwrap().unwrap();
+
+        // Stamped with what the prompt carried when it ran, not what the check saw.
+        assert_eq!(stamped_hashes(&engine), vec![hash_of(&new)]);
     }
 
     #[tokio::test]
