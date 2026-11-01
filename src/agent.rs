@@ -10,7 +10,7 @@ use tokio::sync::Semaphore;
 use tokio::time::interval;
 
 use crate::buffer::RoomBuffer;
-use crate::claude::Claude;
+use crate::harness::{CliRuntime, HarnessKind, McpServer};
 use crate::nubi::NubiClient;
 use crate::runtime::AgentRuntime;
 use crate::skills::{CompositeSkillLoader, RoomSkillLoader, Skill, SkillLoader};
@@ -23,11 +23,11 @@ const COALESCE_WINDOW_MS: u64 = 500;
 /// How often pending read offsets are pushed to the server.
 const OFFSET_FLUSH_SECS: u64 = 2;
 
-/// Ceiling on simultaneously running claude processes across all rooms.
+/// Ceiling on simultaneously running harness processes across all rooms.
 const MAX_CONCURRENT_REPLIES: usize = 4;
 
 /// Check if a string is safe to use as a path segment (no traversal)
-fn is_safe_path_segment(s: &str) -> bool {
+pub(crate) fn is_safe_path_segment(s: &str) -> bool {
     !s.is_empty()
         && !s.contains('/')
         && !s.contains('\\')
@@ -51,6 +51,7 @@ pub struct AgentConfig {
     pub llm_base_url: Option<String>,
     pub llm_api_key: Option<String>,
     pub llm_model: Option<String>,
+    pub harness: HarnessKind,
 }
 
 impl Default for AgentConfig {
@@ -67,6 +68,7 @@ impl Default for AgentConfig {
             llm_base_url: None,
             llm_api_key: None,
             llm_model: None,
+            harness: HarnessKind::default(),
         }
     }
 }
@@ -111,12 +113,9 @@ struct Shared {
     room_skill_loader: Option<RoomSkillLoader>,
 }
 
-/// The main agent that listens to nubi and responds via Claude
+/// The main agent that listens to nubi and responds via a harness CLI
 pub struct Agent {
     shared: Arc<Shared>,
-    /// Kept to ensure the temp config file isn't deleted while agent runs
-    #[allow(dead_code)]
-    mcp_config_path: Option<PathBuf>,
     /// Loaded skills for this agent
     #[allow(dead_code)]
     skills: Vec<Skill>,
@@ -126,21 +125,21 @@ impl Agent {
     /// Create a new agent with synchronous filesystem-only skill loading.
     /// Use `connect` for full room-based skill loading.
     pub fn new(nubi: NubiClient, config: AgentConfig) -> Self {
-        // Generate MCP config if mcp_url is provided
-        let mcp_config_path = config
-            .mcp_url
-            .as_ref()
-            .map(|mcp_url| Self::generate_mcp_config(&config.agent_id, nubi.token(), mcp_url));
+        let mcp = config.mcp_url.as_ref().map(|url| McpServer {
+            url: url.clone(),
+            token: nubi.token().to_string(),
+        });
 
-        let workspace = Self::prepare_workspace(&config.agent_id);
+        let memory_file = config.harness.harness().memory_file();
+        let workspace = Self::prepare_workspace(&config.agent_id, memory_file);
 
         // Load skills from filesystem only (sync)
         let (skills, skill_prompt) = Self::load_skills_sync(&config.agent_id);
 
-        let mut claude = Claude::new(&config.agent_id)
+        let mut runtime = CliRuntime::new(config.harness, &config.agent_id)
             .with_skip_permissions(config.skip_permissions)
             .with_system_prompt(config.system_prompt.clone())
-            .with_mcp_config(mcp_config_path.as_deref())
+            .with_mcp(mcp)
             .with_workspace(workspace)
             .with_llm_base_url(config.llm_base_url.clone())
             .with_llm_api_key(config.llm_api_key.clone())
@@ -148,7 +147,7 @@ impl Agent {
 
         // Inject skills into the runtime
         if !skill_prompt.is_empty() {
-            claude.inject_context(&skill_prompt);
+            runtime.inject_context(&skill_prompt);
             eprintln!("[nubi-agent] Loaded {} skill(s)", skills.len());
         }
 
@@ -165,7 +164,7 @@ impl Agent {
             shared: Arc::new(Shared {
                 config,
                 nubi,
-                runtime: Box::new(claude),
+                runtime: Box::new(runtime),
                 buffer: Mutex::new(buffer),
                 dispatch: Mutex::new(Dispatch::default()),
                 offsets: Mutex::new(Offsets::default()),
@@ -175,7 +174,6 @@ impl Agent {
                 start_time_ms,
                 room_skill_loader: None,
             }),
-            mcp_config_path,
             skills,
         }
     }
@@ -183,22 +181,22 @@ impl Agent {
     /// Create a new agent with async room-based skill loading.
     /// Falls back to filesystem if room API fails.
     pub async fn connect(nubi: NubiClient, config: AgentConfig) -> Self {
-        // Generate MCP config if mcp_url is provided
-        let mcp_config_path = config
-            .mcp_url
-            .as_ref()
-            .map(|mcp_url| Self::generate_mcp_config(&config.agent_id, nubi.token(), mcp_url));
+        let mcp = config.mcp_url.as_ref().map(|url| McpServer {
+            url: url.clone(),
+            token: nubi.token().to_string(),
+        });
 
-        let workspace = Self::prepare_workspace(&config.agent_id);
+        let memory_file = config.harness.harness().memory_file();
+        let workspace = Self::prepare_workspace(&config.agent_id, memory_file);
 
         // Load skills with room-based loader (async)
         let (skills, skill_prompt, room_skill_loader) =
             Self::load_skills_async(&config.agent_id, &nubi).await;
 
-        let mut claude = Claude::new(&config.agent_id)
+        let mut runtime = CliRuntime::new(config.harness, &config.agent_id)
             .with_skip_permissions(config.skip_permissions)
             .with_system_prompt(config.system_prompt.clone())
-            .with_mcp_config(mcp_config_path.as_deref())
+            .with_mcp(mcp)
             .with_workspace(workspace)
             .with_llm_base_url(config.llm_base_url.clone())
             .with_llm_api_key(config.llm_api_key.clone())
@@ -206,7 +204,7 @@ impl Agent {
 
         // Inject skills into the runtime
         if !skill_prompt.is_empty() {
-            claude.inject_context(&skill_prompt);
+            runtime.inject_context(&skill_prompt);
             eprintln!("[nubi-agent] Loaded {} skill(s)", skills.len());
         }
 
@@ -223,7 +221,7 @@ impl Agent {
             shared: Arc::new(Shared {
                 config,
                 nubi,
-                runtime: Box::new(claude),
+                runtime: Box::new(runtime),
                 buffer: Mutex::new(buffer),
                 dispatch: Mutex::new(Dispatch::default()),
                 offsets: Mutex::new(Offsets::default()),
@@ -233,7 +231,6 @@ impl Agent {
                 start_time_ms,
                 room_skill_loader,
             }),
-            mcp_config_path,
             skills,
         }
     }
@@ -314,44 +311,16 @@ impl Agent {
         Self::load_skills_sync(agent_id)
     }
 
-    /// Generate MCP config file for this agent
-    fn generate_mcp_config(agent_id: &str, token: &str, mcp_url: &str) -> PathBuf {
-        // Validate agent_id to prevent path traversal (CWE-22)
-        let safe_id = if is_safe_path_segment(agent_id) {
-            agent_id
-        } else {
-            "default"
-        };
-
-        let config = serde_json::json!({
-            "mcpServers": {
-                "nubi": {
-                    "type": "http",
-                    "url": mcp_url,
-                    "headers": {
-                        "Authorization": format!("Bearer {}", token)
-                    }
-                }
-            }
-        });
-
-        let path = PathBuf::from(format!("/tmp/mcp-{}.json", safe_id));
-        fs::write(&path, serde_json::to_string_pretty(&config).unwrap())
-            .expect("Failed to write MCP config");
-
-        eprintln!("[nubi-agent] Generated MCP config at {:?}", path);
-        path
-    }
-
-    /// A stable per-agent directory for the spawned claude to run in.
+    /// A stable per-agent directory for the spawned CLI to run in.
     ///
-    /// Each message is a one-shot `claude -p` that remembers nothing, so the
-    /// directory is the only thing that survives: CLAUDE.md in it is reloaded
-    /// on every run. Agents get their own so one cannot read another's notes.
+    /// Each message is a one-shot run that remembers nothing, so the directory
+    /// is the only thing that survives: the harness's memory file in it
+    /// (CLAUDE.md, AGENTS.md, GEMINI.md) is reloaded on every run. Agents get
+    /// their own so one cannot read another's notes.
     ///
     /// Returns None if there is no home directory to anchor to, which just
-    /// leaves claude in the launching cwd as before.
-    fn prepare_workspace(agent_id: &str) -> Option<PathBuf> {
+    /// leaves the CLI in the launching cwd as before.
+    fn prepare_workspace(agent_id: &str, memory_file: &str) -> Option<PathBuf> {
         // Validate agent_id to prevent path traversal (CWE-22)
         if !is_safe_path_segment(agent_id) {
             eprintln!("[nubi-agent] Invalid agent_id for workspace: {}", agent_id);
@@ -363,18 +332,18 @@ impl Agent {
             eprintln!("[nubi-agent] Cannot create workspace {:?}: {}", path, e);
             return None;
         }
-        Self::seed_memory_file(&path, agent_id);
+        Self::seed_memory_file(&path, memory_file, agent_id);
         eprintln!("[nubi-agent] Workspace at {:?}", path);
         Some(path)
     }
 
-    /// Create CLAUDE.md on first run only.
+    /// Create the memory file on first run only.
     ///
     /// Seeded rather than left to the agent because a file that already exists
     /// and is visible in context gets appended to, while one that has to be
     /// created from nothing reliably doesn't get written at all.
-    fn seed_memory_file(dir: &Path, agent_id: &str) {
-        let path = dir.join("CLAUDE.md");
+    fn seed_memory_file(dir: &Path, memory_file: &str, agent_id: &str) {
+        let path = dir.join(memory_file);
         if path.exists() {
             return;
         }
@@ -615,7 +584,7 @@ impl Shared {
             .runtime
             .build_prompt(room_id, &trigger.sender, &trigger.text, &context);
 
-        eprintln!("[nubi-agent] Running claude...");
+        eprintln!("[nubi-agent] Running {:?}...", self.config.harness);
         let response = self.run_with_typing(room_id, &prompt).await?;
 
         if response.is_empty() {
@@ -684,7 +653,7 @@ impl Shared {
         Ok(())
     }
 
-    /// Run Claude with typing indicator instead of heartbeat messages
+    /// Run the harness with typing indicator instead of heartbeat messages
     async fn run_with_typing(&self, room_id: &str, prompt: &str) -> anyhow::Result<String> {
         let typing_interval_secs = 5;
 
@@ -717,7 +686,7 @@ impl Shared {
             }
         });
 
-        // Run the runtime (Claude or other)
+        // Run the harness CLI
         let result = self.runtime.run(prompt).await;
 
         // Signal typing to stop

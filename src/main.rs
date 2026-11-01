@@ -1,9 +1,10 @@
 use clap::Parser;
+use nubi_agent::harness::HarnessKind;
 use nubi_agent::{Agent, AgentConfig, NubiClient};
 
 #[derive(Parser)]
 #[command(name = "nubi-agent")]
-#[command(about = "Run Claude Code agents that respond to nubi room messages")]
+#[command(about = "Run coding agents (Claude Code, Codex, Gemini, ...) that respond to nubi room messages")]
 #[command(version)]
 struct Args {
     /// Nubi server URL
@@ -18,11 +19,15 @@ struct Args {
     #[arg(long, default_value = "*")]
     rooms: String,
 
-    /// System prompt for Claude
+    /// Which coding-agent CLI answers messages
+    #[arg(long, env = "NUBI_HARNESS", value_enum, default_value_t = HarnessKind::Claude)]
+    harness: HarnessKind,
+
+    /// Extra system prompt, appended to the built-in one
     #[arg(long)]
     system_prompt: Option<String>,
 
-    /// Skip Claude permission prompts
+    /// Auto-approve every tool call the harness makes
     #[arg(long)]
     skip_permissions: bool,
 
@@ -43,23 +48,21 @@ struct Args {
     #[arg(long, default_value = "30")]
     heartbeat_secs: u64,
 
-    /// LLM backend for the spawned claude. Defaults to the local gateway on
-    /// :5000, which is less aggressive than the raw Anthropic API.
-    #[arg(
-        long,
-        env = "NUBI_LLM_BASE_URL",
-        default_value = "http://localhost:5000"
-    )]
-    llm_base_url: String,
+    /// LLM backend for the spawned CLI. With --harness claude this defaults
+    /// to the local gateway on :5000, which is less aggressive than the raw
+    /// Anthropic API. Other harnesses use their own default unless set.
+    #[arg(long, env = "NUBI_LLM_BASE_URL")]
+    llm_base_url: Option<String>,
 
     /// API key for the LLM backend (the gateway's kg- prefixed key).
     #[arg(long, env = "NUBI_LLM_KEY")]
     llm_key: Option<String>,
 
-    /// Model for the spawned claude. The gateway needs dotted IDs
-    /// (e.g. claude-opus-4.5), not the dashed form.
-    #[arg(long, env = "NUBI_LLM_MODEL", default_value = "claude-opus-4.5")]
-    model: String,
+    /// Model for the spawned CLI. With --harness claude this defaults to
+    /// claude-opus-4.5 (the gateway needs dotted IDs, not the dashed form).
+    /// Other harnesses use their own default unless set.
+    #[arg(long, env = "NUBI_LLM_MODEL")]
+    model: Option<String>,
 }
 
 /// Derive the standard nubi-mcp URL from the engine URL: same host, port 8089,
@@ -88,6 +91,14 @@ async fn main() -> anyhow::Result<()> {
     let agent_id = nubi.agent_id().to_string();
     let mcp_url = Some(args.mcp_url.unwrap_or_else(|| default_mcp_url(&args.url)));
 
+    let (llm_base_url, model) = match args.harness {
+        HarnessKind::Claude => (
+            Some(args.llm_base_url.unwrap_or_else(|| "http://localhost:5000".to_string())),
+            Some(args.model.unwrap_or_else(|| "claude-opus-4.5".to_string())),
+        ),
+        _ => (args.llm_base_url, args.model),
+    };
+
     let config = AgentConfig {
         agent_id,
         rooms: args.rooms,
@@ -97,9 +108,10 @@ async fn main() -> anyhow::Result<()> {
         rate_limit_ms: args.rate_limit_ms,
         mcp_url,
         heartbeat_interval_secs: args.heartbeat_secs,
-        llm_base_url: Some(args.llm_base_url),
+        llm_base_url,
         llm_api_key: args.llm_key,
-        llm_model: Some(args.model),
+        llm_model: model,
+        harness: args.harness,
     };
 
     let mut agent = Agent::connect(nubi, config).await;

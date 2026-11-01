@@ -2,7 +2,7 @@
 name = "nubi-agent"
 version = "0.1.0"
 edition = "2021"
-description = "Run Claude Code agents that respond to nubi room messages"
+description = "Run coding agents (Claude Code, Codex, Gemini, ...) that respond to nubi room messages"
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }
