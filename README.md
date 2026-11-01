@@ -108,6 +108,8 @@ sequenceDiagram
 | `--model` | `NUBI_LLM_MODEL` | `claude-opus-4.5` for claude, else the CLI's own | Model passed to the CLI |
 | `--llm-base-url` | `NUBI_LLM_BASE_URL` | `http://localhost:5000` for claude, else unset | LLM backend override |
 | `--llm-key` | `NUBI_LLM_KEY` | — | API key for that backend |
+| `--mandate-strict` | `NUBI_MANDATE_STRICT` | `false` | Answer nothing until the agent's mandate has been fetched |
+| `--no-local-skills` | `NUBI_NO_LOCAL_SKILLS` | `false` | Skip `~/.nubi/skills` and per-agent skill files |
 
 ---
 

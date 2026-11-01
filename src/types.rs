@@ -8,6 +8,15 @@ pub struct SseData {
     pub entry: LogEntry,
 }
 
+/// SSE `mandate_update`: the agent's resolved mandate changed.
+#[derive(Debug, Clone, Deserialize)]
+pub struct MandateUpdate {
+    pub agent_id: String,
+    #[serde(default)]
+    pub revision: Option<u64>,
+    pub hash: String,
+}
+
 /// A single log entry from the room
 #[derive(Debug, Clone, Deserialize)]
 pub struct LogEntry {

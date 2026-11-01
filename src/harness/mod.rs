@@ -8,10 +8,13 @@
 use async_trait::async_trait;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::RwLock;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;
 
 use crate::buffer::BufferedMessage;
+use crate::mandate::{build_mandate_section, Mandate};
 use crate::runtime::AgentRuntime;
 
 mod amp;
@@ -202,27 +205,56 @@ pub struct CliRuntime {
     harness: Box<dyn Harness>,
     settings: Settings,
     system_prompt: Option<String>,
-    /// Additional context injected into the system prompt (e.g., skills)
+    /// Additional context injected into the system prompt
     injected_context: Option<String>,
+    /// Mandate and ad-hoc skills; swapped between turns by the agent.
+    skills: RwLock<InjectedSkills>,
+    /// Whether `prepare()` has run, so a skills change knows to rerun it.
+    prepared: AtomicBool,
+}
+
+/// What [`AgentRuntime::inject_mandate`] last set.
+#[derive(Default)]
+struct InjectedSkills {
+    mandate: Option<Mandate>,
+    mandate_section: String,
+    adhoc: String,
 }
 
 impl CliRuntime {
     pub fn new(kind: HarnessKind, agent_id: &str) -> Self {
+        Self::with_harness(kind.harness(), agent_id)
+    }
+
+    pub fn with_harness(harness: Box<dyn Harness>, agent_id: &str) -> Self {
         Self {
-            harness: kind.harness(),
+            harness,
             settings: Settings {
                 agent_id: agent_id.to_string(),
                 ..Default::default()
             },
             system_prompt: None,
             injected_context: None,
+            skills: RwLock::new(InjectedSkills::default()),
+            prepared: AtomicBool::new(false),
         }
     }
 
-    /// Build the default system prompt. Includes the MCP tools section only when
-    /// an MCP server is actually wired in, so we never promise tools the agent
-    /// doesn't have.
-    fn default_system_prompt(&self) -> String {
+    /// Who the agent is. The mandate goes straight after this, ahead of every
+    /// other instruction.
+    fn identity(&self) -> String {
+        format!(
+            "You are '{}', a member of this team in a nubi chat room. You work alongside\n\
+             the other people here — as a peer, as an employee, as a manager when you're leading.\n\
+             You are a colleague, not an assistant.",
+            self.settings.agent_id
+        )
+    }
+
+    /// Build the default system prompt after the identity line. Includes the
+    /// MCP tools section only when an MCP server is actually wired in, so we
+    /// never promise tools the agent doesn't have.
+    fn default_instructions(&self) -> String {
         let tools_section = if self.settings.mcp.is_some() {
             r#"
 - You have nubi MCP tools: nubi_send, nubi_poll, nubi_get_room, nubi_search, nubi_list_rooms, nubi_list_agents, nubi_dm, nubi_create_room, nubi_invite.
@@ -260,11 +292,7 @@ Memory — you start from zero on every message:
         };
 
         format!(
-            r#"You are '{}', a member of this team in a nubi chat room. You work alongside
-the other people here — as a peer, as an employee, as a manager when you're leading.
-You are a colleague, not an assistant.
-
-How nubi works — mentions decide who reads what:
+            r#"How nubi works — mentions decide who reads what:
 - In a group room, an agent only acts on messages that mention it. @username for
   one person, @here for everyone in the room. No mention means nobody is expected
   to pick it up — it just sits in the history.
@@ -325,7 +353,7 @@ Rules:
 3. Never prefix your response with "Human:" or any name followed by colon
 4. Never bluff when you have lost the thread. Use nubi_poll or nubi_search to find what they are referring to in the room history first. If the history genuinely does not have it, say plainly what you are missing and ask — a confident guess is worse than a question.
 5. Just respond naturally with your message content only"#,
-            self.settings.agent_id, tools_section, memory_section
+            tools_section, memory_section
         )
     }
 
@@ -380,9 +408,22 @@ Rules:
         self.harness.memory_file()
     }
 
-    /// Build the full system prompt including base, custom, and injected context
+    /// Build the full system prompt: identity, mandate, the default
+    /// instructions, the custom prompt, injected context, ad-hoc skills.
+    ///
+    /// The mandate sits above the custom `--system-prompt` so personality text
+    /// cannot override it, and ad-hoc skills come last.
     fn build_system_prompt(&self) -> String {
-        let mut system_prompt = self.default_system_prompt();
+        let skills = self.skills.read().unwrap();
+        let mut system_prompt = self.identity();
+
+        if !skills.mandate_section.is_empty() {
+            system_prompt.push_str("\n\n");
+            system_prompt.push_str(skills.mandate_section.trim_end());
+        }
+
+        system_prompt.push_str("\n\n");
+        system_prompt.push_str(&self.default_instructions());
 
         if let Some(ref extra) = self.system_prompt {
             system_prompt.push_str("\n\nAbout you specifically:\n");
@@ -393,7 +434,19 @@ Rules:
             system_prompt.push_str(context);
         }
 
+        system_prompt.push_str(&skills.adhoc);
+
         system_prompt
+    }
+
+    /// Hand the current system prompt to the harness's one-time setup. Run
+    /// again whenever the skills change: some CLIs (Gemini, OpenCode) read
+    /// the prompt from a file written here rather than from each invocation.
+    fn prepare_harness(&self) -> anyhow::Result<()> {
+        self.harness
+            .prepare(&self.settings, &self.build_system_prompt())?;
+        self.prepared.store(true, Ordering::SeqCst);
+        Ok(())
     }
 }
 
@@ -408,8 +461,7 @@ impl AgentRuntime for CliRuntime {
                 self.harness.install_hint()
             );
         }
-        self.harness
-            .prepare(&self.settings, &self.build_system_prompt())
+        self.prepare_harness()
             .map_err(|e| anyhow::anyhow!("Cannot set up {}: {}", bin, e))
     }
 
@@ -533,6 +585,28 @@ impl AgentRuntime for CliRuntime {
                 self.injected_context = Some(context.to_string());
             }
         }
+    }
+
+    fn inject_mandate(&self, mandate: Option<&Mandate>, adhoc_skills: &str) -> anyhow::Result<()> {
+        {
+            let mut skills = self.skills.write().unwrap();
+            skills.mandate_section = mandate.map(build_mandate_section).unwrap_or_default();
+            skills.mandate = mandate.cloned();
+            skills.adhoc = adhoc_skills.to_string();
+        }
+        if self.prepared.load(Ordering::SeqCst) {
+            self.prepare_harness()?;
+        }
+        Ok(())
+    }
+
+    fn mandate_hash(&self) -> Option<String> {
+        self.skills
+            .read()
+            .unwrap()
+            .mandate
+            .as_ref()
+            .map(Mandate::computed_hash)
     }
 }
 
@@ -861,5 +935,116 @@ mod tests {
             strip_thinking_tags("a</thinking>b<thinking>c</thinking>d"),
             "a</thinking>bd"
         );
+    }
+
+    fn mandate() -> Mandate {
+        use crate::mandate::tests::{fixture, resolve_body};
+        serde_json::from_value(resolve_body(&fixture())).unwrap()
+    }
+
+    #[test]
+    fn mandate_goes_after_identity_and_before_everything_else() {
+        let rt = CliRuntime::new(HarnessKind::Claude, "bot")
+            .with_system_prompt(Some("You are cheerful.".into()));
+        rt.inject_mandate(
+            Some(&mandate()),
+            "\n\n## Available Skills\n\n### local\nx\n",
+        )
+        .unwrap();
+        let sp = rt.build_system_prompt();
+
+        let identity = sp.find("You are 'bot'").unwrap();
+        let heading = sp.find(crate::mandate::MANDATE_HEADING).unwrap();
+        let how = sp.find("How nubi works").unwrap();
+        let about = sp.find("About you specifically").unwrap();
+        let adhoc = sp.find("## Available Skills").unwrap();
+        assert_eq!(identity, 0);
+        assert!(identity < heading && heading < how && how < about && about < adhoc);
+        assert!(sp.contains("Refund within 30 days."));
+    }
+
+    #[test]
+    fn no_mandate_leaves_the_prompt_as_before() {
+        let rt = CliRuntime::new(HarnessKind::Claude, "bot");
+        let sp = rt.build_system_prompt();
+        assert!(sp.starts_with("You are 'bot', a member of this team"));
+        assert!(sp.contains("You are a colleague, not an assistant.\n\nHow nubi works"));
+        assert!(!sp.contains("Mandate"));
+        assert_eq!(rt.mandate_hash(), None);
+    }
+
+    #[test]
+    fn mandate_hash_is_recomputed_from_the_injected_skills() {
+        let rt = CliRuntime::new(HarnessKind::Claude, "bot");
+        let m = mandate();
+        rt.inject_mandate(Some(&m), "").unwrap();
+        assert_eq!(rt.mandate_hash(), Some(m.hash.clone()));
+
+        let mut tampered = m.clone();
+        tampered.skills[0].content = "Refunds are never allowed.".into();
+        rt.inject_mandate(Some(&tampered), "").unwrap();
+        assert_ne!(rt.mandate_hash(), Some(m.hash));
+
+        rt.inject_mandate(None, "").unwrap();
+        assert_eq!(rt.mandate_hash(), None);
+    }
+
+    /// Records every system prompt `prepare()` is handed.
+    struct Recording(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
+
+    impl Harness for Recording {
+        fn binary(&self) -> &'static str {
+            "true"
+        }
+        fn install_hint(&self) -> &'static str {
+            ""
+        }
+        fn memory_file(&self) -> &'static str {
+            "MEMORY.md"
+        }
+        fn prepare(&self, _settings: &Settings, system_prompt: &str) -> anyhow::Result<()> {
+            self.0.lock().unwrap().push(system_prompt.to_string());
+            Ok(())
+        }
+        fn invocation(&self, _: &Settings, _: &str, _: &str) -> Invocation {
+            Invocation::default()
+        }
+    }
+
+    #[test]
+    fn a_mandate_change_reruns_prepare_once_prepared() {
+        let calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let rt = CliRuntime::with_harness(Box::new(Recording(calls.clone())), "bot");
+
+        // Before the first prepare there is nothing on disk to rewrite.
+        rt.inject_mandate(None, "").unwrap();
+        assert!(calls.lock().unwrap().is_empty());
+
+        rt.prepare_harness().unwrap();
+        rt.inject_mandate(Some(&mandate()), "").unwrap();
+        let calls = calls.lock().unwrap();
+        assert_eq!(calls.len(), 2);
+        assert!(!calls[0].contains(crate::mandate::MANDATE_HEADING));
+        assert!(calls[1].contains(crate::mandate::MANDATE_HEADING));
+    }
+
+    #[test]
+    fn gemini_and_opencode_prompt_files_follow_the_mandate() {
+        for (kind, file) in [
+            (HarnessKind::Gemini, "gemini-system.md"),
+            (HarnessKind::Opencode, "opencode-instructions.md"),
+        ] {
+            let id = format!("mandate-test-{}", uuid::Uuid::new_v4());
+            let rt = CliRuntime::new(kind, &id);
+            rt.prepare_harness().unwrap();
+            let path = rt.settings.state_dir().join(file);
+            let before = std::fs::read_to_string(&path).unwrap();
+            assert!(!before.contains(crate::mandate::MANDATE_HEADING));
+
+            rt.inject_mandate(Some(&mandate()), "").unwrap();
+            let after = std::fs::read_to_string(&path).unwrap();
+            assert!(after.contains(crate::mandate::MANDATE_HEADING), "{file}");
+            let _ = std::fs::remove_dir_all(rt.settings.state_dir());
+        }
     }
 }

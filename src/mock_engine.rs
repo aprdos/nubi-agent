@@ -22,6 +22,8 @@ pub struct MockState {
     /// Resolve body for `GET /agents/{agent}/mandate`. None answers 404, the
     /// way an engine without skill sets does.
     pub mandate: Option<Value>,
+    /// Answer every mandate request with this status instead (e.g. 500).
+    pub mandate_fail: Option<u16>,
     /// The `If-None-Match` header of every mandate request, in order.
     pub mandate_requests: Vec<Option<String>>,
     /// Query strings of every room list request.
@@ -106,6 +108,10 @@ async fn mandate(State(s): Shared, headers: HeaderMap) -> Response {
         .and_then(|v| v.to_str().ok())
         .map(String::from);
     s.mandate_requests.push(inm.clone());
+
+    if let Some(code) = s.mandate_fail {
+        return StatusCode::from_u16(code).unwrap().into_response();
+    }
 
     let Some(body) = s.mandate.clone() else {
         return (StatusCode::NOT_FOUND, Json(json!({"error": "not found"}))).into_response();

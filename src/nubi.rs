@@ -42,6 +42,15 @@ fn http_client() -> Client {
         .expect("reqwest client builds with rustls")
 }
 
+/// Metadata on every reply nubi-agent posts.
+fn post_metadata(mandate_hash: Option<&str>) -> serde_json::Value {
+    let mut meta = serde_json::json!({"expect_reply": []});
+    if let Some(hash) = mandate_hash {
+        meta["mandate_hash"] = hash.into();
+    }
+    meta
+}
+
 /// Nubi API client for posting messages
 #[derive(Clone)]
 pub struct NubiClient {
@@ -133,9 +142,18 @@ impl NubiClient {
     /// agent writing "@foo" in prose would trigger foo, who answers, and so on.
     /// Agents that genuinely want a reply use the nubi_send tool instead.
     ///
+    /// `mandate_hash` is the hash of the mandate that was in the prompt for
+    /// this reply; it is stamped as `metadata.mandate_hash` so an engine in
+    /// strict mode can tell the reply was written under the current mandate.
+    ///
     /// Retried on transport and 5xx failures. The message_id is generated once
     /// up front so a retry is deduplicated server-side instead of double-posting.
-    pub async fn post(&self, room_id: &str, text: &str) -> anyhow::Result<()> {
+    pub async fn post(
+        &self,
+        room_id: &str,
+        text: &str,
+        mandate_hash: Option<&str>,
+    ) -> anyhow::Result<()> {
         let msg = SendMessage {
             message_id: Uuid::new_v4().to_string(),
             parts: vec![SendPart {
@@ -143,7 +161,7 @@ impl NubiClient {
                 text: text.to_string(),
             }],
             mentions: vec![],
-            metadata: Some(serde_json::json!({"expect_reply": []})),
+            metadata: Some(post_metadata(mandate_hash)),
         };
 
         let url = format!(
@@ -293,6 +311,15 @@ impl NubiClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn metadata_carries_the_mandate_hash_only_when_given() {
+        assert_eq!(post_metadata(None), serde_json::json!({"expect_reply": []}));
+        assert_eq!(
+            post_metadata(Some("sha256:ab")),
+            serde_json::json!({"expect_reply": [], "mandate_hash": "sha256:ab"})
+        );
+    }
 
     #[test]
     fn test_stream_url_all_rooms() {

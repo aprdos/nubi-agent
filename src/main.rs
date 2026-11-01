@@ -65,6 +65,18 @@ struct Args {
     /// Other harnesses use their own default unless set.
     #[arg(long, env = "NUBI_LLM_MODEL")]
     model: Option<String>,
+
+    /// Do not answer anything until the agent's mandate (the skill sets
+    /// bound to it) has been fetched from the engine, and refuse a turn
+    /// while it cannot be. Off by default: an engine without mandates
+    /// simply means no mandate.
+    #[arg(long, env = "NUBI_MANDATE_STRICT")]
+    mandate_strict: bool,
+
+    /// Never load skills from ~/.nubi/skills or the agent's own skills
+    /// directory; only room skills and the mandate.
+    #[arg(long, env = "NUBI_NO_LOCAL_SKILLS")]
+    no_local_skills: bool,
 }
 
 /// Derive the standard nubi-mcp URL from the engine URL: same host, port 8089,
@@ -117,6 +129,8 @@ async fn main() -> anyhow::Result<()> {
         llm_api_key: args.llm_key,
         llm_model: model,
         harness: args.harness,
+        mandate_strict: args.mandate_strict,
+        no_local_skills: args.no_local_skills,
     };
 
     let mut agent = Agent::connect(nubi, config).await;
