@@ -370,13 +370,23 @@ impl RoomSkillLoader {
             ));
         }
 
-        let rooms: Vec<RoomData> = resp
+        // One room at a time: a malformed room (no `kind`, or a kind that is
+        // not an object) is skipped rather than failing the whole list.
+        let rooms: Vec<serde_json::Value> = resp
             .json()
             .await
             .map_err(|e| format!("Failed to parse skill rooms response: {}", e))?;
 
         let mut skills = Vec::new();
-        for room in rooms {
+        for raw in rooms {
+            let room: RoomData = match serde_json::from_value(raw.clone()) {
+                Ok(room) => room,
+                Err(e) => {
+                    let id = raw.get("id").and_then(|v| v.as_str()).unwrap_or("?");
+                    eprintln!("[nubi-agent] Skipping malformed room {}: {}", id, e);
+                    continue;
+                }
+            };
             let RoomKind::Skill(meta) = room.kind else {
                 continue;
             };
@@ -785,6 +795,34 @@ mod room_loader_tests {
             .unwrap();
         assert_eq!(skills.len(), 1);
         assert_eq!(skills[0].meta.name, "Ok");
+    }
+
+    #[tokio::test]
+    async fn a_malformed_room_is_skipped_and_the_rest_still_load() {
+        let mut state = MockState {
+            skill_rooms: vec![
+                skill_room("ok-1", "Ok", "published"),
+                json!({"id": "no-kind", "name": "No kind"}),
+                json!({"id": "flat-kind", "name": "Flat", "kind": "skill"}),
+                json!({"not even": "a room"}),
+                skill_room("ok-2", "Also ok", "published"),
+            ],
+            ..Default::default()
+        };
+        state.prompts.insert("ok-1".into(), ("One.".into(), 1));
+        state.prompts.insert("ok-2".into(), ("Two.".into(), 1));
+        let engine = MockEngine::start(state).await;
+
+        let skills = RoomSkillLoader::new(&engine.url, "tok", "s1")
+            .load_all()
+            .await
+            .expect("malformed rooms are not fatal");
+        let names: Vec<_> = skills.iter().map(|s| s.meta.name.as_str()).collect();
+        assert_eq!(names, vec!["Ok", "Also ok"]);
+        assert_eq!(
+            engine.state().prompt_requests,
+            vec!["ok-1".to_string(), "ok-2".to_string()]
+        );
     }
 
     #[test]
