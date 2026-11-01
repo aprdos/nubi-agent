@@ -34,8 +34,10 @@ impl Harness for Codex {
 
         // Added on top of Codex's own instructions, unlike AGENTS.md which
         // stays the agent's memory.
-        inv.arg("-c")
-            .arg(format!("developer_instructions={}", toml_string(system_prompt)));
+        inv.arg("-c").arg(format!(
+            "developer_instructions={}",
+            toml_string(system_prompt)
+        ));
 
         if let Some(ref mcp) = settings.mcp {
             inv.arg("-c")
@@ -59,7 +61,8 @@ impl Harness for Codex {
             inv.arg("--model").arg(model);
         }
         if let Some(ref url) = settings.llm_base_url {
-            inv.arg("-c").arg(format!("openai_base_url={}", toml_string(url)));
+            inv.arg("-c")
+                .arg(format!("openai_base_url={}", toml_string(url)));
         }
         if let Some(ref key) = settings.llm_api_key {
             inv.env("CODEX_API_KEY", key);

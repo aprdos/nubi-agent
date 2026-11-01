@@ -4,7 +4,9 @@ use nubi_agent::{Agent, AgentConfig, NubiClient};
 
 #[derive(Parser)]
 #[command(name = "nubi-agent")]
-#[command(about = "Run coding agents (Claude Code, Codex, Gemini, ...) that respond to nubi room messages")]
+#[command(
+    about = "Run coding agents (Claude Code, Codex, Gemini, ...) that respond to nubi room messages"
+)]
 #[command(version)]
 struct Args {
     /// Nubi server URL
@@ -93,7 +95,10 @@ async fn main() -> anyhow::Result<()> {
 
     let (llm_base_url, model) = match args.harness {
         HarnessKind::Claude => (
-            Some(args.llm_base_url.unwrap_or_else(|| "http://localhost:5000".to_string())),
+            Some(
+                args.llm_base_url
+                    .unwrap_or_else(|| "http://localhost:5000".to_string()),
+            ),
             Some(args.model.unwrap_or_else(|| "claude-opus-4.5".to_string())),
         ),
         _ => (args.llm_base_url, args.model),

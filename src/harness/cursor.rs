@@ -40,10 +40,16 @@ impl Harness for Cursor {
                 }
             }
         });
-        write_private(&dir.join("mcp.json"), &serde_json::to_string_pretty(&config)?)?;
+        write_private(
+            &dir.join("mcp.json"),
+            &serde_json::to_string_pretty(&config)?,
+        )?;
         // Allow the nubi tools even without --force; they are the point.
         let permissions = serde_json::json!({ "permissions": { "allow": ["Mcp(nubi:*)"] } });
-        write_private(&dir.join("cli.json"), &serde_json::to_string_pretty(&permissions)?)
+        write_private(
+            &dir.join("cli.json"),
+            &serde_json::to_string_pretty(&permissions)?,
+        )
     }
 
     fn invocation(&self, settings: &Settings, system_prompt: &str, prompt: &str) -> Invocation {

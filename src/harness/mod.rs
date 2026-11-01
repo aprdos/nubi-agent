@@ -388,7 +388,11 @@ impl AgentRuntime for CliRuntime {
     async fn check_available(&self) -> anyhow::Result<()> {
         let bin = self.harness.binary();
         if Command::new(bin).arg("--version").output().await.is_err() {
-            anyhow::bail!("'{}' not found. Install it first:\n  {}", bin, self.harness.install_hint());
+            anyhow::bail!(
+                "'{}' not found. Install it first:\n  {}",
+                bin,
+                self.harness.install_hint()
+            );
         }
         self.harness
             .prepare(&self.settings, &self.build_system_prompt())
@@ -435,13 +439,18 @@ impl AgentRuntime for CliRuntime {
             .invocation(&self.settings, &self.build_system_prompt(), prompt);
 
         let mut cmd = Command::new(bin);
-        cmd.args(&inv.args).envs(inv.env.iter().map(|(k, v)| (k, v)));
+        cmd.args(&inv.args)
+            .envs(inv.env.iter().map(|(k, v)| (k, v)));
         if let Some(ref dir) = self.settings.workspace {
             cmd.current_dir(dir);
         }
-        cmd.stdin(if inv.stdin.is_some() { Stdio::piped() } else { Stdio::null() })
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
+        cmd.stdin(if inv.stdin.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
 
         let mut child = cmd.spawn()?;
 
@@ -481,7 +490,11 @@ impl AgentRuntime for CliRuntime {
 
         if !status.success() {
             // Some CLIs (claude among them) print their error on stdout.
-            let detail = if stderr.trim().is_empty() { &stdout } else { &stderr };
+            let detail = if stderr.trim().is_empty() {
+                &stdout
+            } else {
+                &stderr
+            };
             anyhow::bail!("{} failed ({}): {}", bin, status, detail.trim());
         }
 
@@ -620,12 +633,19 @@ mod tests {
     }
 
     fn env<'a>(inv: &'a Invocation, key: &str) -> Option<&'a str> {
-        inv.env.iter().find(|(k, _)| k == key).map(|(_, v)| v.as_str())
+        inv.env
+            .iter()
+            .find(|(k, _)| k == key)
+            .map(|(_, v)| v.as_str())
     }
 
     /// Only Claude and Amp may put the token anywhere but the env.
     fn token_only_in_env(inv: &Invocation) {
-        assert!(inv.args.iter().all(|a| !a.contains("nubi_secret")), "{:?}", inv.args);
+        assert!(
+            inv.args.iter().all(|a| !a.contains("nubi_secret")),
+            "{:?}",
+            inv.args
+        );
         assert_eq!(env(inv, MCP_TOKEN_ENV), Some("nubi_secret"));
     }
 
@@ -648,8 +668,14 @@ mod tests {
         assert_eq!(inv.args.last().map(String::as_str), Some("-"));
         assert_eq!(inv.stdin.as_deref(), Some("hi"));
         assert!(inv.output_file.is_some());
-        assert!(has(&inv, "developer_instructions=\"line one\\n\\\"quoted\\\"\""));
-        assert!(has(&inv, "mcp_servers.nubi.bearer_token_env_var=\"NUBI_MCP_TOKEN\""));
+        assert!(has(
+            &inv,
+            "developer_instructions=\"line one\\n\\\"quoted\\\"\""
+        ));
+        assert!(has(
+            &inv,
+            "mcp_servers.nubi.bearer_token_env_var=\"NUBI_MCP_TOKEN\""
+        ));
         assert!(has(&inv, "--dangerously-bypass-approvals-and-sandbox"));
         token_only_in_env(&inv);
     }
@@ -693,10 +719,14 @@ mod tests {
     #[test]
     fn opencode_takes_the_last_text_event() {
         let out = concat!(
-            r#"{"type":"text","part":{"text":"let me check"}}"#, "\n",
-            r#"{"type":"tool_use","part":{}}"#, "\n",
-            r#"{"type":"text","part":{"text":"it is green"}}"#, "\n",
-            r#"{"type":"step_finish","part":{}}"#, "\n",
+            r#"{"type":"text","part":{"text":"let me check"}}"#,
+            "\n",
+            r#"{"type":"tool_use","part":{}}"#,
+            "\n",
+            r#"{"type":"text","part":{"text":"it is green"}}"#,
+            "\n",
+            r#"{"type":"step_finish","part":{}}"#,
+            "\n",
         );
         assert_eq!(opencode::OpenCode.parse_output(out).unwrap(), "it is green");
         assert!(opencode::OpenCode
@@ -725,8 +755,10 @@ mod tests {
     #[test]
     fn amp_reads_the_result_event() {
         let out = concat!(
-            r#"{"type":"assistant","message":{}}"#, "\n",
-            r#"{"type":"result","subtype":"success","is_error":false,"result":"done"}"#, "\n",
+            r#"{"type":"assistant","message":{}}"#,
+            "\n",
+            r#"{"type":"result","subtype":"success","is_error":false,"result":"done"}"#,
+            "\n",
         );
         assert_eq!(amp::Amp.parse_output(out).unwrap(), "done");
         assert!(amp::Amp
@@ -740,7 +772,10 @@ mod tests {
         let s = settings();
         let inv = copilot::Copilot.invocation(&s, "SYS", "hi");
         assert!(has(&inv, "-s"));
-        assert!(inv.args.iter().any(|a| a.starts_with("--additional-mcp-config=")));
+        assert!(inv
+            .args
+            .iter()
+            .any(|a| a.starts_with("--additional-mcp-config=")));
         assert!(has(&inv, "--allow-tool=nubi"));
         assert!(!has(&inv, "--allow-all-tools"));
         token_only_in_env(&inv);
@@ -748,8 +783,8 @@ mod tests {
 
     #[test]
     fn memory_prompt_names_the_harness_file() {
-        let rt = CliRuntime::new(HarnessKind::Gemini, "bot")
-            .with_workspace(Some(std::env::temp_dir()));
+        let rt =
+            CliRuntime::new(HarnessKind::Gemini, "bot").with_workspace(Some(std::env::temp_dir()));
         let sp = rt.build_system_prompt();
         assert!(sp.contains("GEMINI.md"));
         assert!(!sp.contains("CLAUDE.md"));

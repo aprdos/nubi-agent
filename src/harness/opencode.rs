@@ -82,7 +82,10 @@ impl Harness for OpenCode {
         if let Some(ref model) = settings.model {
             inv.arg("--model").arg(model);
         }
-        inv.env("OPENCODE_CONFIG_CONTENT", Self::config(settings).to_string());
+        inv.env(
+            "OPENCODE_CONFIG_CONTENT",
+            Self::config(settings).to_string(),
+        );
         pass_mcp_token(settings, &mut inv);
         // Read from stdin when it is not a terminal.
         inv.stdin = Some(prompt.to_string());
