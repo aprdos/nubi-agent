@@ -50,7 +50,11 @@ impl Harness for Codex {
                 // exec has nobody to ask, and without this it cancels every
                 // nubi tool call as if the user had said no.
                 .arg("-c")
-                .arg("mcp_servers.nubi.default_tools_approval_mode=\"approve\"");
+                .arg("mcp_servers.nubi.default_tools_approval_mode=\"approve\"")
+                // Otherwise the first turn can start before the server's tools
+                // are listed, and the model never sees them.
+                .arg("-c")
+                .arg("mcp_servers.nubi.required=true");
             pass_mcp_token(settings, &mut inv);
         }
 

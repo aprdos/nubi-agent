@@ -694,6 +694,7 @@ mod tests {
             &inv,
             "mcp_servers.nubi.bearer_token_env_var=\"NUBI_MCP_TOKEN\""
         ));
+        assert!(has(&inv, "mcp_servers.nubi.required=true"));
         assert!(has(&inv, "--dangerously-bypass-approvals-and-sandbox"));
         token_only_in_env(&inv);
     }
