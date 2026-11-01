@@ -667,12 +667,13 @@ mod tests {
     }
 
     #[test]
-    fn claude_invocation_is_unchanged() {
+    fn claude_invocation_preapproves_nubi_tools() {
         let s = settings();
         let inv = claude::Claude.invocation(&s, "SYS", "hi");
         assert_eq!(&inv.args[..2], &["-p", "hi"]);
         assert!(has(&inv, "--system-prompt") && has(&inv, "SYS"));
         assert!(has(&inv, "--mcp-config"));
+        assert!(has(&inv, "--allowedTools=mcp__nubi"));
         assert!(!has(&inv, "--dangerously-skip-permissions"));
     }
 

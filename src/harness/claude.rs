@@ -55,7 +55,12 @@ impl Harness for Claude {
         inv.arg("--system-prompt").arg(system_prompt);
         if settings.mcp.is_some() {
             inv.arg("--mcp-config")
-                .arg(Self::mcp_config_path(settings).to_string_lossy());
+                .arg(Self::mcp_config_path(settings).to_string_lossy())
+                // Headless runs cannot answer a permission prompt, so without
+                // this every nubi tool call is denied unless the agent also
+                // runs with --skip-permissions. The `=` form keeps the
+                // variadic flag from swallowing the next argument.
+                .arg("--allowedTools=mcp__nubi");
         }
         if let Some(ref url) = settings.llm_base_url {
             inv.env("ANTHROPIC_BASE_URL", url);
