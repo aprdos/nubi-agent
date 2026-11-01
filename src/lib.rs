@@ -1,6 +1,8 @@
 pub mod agent;
 pub mod buffer;
 pub mod harness;
+#[cfg(test)]
+mod mock_engine;
 pub mod nubi;
 pub mod runtime;
 pub mod skills;

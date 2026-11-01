@@ -19,5 +19,6 @@ uuid = { version = "1", features = ["v4"] }
 dirs = "5"
 
 [dev-dependencies]
+axum = "0.8"
 tokio-test = "0.4"
 tempfile = "3"

@@ -256,75 +256,73 @@ impl SkillLoader {
 // Room-based skill loading (fetches from nubi API)
 // =============================================================================
 
-/// API response for listing rooms
-#[derive(Debug, Deserialize)]
-struct RoomsResponse {
-    rooms: Vec<RoomData>,
-}
-
-/// Room data from API
+/// One room from `GET /rooms?kind=skill`. The engine returns a bare array of
+/// these, with the room meta flattened in beside `unread_count`.
 #[derive(Debug, Clone, Deserialize)]
 struct RoomData {
     id: String,
+    #[serde(default)]
     name: Option<String>,
-    kind: Option<RoomKind>,
+    kind: RoomKind,
 }
 
-/// Room kind with skill metadata
+/// The engine tags the kind object with `type`; only skills matter here.
 #[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "lowercase")]
+#[serde(tag = "type", rename_all = "snake_case")]
 enum RoomKind {
-    Dm,
-    Group,
-    #[allow(dead_code)]
-    Thread(ThreadMeta),
     Skill(ApiSkillMeta),
+    #[serde(other)]
+    Other,
 }
 
-#[derive(Debug, Clone, Deserialize)]
-struct ThreadMeta {
-    #[allow(dead_code)]
-    parent_room_id: String,
-}
-
-/// Skill metadata from the API
+/// Skill metadata as the engine stores it. Content is not in here: it lives
+/// in the skill room's owner messages and comes from `/skills/{room}/prompt`.
 #[derive(Debug, Clone, Deserialize)]
 struct ApiSkillMeta {
-    #[allow(dead_code)]
-    owner: Option<String>,
-    description: Option<String>,
-    content: Option<String>,
-    version: i32,
     #[serde(default)]
     trigger_patterns: Vec<String>,
-    status: Option<SkillStatus>,
+    #[serde(default)]
+    status: SkillStatus,
 }
 
-#[derive(Debug, Clone, Deserialize, PartialEq)]
-#[serde(rename_all = "lowercase")]
+#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
 enum SkillStatus {
+    #[default]
     Draft,
     Published,
     Archived,
 }
 
-/// Cached skill with version for invalidation
-#[derive(Debug, Clone)]
-struct CachedSkill {
-    skill: Skill,
-    version: i32,
+/// Body of `GET /skills/{room}/prompt`: the active version, which honours the
+/// skill's pinned `active_version` and otherwise is the latest owner message.
+#[derive(Debug, Clone, Deserialize)]
+struct PromptResp {
+    content: String,
+    version_index: u64,
+}
+
+/// Prefix of [`Skill::path`] for skills that came from a room.
+const ROOM_PATH_PREFIX: &str = "room://";
+
+impl Skill {
+    /// The skill room this came from, if it did not come from a file.
+    pub fn room_id(&self) -> Option<&str> {
+        self.path.to_str()?.strip_prefix(ROOM_PATH_PREFIX)
+    }
 }
 
 /// Loads skills from the nubi room API.
 ///
-/// Fetches rooms with `kind=skill`, caches by version, and supports
-/// SSE-triggered cache invalidation.
+/// Lists the skill rooms the agent is a member of, keeps the published ones,
+/// and fetches each one's active prompt version.
 pub struct RoomSkillLoader {
     client: Client,
     base_url: String,
     token: String,
     space: String,
-    cache: Arc<RwLock<HashMap<String, CachedSkill>>>,
+    /// Prompt version (message index) last loaded per skill room.
+    cache: Arc<RwLock<HashMap<String, u64>>>,
 }
 
 impl RoomSkillLoader {
@@ -346,15 +344,18 @@ impl RoomSkillLoader {
     }
 
     /// Load all published skills from the API.
+    ///
+    /// A skill whose prompt cannot be fetched (no versions yet, or a transient
+    /// error) is skipped with a log line rather than failing the whole load.
     pub async fn load_all(&self) -> Result<Vec<Skill>, String> {
-        let url = format!(
-            "{}/v1/spaces/{}/rooms?kind=skill",
-            self.base_url, self.space
-        );
+        let url = format!("{}/v1/spaces/{}/rooms", self.base_url, self.space);
 
+        // `status` is honoured by engines that support it and ignored by the
+        // rest, so drafts are still filtered below.
         let resp = self
             .client
             .get(&url)
+            .query(&[("kind", "skill"), ("status", "published")])
             .header("Authorization", format!("Bearer {}", self.token))
             .send()
             .await
@@ -369,50 +370,69 @@ impl RoomSkillLoader {
             ));
         }
 
-        let rooms: RoomsResponse = resp
+        let rooms: Vec<RoomData> = resp
             .json()
             .await
             .map_err(|e| format!("Failed to parse skill rooms response: {}", e))?;
 
         let mut skills = Vec::new();
-        let mut cache = self.cache.write().unwrap();
+        for room in rooms {
+            let RoomKind::Skill(meta) = room.kind else {
+                continue;
+            };
+            if meta.status != SkillStatus::Published {
+                continue;
+            }
 
-        for room in rooms.rooms {
-            if let Some(RoomKind::Skill(meta)) = room.kind {
-                // Only load published skills
-                if meta.status != Some(SkillStatus::Published) {
+            let prompt = match self.fetch_prompt(&room.id).await {
+                Ok(p) => p,
+                Err(e) => {
+                    eprintln!("[nubi-agent] Skipping skill {}: {}", room.id, e);
                     continue;
                 }
+            };
 
-                // Check cache
-                if let Some(cached) = cache.get(&room.id) {
-                    if cached.version == meta.version {
-                        skills.push(cached.skill.clone());
-                        continue;
-                    }
-                }
-
-                // Convert to Skill
-                let skill = self.convert_to_skill(&room.id, room.name.as_deref(), &meta);
-                cache.insert(
-                    room.id.clone(),
-                    CachedSkill {
-                        skill: skill.clone(),
-                        version: meta.version,
-                    },
-                );
-                skills.push(skill);
-            }
+            let skill =
+                Self::convert_to_skill(&room.id, room.name.as_deref(), &meta, prompt.content);
+            self.cache
+                .write()
+                .unwrap()
+                .insert(room.id.clone(), prompt.version_index);
+            skills.push(skill);
         }
 
         Ok(skills)
     }
 
-    /// Check if a skill needs refresh based on version.
-    pub fn needs_refresh(&self, room_id: &str, new_version: i32) -> bool {
+    async fn fetch_prompt(&self, room_id: &str) -> Result<PromptResp, String> {
+        let url = format!(
+            "{}/v1/spaces/{}/skills/{}/prompt",
+            self.base_url, self.space, room_id
+        );
+        let resp = self
+            .client
+            .get(&url)
+            .header("Authorization", format!("Bearer {}", self.token))
+            .send()
+            .await
+            .map_err(|e| format!("prompt fetch failed: {}", e))?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            return Err(format!("prompt fetch failed: {} - {}", status, body));
+        }
+
+        resp.json()
+            .await
+            .map_err(|e| format!("cannot parse prompt: {}", e))
+    }
+
+    /// Check if a skill needs refresh based on its prompt version.
+    pub fn needs_refresh(&self, room_id: &str, new_version: u64) -> bool {
         let cache = self.cache.read().unwrap();
         match cache.get(room_id) {
-            Some(cached) => cached.version < new_version,
+            Some(cached) => *cached != new_version,
             None => true,
         }
     }
@@ -423,30 +443,32 @@ impl RoomSkillLoader {
         cache.remove(room_id);
     }
 
-    /// Get cached version for a skill room.
-    pub fn cached_version(&self, room_id: &str) -> Option<i32> {
+    /// Prompt version (message index) a cached skill was built from.
+    pub fn cached_version(&self, room_id: &str) -> Option<u64> {
         let cache = self.cache.read().unwrap();
-        cache.get(room_id).map(|c| c.version)
+        cache.get(room_id).copied()
     }
 
     fn convert_to_skill(
-        &self,
         room_id: &str,
         room_name: Option<&str>,
         meta: &ApiSkillMeta,
+        content: String,
     ) -> Skill {
         // Use first trigger pattern as the trigger hint
         let trigger = meta.trigger_patterns.first().cloned();
+        let name = room_name.filter(|n| !n.is_empty()).unwrap_or(room_id);
 
         Skill {
             meta: SkillMeta {
-                name: room_name.unwrap_or(room_id).to_string(),
-                description: meta.description.clone(),
+                name: name.to_string(),
+                // The engine keeps a skill's description in the room name.
+                description: None,
                 trigger,
                 enabled: true,
             },
-            content: meta.content.clone().unwrap_or_default(),
-            path: PathBuf::from(format!("room://{}", room_id)),
+            content,
+            path: PathBuf::from(format!("{ROOM_PATH_PREFIX}{room_id}")),
         }
     }
 }
@@ -659,5 +681,119 @@ This is the skill content.
         assert!(section.contains("_Test skill_"));
         assert!(section.contains("**Trigger:** when testing"));
         assert!(section.contains("Do the test thing."));
+    }
+}
+
+#[cfg(test)]
+mod room_loader_tests {
+    use super::*;
+    use crate::mock_engine::{MockEngine, MockState};
+    use serde_json::json;
+
+    /// A room as `GET /rooms` really returns it: meta flattened beside the
+    /// unread fields, `kind` tagged by `type`, and no content in the kind.
+    fn skill_room(id: &str, name: &str, status: &str) -> serde_json::Value {
+        json!({
+            "id": id,
+            "space_id": "s1",
+            "kind": {
+                "type": "skill",
+                "owner": "alice",
+                "trigger_patterns": ["refund"],
+                "status": status,
+                "active_version": 3
+            },
+            "name": name,
+            "status": "active",
+            "created_at_ms": 1,
+            "is_public": true,
+            "unread_count": 0,
+            "last_activity_at": 1
+        })
+    }
+
+    #[tokio::test]
+    async fn parses_the_bare_array_the_engine_returns() {
+        let mut state = MockState {
+            skill_rooms: vec![
+                skill_room("refund-9x2k", "Refund policy", "published"),
+                skill_room("wip-1", "Work in progress", "draft"),
+                json!({"id": "general", "space_id": "s1", "kind": {"type": "group"},
+                   "name": "general", "status": "active", "created_at_ms": 1,
+                   "unread_count": 0, "last_activity_at": 1}),
+            ],
+            ..Default::default()
+        };
+        state
+            .prompts
+            .insert("refund-9x2k".into(), ("Refund within 30 days.".into(), 3));
+        state.prompts.insert("wip-1".into(), ("draft".into(), 1));
+        let engine = MockEngine::start(state).await;
+
+        let loader = RoomSkillLoader::new(&engine.url, "tok", "s1");
+        let skills = loader.load_all().await.expect("bare array parses");
+
+        assert_eq!(skills.len(), 1, "drafts and non-skill rooms are skipped");
+        assert_eq!(skills[0].meta.name, "Refund policy");
+        assert_eq!(skills[0].content, "Refund within 30 days.");
+        assert_eq!(skills[0].meta.trigger.as_deref(), Some("refund"));
+        assert_eq!(skills[0].room_id(), Some("refund-9x2k"));
+        assert_eq!(loader.cached_version("refund-9x2k"), Some(3));
+
+        let s = engine.state();
+        let q = &s.room_queries[0];
+        assert_eq!(q.get("kind").map(String::as_str), Some("skill"));
+        assert_eq!(q.get("status").map(String::as_str), Some("published"));
+        assert_eq!(s.prompt_requests, vec!["refund-9x2k".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn content_comes_from_the_prompt_endpoint() {
+        // The prompt endpoint resolves active_version; whatever it says wins.
+        let mut state = MockState {
+            skill_rooms: vec![skill_room("tone-1", "Tone", "published")],
+            ..Default::default()
+        };
+        state
+            .prompts
+            .insert("tone-1".into(), ("Be brief.".into(), 7));
+        let engine = MockEngine::start(state).await;
+
+        let loader = RoomSkillLoader::new(&engine.url, "tok", "s1");
+        let skills = loader.load_all().await.unwrap();
+        assert_eq!(skills[0].content, "Be brief.");
+        assert_eq!(loader.cached_version("tone-1"), Some(7));
+        assert!(!loader.needs_refresh("tone-1", 7));
+        assert!(loader.needs_refresh("tone-1", 8));
+    }
+
+    #[tokio::test]
+    async fn a_skill_without_versions_is_skipped_not_fatal() {
+        let mut state = MockState {
+            skill_rooms: vec![
+                skill_room("empty-1", "Empty", "published"),
+                skill_room("ok-1", "Ok", "published"),
+            ],
+            ..Default::default()
+        };
+        state.prompts.insert("ok-1".into(), ("Fine.".into(), 2));
+        let engine = MockEngine::start(state).await;
+
+        let skills = RoomSkillLoader::new(&engine.url, "tok", "s1")
+            .load_all()
+            .await
+            .unwrap();
+        assert_eq!(skills.len(), 1);
+        assert_eq!(skills[0].meta.name, "Ok");
+    }
+
+    #[test]
+    fn file_skills_have_no_room_id() {
+        let skill = Skill {
+            meta: SkillMeta::default(),
+            content: String::new(),
+            path: PathBuf::from("/home/a/.nubi/skills/x.md"),
+        };
+        assert_eq!(skill.room_id(), None);
     }
 }
