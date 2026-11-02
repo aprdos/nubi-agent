@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use super::{write_private, Harness, Invocation, OutputWatch, Parsed, Settings, REPLY_SCHEMA};
@@ -205,9 +205,13 @@ const STEPS_AFTER_REPLY: u64 = 3;
 #[derive(Default)]
 struct ReplyWatch {
     session_id: Option<String>,
+    /// Ids of every StructuredOutput call seen.
+    calls: HashSet<String>,
     /// StructuredOutput calls whose result has not come back yet, by id.
     pending: HashMap<String, serde_json::Value>,
-    /// The last reply Claude accepted.
+    /// The last reply Claude accepted. Claude Code's `structured_output` is
+    /// the input of the call it accepted, so this is the same object the
+    /// result event would carry.
     reply: Option<serde_json::Value>,
     /// Assistant messages since `reply` was accepted.
     steps_after_reply: u64,
@@ -245,14 +249,17 @@ impl OutputWatch for ReplyWatch {
                     if block["type"] != "tool_use" || block["name"] != "StructuredOutput" {
                         continue;
                     }
+                    let call = block["id"].as_str().unwrap_or_default().to_string();
+                    // The same call streamed again is not a new call.
+                    if !self.calls.insert(call.clone()) {
+                        continue;
+                    }
                     if self.reply.is_some() {
                         return Some(
                             "it called StructuredOutput again after its reply was accepted".into(),
                         );
                     }
-                    if let Some(id) = block["id"].as_str() {
-                        self.pending.insert(id.to_string(), block["input"].clone());
-                    }
+                    self.pending.insert(call, block["input"].clone());
                 }
                 if self.steps_after_reply > STEPS_AFTER_REPLY {
                     return Some(format!(

@@ -941,6 +941,9 @@ impl AgentRuntime for CliRuntime {
         let mut stopped: Option<String> = None;
         let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
         let until_stopped = |mut rx: tokio::sync::watch::Receiver<bool>| async move {
+            // The sender goes only when read_out is done without a stop
+            // (EOF, or an error that ends the join anyway): leave the
+            // pipe's own read to finish.
             if rx.wait_for(|s| *s).await.is_err() {
                 std::future::pending::<()>().await;
             }
@@ -1510,6 +1513,20 @@ mod tests {
         let (stop, p) = watch_lines(&lines);
         // The fourth step after the reply.
         assert_eq!(stop, Some(8));
+        assert!(p.structured.is_some());
+    }
+
+    #[test]
+    fn claude_watch_does_not_count_a_call_streamed_twice() {
+        let call = stream::tool_use("m1", "t1", "StructuredOutput", stream::SENT);
+        let lines = vec![
+            call.clone(),
+            stream::tool_result("t1", false),
+            call,
+            stream::text("m2", "done"),
+        ];
+        let (stop, p) = watch_lines(&lines);
+        assert_eq!(stop, None);
         assert!(p.structured.is_some());
     }
 
