@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use async_trait::async_trait;
 
 use crate::buffer::BufferedMessage;
@@ -84,7 +86,11 @@ pub struct RunOutput {
     pub session_id: Option<String>,
     pub cost_usd: Option<f64>,
     pub duration_ms: Option<u64>,
+    /// The run's total, for the turn log.
     pub usage: TokenUsage,
+    /// The same tokens split by the model that used them, as the CLI names
+    /// it. A run can use several (a small model for side tasks, a fallback).
+    pub model_usage: BTreeMap<String, TokenUsage>,
 }
 
 /// Tokens one run used, as far as the CLI reports them. Fields the CLI

@@ -58,6 +58,13 @@ struct Args {
     #[arg(long, env = "NUBI_LLM_BASE_URL")]
     llm_base_url: Option<String>,
 
+    /// Who serves the model: `anthropic`, `bedrock`, `vertex`, `kiro`, ...
+    /// Sent with each reply's token counts so nubi-app can price them.
+    /// Defaults to `kiro` with --harness claude on the default local gateway,
+    /// else it is read off the base URL (`anthropic` without one).
+    #[arg(long, env = "NUBI_LLM_PROVIDER")]
+    llm_provider: Option<String>,
+
     /// API key for the LLM backend (the gateway's kg- prefixed key).
     #[arg(long, env = "NUBI_LLM_KEY")]
     llm_key: Option<String>,
@@ -128,6 +135,14 @@ async fn main() -> anyhow::Result<()> {
     let agent_id = nubi.agent_id().to_string();
     let mcp_url = Some(args.mcp_url.unwrap_or_else(|| default_mcp_url(&args.url)));
 
+    let default_gateway = args.harness == HarnessKind::Claude && args.llm_base_url.is_none();
+    let llm_provider = args.llm_provider.clone().unwrap_or_else(|| {
+        if default_gateway {
+            "kiro".to_string()
+        } else {
+            infer_provider(args.llm_base_url.as_deref(), args.harness)
+        }
+    });
     let (llm_base_url, model, fallback_model, effort) = match args.harness {
         HarnessKind::Claude => (
             Some(
@@ -159,6 +174,7 @@ async fn main() -> anyhow::Result<()> {
         mcp_url,
         heartbeat_interval_secs: args.heartbeat_secs,
         llm_base_url,
+        llm_provider,
         llm_api_key: args.llm_key,
         llm_model: model,
         llm_fallback_model: fallback_model,
@@ -174,9 +190,74 @@ async fn main() -> anyhow::Result<()> {
     agent.run().await
 }
 
+/// The provider behind an LLM base URL. Without one, the harness's own
+/// vendor (`anthropic` for Claude Code, `openai` for Codex, `google` for
+/// Gemini, else the CLI's name); `bedrock`/`vertex` when Claude Code is told
+/// to use them (only Claude Code reads those); `anthropic` for Anthropic's
+/// API, else `custom:<host>`.
+fn infer_provider(base_url: Option<&str>, harness: HarnessKind) -> String {
+    if harness == HarnessKind::Claude {
+        if std::env::var_os("CLAUDE_CODE_USE_BEDROCK").is_some() {
+            return "bedrock".to_string();
+        }
+        if std::env::var_os("CLAUDE_CODE_USE_VERTEX").is_some() {
+            return "vertex".to_string();
+        }
+    }
+    let Some(url) = base_url else {
+        return match harness {
+            HarnessKind::Claude => "anthropic",
+            HarnessKind::Codex => "openai",
+            HarnessKind::Gemini => "google",
+            HarnessKind::Cursor => "cursor",
+            HarnessKind::Opencode => "opencode",
+            HarnessKind::Amp => "amp",
+            HarnessKind::Copilot => "copilot",
+        }
+        .to_string();
+    };
+    let host = url
+        .split("://")
+        .last()
+        .unwrap_or(url)
+        .split(['/', '?'])
+        .next()
+        .unwrap_or_default()
+        .to_lowercase();
+    if host == "api.anthropic.com" {
+        "anthropic".to_string()
+    } else {
+        format!("custom:{host}")
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::default_mcp_url;
+    use super::HarnessKind;
+    use super::{default_mcp_url, infer_provider};
+
+    #[test]
+    fn provider_is_read_off_the_base_url() {
+        assert_eq!(infer_provider(None, HarnessKind::Claude), "anthropic");
+        assert_eq!(infer_provider(None, HarnessKind::Codex), "openai");
+        assert_eq!(infer_provider(None, HarnessKind::Gemini), "google");
+        assert_eq!(
+            infer_provider(Some("https://api.anthropic.com"), HarnessKind::Codex),
+            "anthropic"
+        );
+        assert_eq!(
+            infer_provider(Some("https://API.anthropic.com/v1"), HarnessKind::Codex),
+            "anthropic"
+        );
+        assert_eq!(
+            infer_provider(Some("http://localhost:5000"), HarnessKind::Codex),
+            "custom:localhost:5000"
+        );
+        assert_eq!(
+            infer_provider(Some("https://openrouter.ai/api?x=1"), HarnessKind::Codex),
+            "custom:openrouter.ai"
+        );
+    }
 
     #[test]
     fn derives_mcp_url_from_engine() {

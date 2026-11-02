@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use reqwest::Client;
 use serde::Deserialize;
 use std::time::Duration;
@@ -64,25 +66,69 @@ fn post_metadata(
     meta
 }
 
-/// `metadata.usage`: what the run that wrote the reply cost, for the engine
-/// to add up per agent. Only the fields the CLI reported; None when it
-/// reported nothing.
-fn usage_metadata(usage: &TokenUsage, cost_usd: Option<f64>) -> Option<serde_json::Value> {
-    let mut meta = serde_json::Map::new();
-    for (key, n) in [
-        ("input_tokens", usage.input),
-        ("output_tokens", usage.output),
-        ("cache_read_tokens", usage.cache_read),
-        ("cache_write_tokens", usage.cache_write),
-    ] {
-        if let Some(n) = n {
-            meta.insert(key.into(), n.into());
+/// `metadata.usage`: the tokens the run behind the reply used, per model,
+/// and the provider that served them, for the engine to add up per agent.
+/// Prices are not ours to know; nubi-app applies them. None when the CLI
+/// reported no tokens.
+pub fn usage_metadata(
+    provider: &str,
+    model_usage: &BTreeMap<String, TokenUsage>,
+) -> Option<serde_json::Value> {
+    let mut models: BTreeMap<String, [u64; 4]> = BTreeMap::new();
+    for (model, u) in model_usage {
+        let n = [u.input, u.output, u.cache_read, u.cache_write].map(Option::unwrap_or_default);
+        if n.iter().all(|&t| t == 0) {
+            continue;
+        }
+        let sum = models.entry(normalize_model(model)).or_default();
+        for (s, t) in sum.iter_mut().zip(n) {
+            *s += t;
         }
     }
-    if let Some(c) = cost_usd {
-        meta.insert("cost_usd".into(), c.into());
+    if models.is_empty() {
+        return None;
     }
-    (!meta.is_empty()).then_some(serde_json::Value::Object(meta))
+    let models: serde_json::Map<String, serde_json::Value> = models
+        .into_iter()
+        .map(|(model, [input, output, cache_read, cache_write])| {
+            let tokens = serde_json::json!({
+                "input_tokens": input,
+                "output_tokens": output,
+                "cache_read_tokens": cache_read,
+                "cache_write_tokens": cache_write,
+            });
+            (model, tokens)
+        })
+        .collect();
+    Some(serde_json::json!({"provider": provider, "models": models}))
+}
+
+/// One id per model whatever the provider calls it: lowercase, dots as
+/// dashes, no provider prefix (`us.anthropic.`), no date or version suffix
+/// (`-20251101`, `@20251101`, `-v1:0`).
+pub fn normalize_model(model: &str) -> String {
+    let mut m = model.trim().to_lowercase();
+    if let Some(i) = m.find("anthropic.") {
+        m = m[i + "anthropic.".len()..].to_string();
+    }
+    if let Some(i) = m.find('@') {
+        m.truncate(i);
+    }
+    if let Some(i) = m.find(":") {
+        m.truncate(i);
+        if let Some(v) = m.rfind("-v") {
+            if m[v + 2..].chars().all(|c| c.is_ascii_digit()) {
+                m.truncate(v);
+            }
+        }
+    }
+    if let Some(d) = m.rfind('-') {
+        let tail = &m[d + 1..];
+        if tail.len() == 8 && tail.chars().all(|c| c.is_ascii_digit()) {
+            m.truncate(d);
+        }
+    }
+    m.replace('.', "-")
 }
 
 /// What to post: the text plus who it is for.
@@ -95,9 +141,8 @@ pub struct Outgoing<'a> {
     /// `metadata.mandate_hash` so an engine in strict mode can tell the reply
     /// was written under the current mandate.
     pub mandate_hash: Option<&'a str>,
-    /// Tokens the run that wrote this reply used, stamped as `metadata.usage`.
-    pub usage: TokenUsage,
-    pub cost_usd: Option<f64>,
+    /// `metadata.usage`, from [`usage_metadata`].
+    pub usage: Option<serde_json::Value>,
 }
 
 /// Nubi API client for posting messages
@@ -196,11 +241,7 @@ impl NubiClient {
                 text: out.text.to_string(),
             }],
             mentions: out.mentions.to_vec(),
-            metadata: Some(post_metadata(
-                out.expect_reply,
-                out.mandate_hash,
-                usage_metadata(&out.usage, out.cost_usd),
-            )),
+            metadata: Some(post_metadata(out.expect_reply, out.mandate_hash, out.usage)),
         };
 
         let url = format!(
@@ -402,28 +443,51 @@ mod tests {
     }
 
     #[test]
-    fn usage_metadata_carries_only_what_the_cli_reported() {
-        assert_eq!(usage_metadata(&TokenUsage::default(), None), None);
-        let usage = TokenUsage {
-            input: Some(12),
-            output: Some(340),
-            cache_read: Some(20480),
+    fn usage_metadata_is_tokens_per_model_and_provider() {
+        let mut models = BTreeMap::new();
+        assert_eq!(usage_metadata("kiro", &models), None);
+        let u = |input, output, cache_read| TokenUsage {
+            input: Some(input),
+            output: Some(output),
+            cache_read,
             cache_write: None,
         };
-        let meta = usage_metadata(&usage, Some(0.0421));
+        models.insert("claude-opus-4-5".to_string(), u(100, 20, Some(5)));
+        // The same model under another name adds up under one id.
+        models.insert("claude-opus-4.5".to_string(), u(1, 1, None));
+        models.insert("claude-haiku-4-5-20251001".to_string(), u(7, 3, None));
+        // A model that used nothing is left out.
+        models.insert("claude-sonnet-4-6".to_string(), TokenUsage::default());
         assert_eq!(
-            meta,
+            usage_metadata("kiro", &models),
             Some(serde_json::json!({
-                "input_tokens": 12,
-                "output_tokens": 340,
-                "cache_read_tokens": 20480,
-                "cost_usd": 0.0421
+                "provider": "kiro",
+                "models": {
+                    "claude-haiku-4-5": {"input_tokens": 7, "output_tokens": 3,
+                                         "cache_read_tokens": 0, "cache_write_tokens": 0},
+                    "claude-opus-4-5": {"input_tokens": 101, "output_tokens": 21,
+                                        "cache_read_tokens": 5, "cache_write_tokens": 0}
+                }
             }))
         );
-        assert_eq!(
-            post_metadata(None, None, meta.clone())["usage"],
-            meta.unwrap()
-        );
+    }
+
+    #[test]
+    fn model_names_normalize_across_providers() {
+        for (raw, want) in [
+            ("claude-opus-4-5", "claude-opus-4-5"),
+            ("claude-opus-4.5", "claude-opus-4-5"),
+            ("Claude-Opus-4-5-20251101", "claude-opus-4-5"),
+            ("claude-opus-4-5@20251101", "claude-opus-4-5"),
+            (
+                "us.anthropic.claude-opus-4-5-20251101-v1:0",
+                "claude-opus-4-5",
+            ),
+            ("anthropic.claude-haiku-4-5", "claude-haiku-4-5"),
+            ("claude-opus-5-5", "claude-opus-5-5"),
+        ] {
+            assert_eq!(normalize_model(raw), want, "{raw}");
+        }
     }
 
     #[test]
