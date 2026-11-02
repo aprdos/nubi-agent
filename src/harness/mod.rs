@@ -941,9 +941,8 @@ impl AgentRuntime for CliRuntime {
         let mut stopped: Option<String> = None;
         let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
         let until_stopped = |mut rx: tokio::sync::watch::Receiver<bool>| async move {
-            // The sender goes only when read_out is done without a stop
-            // (EOF, or an error that ends the join anyway): leave the
-            // pipe's own read to finish.
+            // Without a stop the signal never comes and the pipe's own read
+            // finishes the select; a dropped sender means the same.
             if rx.wait_for(|s| *s).await.is_err() {
                 std::future::pending::<()>().await;
             }
