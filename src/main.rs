@@ -140,7 +140,7 @@ async fn main() -> anyhow::Result<()> {
         if default_gateway {
             "kiro".to_string()
         } else {
-            infer_provider(args.llm_base_url.as_deref())
+            infer_provider(args.llm_base_url.as_deref(), args.harness)
         }
     });
     let (llm_base_url, model, fallback_model, effort) = match args.harness {
@@ -191,14 +191,16 @@ async fn main() -> anyhow::Result<()> {
 }
 
 /// The provider behind an LLM base URL: `anthropic` for none or Anthropic's
-/// own API, `bedrock`/`vertex` when Claude Code is told to use them, else
-/// `custom:<host>`.
-fn infer_provider(base_url: Option<&str>) -> String {
-    if std::env::var_os("CLAUDE_CODE_USE_BEDROCK").is_some() {
-        return "bedrock".to_string();
-    }
-    if std::env::var_os("CLAUDE_CODE_USE_VERTEX").is_some() {
-        return "vertex".to_string();
+/// own API, `bedrock`/`vertex` when Claude Code is told to use them (only
+/// Claude Code reads those), else `custom:<host>`.
+fn infer_provider(base_url: Option<&str>, harness: HarnessKind) -> String {
+    if harness == HarnessKind::Claude {
+        if std::env::var_os("CLAUDE_CODE_USE_BEDROCK").is_some() {
+            return "bedrock".to_string();
+        }
+        if std::env::var_os("CLAUDE_CODE_USE_VERTEX").is_some() {
+            return "vertex".to_string();
+        }
     }
     let Some(url) = base_url else {
         return "anthropic".to_string();
@@ -220,25 +222,26 @@ fn infer_provider(base_url: Option<&str>) -> String {
 
 #[cfg(test)]
 mod tests {
+    use super::HarnessKind;
     use super::{default_mcp_url, infer_provider};
 
     #[test]
     fn provider_is_read_off_the_base_url() {
-        assert_eq!(infer_provider(None), "anthropic");
+        assert_eq!(infer_provider(None, HarnessKind::Codex), "anthropic");
         assert_eq!(
-            infer_provider(Some("https://api.anthropic.com")),
+            infer_provider(Some("https://api.anthropic.com"), HarnessKind::Codex),
             "anthropic"
         );
         assert_eq!(
-            infer_provider(Some("https://API.anthropic.com/v1")),
+            infer_provider(Some("https://API.anthropic.com/v1"), HarnessKind::Codex),
             "anthropic"
         );
         assert_eq!(
-            infer_provider(Some("http://localhost:5000")),
+            infer_provider(Some("http://localhost:5000"), HarnessKind::Codex),
             "custom:localhost:5000"
         );
         assert_eq!(
-            infer_provider(Some("https://openrouter.ai/api?x=1")),
+            infer_provider(Some("https://openrouter.ai/api?x=1"), HarnessKind::Codex),
             "custom:openrouter.ai"
         );
     }

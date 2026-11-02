@@ -108,7 +108,7 @@ pub fn usage_metadata(
 /// (`-20251101`, `@20251101`, `-v1:0`).
 pub fn normalize_model(model: &str) -> String {
     let mut m = model.trim().to_lowercase();
-    if let Some(i) = m.rfind("anthropic.") {
+    if let Some(i) = m.find("anthropic.") {
         m = m[i + "anthropic.".len()..].to_string();
     }
     if let Some(i) = m.find('@') {
