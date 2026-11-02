@@ -1485,10 +1485,16 @@ mod tests {
                 .map(Mandate::computed_hash)
         }
 
+        /// Consume one unit of a countdown, if any is left.
         fn take(counter: &AtomicUsize) -> bool {
-            counter
-                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
-                .is_ok()
+            let mut n = counter.load(Ordering::SeqCst);
+            while n > 0 {
+                match counter.compare_exchange(n, n - 1, Ordering::SeqCst, Ordering::SeqCst) {
+                    Ok(_) => return true,
+                    Err(actual) => n = actual,
+                }
+            }
+            false
         }
     }
 
