@@ -1,7 +1,8 @@
 use super::{
-    pass_mcp_token, warn_unsupported, with_instructions, Harness, Invocation, Settings,
+    pass_mcp_token, warn_unsupported, with_instructions, Harness, Invocation, Parsed, Settings,
     MCP_TOKEN_ENV,
 };
+use crate::runtime::Session;
 
 /// Sourcegraph Amp: `amp -x`.
 pub struct Amp;
@@ -24,7 +25,13 @@ impl Harness for Amp {
         Ok(())
     }
 
-    fn invocation(&self, settings: &Settings, system_prompt: &str, prompt: &str) -> Invocation {
+    fn invocation(
+        &self,
+        settings: &Settings,
+        system_prompt: &str,
+        prompt: &str,
+        _session: Option<&Session>,
+    ) -> Invocation {
         let mut inv = Invocation::default();
         if let Some(ref mcp) = settings.mcp {
             // Inline config needs no `amp mcp approve`. The token stays in
@@ -56,7 +63,7 @@ impl Harness for Amp {
     }
 
     /// JSON lines ending in a `result` event that holds the final message.
-    fn parse_output(&self, stdout: &str) -> anyhow::Result<String> {
+    fn parse_output(&self, stdout: &str) -> anyhow::Result<Parsed> {
         for line in stdout.lines().rev().filter(|l| !l.trim().is_empty()) {
             let Ok(event) = serde_json::from_str::<serde_json::Value>(line) else {
                 continue;
@@ -65,7 +72,7 @@ impl Harness for Amp {
                 if event["is_error"].as_bool().unwrap_or(false) {
                     anyhow::bail!("amp reported an error: {}", event);
                 }
-                return Ok(event["result"].as_str().unwrap_or_default().to_string());
+                return Ok(Parsed::text(event["result"].as_str().unwrap_or_default()));
             }
         }
         anyhow::bail!("amp finished without a result event")

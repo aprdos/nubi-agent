@@ -1,24 +1,25 @@
 use eventsource_client::Client;
 use futures::StreamExt;
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::Semaphore;
 use tokio::time::interval;
 
 use crate::buffer::RoomBuffer;
-use crate::harness::{CliRuntime, HarnessKind, McpServer};
+use crate::harness::{age, now_ms, write_private, CliRuntime, HarnessKind, McpServer};
 use crate::mandate::{FetchError, Fetched, Mandate, MandateLoader};
-use crate::nubi::NubiClient;
-use crate::runtime::{AgentRuntime, RunOutput};
+use crate::nubi::{NubiClient, Outgoing};
+use crate::runtime::{AgentRuntime, RunOutput, Session, ThreadAnchor, Trigger, TurnInput};
 use crate::skills::{CompositeSkillLoader, RoomSkillLoader, Skill, SkillLoader};
 use crate::types::{MandateUpdate, SseData};
 
-/// How long a room's incoming burst is allowed to settle before we pick a
-/// message to answer. Collapses a backlog into one reply to the newest message.
+/// How long a room's incoming burst is allowed to settle before we answer.
+/// Everything that arrived by then is answered in one turn.
 const COALESCE_WINDOW_MS: u64 = 500;
 
 /// How often pending read offsets are pushed to the server.
@@ -26,6 +27,18 @@ const OFFSET_FLUSH_SECS: u64 = 2;
 
 /// Ceiling on simultaneously running harness processes across all rooms.
 const MAX_CONCURRENT_REPLIES: usize = 4;
+
+/// Harness runs one turn may take before giving up: the first, one retry
+/// after a failure, and possibly a fresh start when a resume failed.
+const MAX_RUNS_PER_TURN: u32 = 3;
+const RETRY_BACKOFF: Duration = Duration::from_secs(2);
+
+/// A room's harness session is continued for this long after its last turn;
+/// after that the next message starts a fresh one.
+const SESSION_MAX_IDLE: Duration = Duration::from_secs(6 * 3600);
+
+/// How many of the agent's own recent turns in a room go into the prompt.
+const JOURNAL_LINES: usize = 5;
 
 /// Startup attempts at fetching the mandate before carrying on without one
 /// (unless `mandate_strict`, which keeps trying).
@@ -54,10 +67,16 @@ pub struct AgentConfig {
     pub context_size: usize,
     pub rate_limit_ms: u64,
     pub mcp_url: Option<String>,
+    /// How often the typing indicator is refreshed while a turn runs; 0
+    /// sets it once and leaves it.
     pub heartbeat_interval_secs: u64,
     pub llm_base_url: Option<String>,
     pub llm_api_key: Option<String>,
     pub llm_model: Option<String>,
+    pub llm_fallback_model: Option<String>,
+    pub llm_effort: Option<String>,
+    pub compact_at_pct: Option<u8>,
+    pub turn_timeout_secs: u64,
     pub harness: HarnessKind,
     /// Do not serve any room until the mandate has been fetched, and refuse a
     /// turn while it cannot be.
@@ -77,10 +96,14 @@ impl Default for AgentConfig {
             context_size: 30,
             rate_limit_ms: 5000,
             mcp_url: None,
-            heartbeat_interval_secs: 30,
+            heartbeat_interval_secs: 5,
             llm_base_url: None,
             llm_api_key: None,
             llm_model: None,
+            llm_fallback_model: None,
+            llm_effort: None,
+            compact_at_pct: None,
+            turn_timeout_secs: crate::harness::DEFAULT_TURN_TIMEOUT.as_secs(),
             harness: HarnessKind::default(),
             mandate_strict: false,
             no_local_skills: false,
@@ -107,16 +130,10 @@ struct MandateStatus {
     unverified: bool,
 }
 
-/// The message a room worker will answer. Only the newest one per room is kept.
-struct Trigger {
-    sender: String,
-    text: String,
-}
-
-/// Which rooms have a pending message and which already have a worker running.
+/// Which rooms have pending messages and which already have a worker running.
 #[derive(Default)]
 struct Dispatch {
-    pending: HashMap<String, Trigger>,
+    pending: HashMap<String, Vec<Trigger>>,
     active: HashSet<String>,
 }
 
@@ -125,6 +142,35 @@ struct Dispatch {
 struct Offsets {
     seen: HashMap<String, u64>,
     committed: HashMap<String, u64>,
+}
+
+/// The harness conversation a room is being served in.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SessionRecord {
+    id: String,
+    last_used_ms: u64,
+    /// Highest message index the session has already seen, so the next
+    /// prompt only carries what came after.
+    last_index: u64,
+}
+
+/// How a turn ended, for the journal and the log line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Outcome {
+    Posted,
+    /// The model answered through tools and asked for nothing to be posted.
+    Tools,
+    Failed,
+}
+
+impl Outcome {
+    fn as_str(self) -> &'static str {
+        match self {
+            Outcome::Posted => "posted",
+            Outcome::Tools => "tools",
+            Outcome::Failed => "failed",
+        }
+    }
 }
 
 /// State shared between the SSE loop, the offset flusher and the room workers.
@@ -142,9 +188,12 @@ struct Shared {
     primed: Mutex<HashSet<String>>,
     replies: Semaphore,
     start_time_ms: u64,
-    /// Room skill loader for cache invalidation on SSE updates.
-    #[allow(dead_code)]
-    room_skill_loader: Option<RoomSkillLoader>,
+    /// The agent's workspace: sessions and the per-room journal live under
+    /// its `.nubi/` directory. None when there is no home directory.
+    workspace: Option<PathBuf>,
+    sessions: Mutex<HashMap<String, SessionRecord>>,
+    /// Thread anchors already looked up, None when the lookup found nothing.
+    anchors: Mutex<HashMap<String, Option<ThreadAnchor>>>,
     /// Skills from room membership and files. Re-filtered against the
     /// mandate whenever it changes.
     adhoc_skills: Vec<Skill>,
@@ -158,61 +207,24 @@ struct Shared {
 /// The main agent that listens to nubi and responds via a harness CLI
 pub struct Agent {
     shared: Arc<Shared>,
-    /// Loaded skills for this agent
-    #[allow(dead_code)]
-    skills: Vec<Skill>,
 }
 
 impl Agent {
     /// Create a new agent with synchronous filesystem-only skill loading.
     /// Use `connect` for full room-based skill loading.
     pub fn new(nubi: NubiClient, config: AgentConfig) -> Self {
-        let mcp = config.mcp_url.as_ref().map(|url| McpServer {
-            url: url.clone(),
-            token: nubi.token().to_string(),
-        });
-
-        let memory_file = config.harness.harness().memory_file();
-        let workspace = Self::prepare_workspace(&config.agent_id, memory_file);
-
-        // Load skills from filesystem only (sync)
-        let (skills, _) = Self::load_skills_sync(&config.agent_id);
-
-        let runtime = CliRuntime::new(config.harness, &config.agent_id)
-            .with_skip_permissions(config.skip_permissions)
-            .with_system_prompt(config.system_prompt.clone())
-            .with_mcp(mcp)
-            .with_workspace(workspace)
-            .with_llm_base_url(config.llm_base_url.clone())
-            .with_llm_api_key(config.llm_api_key.clone())
-            .with_model(config.llm_model.clone());
-
-        Self::assemble(nubi, config, Box::new(runtime), skills, None, None)
+        let workspace = Self::prepare_workspace(&config.agent_id, config.harness);
+        let skills = Self::load_skills_sync(&config.agent_id);
+        let runtime = Self::build_runtime(&config, &nubi, workspace.clone());
+        Self::assemble(nubi, config, Box::new(runtime), skills, workspace, None)
     }
 
     /// Create a new agent with async room-based skill loading.
     /// Falls back to filesystem if room API fails.
     pub async fn connect(nubi: NubiClient, config: AgentConfig) -> Self {
-        let mcp = config.mcp_url.as_ref().map(|url| McpServer {
-            url: url.clone(),
-            token: nubi.token().to_string(),
-        });
-
-        let memory_file = config.harness.harness().memory_file();
-        let workspace = Self::prepare_workspace(&config.agent_id, memory_file);
-
-        // Load skills with room-based loader (async)
-        let (skills, room_skill_loader) = Self::load_skills_async(&config.agent_id, &nubi).await;
-
-        let runtime = CliRuntime::new(config.harness, &config.agent_id)
-            .with_skip_permissions(config.skip_permissions)
-            .with_system_prompt(config.system_prompt.clone())
-            .with_mcp(mcp)
-            .with_workspace(workspace)
-            .with_llm_base_url(config.llm_base_url.clone())
-            .with_llm_api_key(config.llm_api_key.clone())
-            .with_model(config.llm_model.clone());
-
+        let workspace = Self::prepare_workspace(&config.agent_id, config.harness);
+        let skills = Self::load_skills_async(&config.agent_id, &nubi).await;
+        let runtime = Self::build_runtime(&config, &nubi, workspace.clone());
         let mandate =
             MandateLoader::new(nubi.base_url(), nubi.token(), nubi.space(), nubi.agent_id());
 
@@ -221,11 +233,36 @@ impl Agent {
             config,
             Box::new(runtime),
             skills,
-            room_skill_loader,
+            workspace,
             Some(mandate),
         );
         agent.shared.init_mandate().await;
         agent
+    }
+
+    fn build_runtime(
+        config: &AgentConfig,
+        nubi: &NubiClient,
+        workspace: Option<PathBuf>,
+    ) -> CliRuntime {
+        let mcp = config.mcp_url.as_ref().map(|url| McpServer {
+            url: url.clone(),
+            token: nubi.token().to_string(),
+        });
+        let team_memory = dirs::home_dir().map(|h| h.join(".nubi").join("TEAM.md"));
+        CliRuntime::new(config.harness, &config.agent_id)
+            .with_skip_permissions(config.skip_permissions)
+            .with_system_prompt(config.system_prompt.clone())
+            .with_mcp(mcp)
+            .with_workspace(workspace)
+            .with_llm_base_url(config.llm_base_url.clone())
+            .with_llm_api_key(config.llm_api_key.clone())
+            .with_model(config.llm_model.clone())
+            .with_fallback_model(config.llm_fallback_model.clone())
+            .with_effort(config.llm_effort.clone())
+            .with_compact_at_pct(config.compact_at_pct)
+            .with_turn_timeout(Duration::from_secs(config.turn_timeout_secs.max(1)))
+            .with_team_memory(team_memory)
     }
 
     /// Wire the shared state together and inject the ad-hoc skills.
@@ -234,7 +271,7 @@ impl Agent {
         config: AgentConfig,
         runtime: Box<dyn AgentRuntime>,
         skills: Vec<Skill>,
-        room_skill_loader: Option<RoomSkillLoader>,
+        workspace: Option<PathBuf>,
         mandate: Option<MandateLoader>,
     ) -> Self {
         let buffer = RoomBuffer::new()
@@ -245,6 +282,11 @@ impl Agent {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_millis() as u64;
+
+        let sessions = workspace
+            .as_ref()
+            .map(|ws| load_sessions(&sessions_path(ws)))
+            .unwrap_or_default();
 
         let shared = Shared {
             config,
@@ -257,7 +299,9 @@ impl Agent {
             primed: Mutex::new(HashSet::new()),
             replies: Semaphore::new(MAX_CONCURRENT_REPLIES),
             start_time_ms,
-            room_skill_loader,
+            workspace,
+            sessions: Mutex::new(sessions),
+            anchors: Mutex::new(HashMap::new()),
             adhoc_skills: skills.clone(),
             mandate,
             mandate_status: Mutex::new(MandateStatus::default()),
@@ -272,96 +316,59 @@ impl Agent {
 
         Self {
             shared: Arc::new(shared),
-            skills,
         }
+    }
+
+    /// The shared and per-agent skill directories, created if missing.
+    fn skill_dirs(agent_id: &str) -> Option<(PathBuf, PathBuf)> {
+        let home = dirs::home_dir()?;
+        // Validate agent_id to prevent path traversal (CWE-22)
+        if !is_safe_path_segment(agent_id) {
+            eprintln!(
+                "[nubi-agent] Invalid agent_id for skills path: {}",
+                agent_id
+            );
+            return None;
+        }
+        let shared_dir = home.join(".nubi").join("skills");
+        let agent_skills_dir = home.join(".nubi-agents").join(agent_id).join("skills");
+        let _ = fs::create_dir_all(&shared_dir);
+        let _ = fs::create_dir_all(&agent_skills_dir);
+        Some((shared_dir, agent_skills_dir))
     }
 
     /// Load skills from filesystem only (synchronous).
-    fn load_skills_sync(agent_id: &str) -> (Vec<Skill>, String) {
-        let home = match dirs::home_dir() {
-            Some(h) => h,
-            None => return (Vec::new(), String::new()),
+    fn load_skills_sync(agent_id: &str) -> Vec<Skill> {
+        let Some((shared_dir, agent_dir)) = Self::skill_dirs(agent_id) else {
+            return Vec::new();
         };
-
-        // Validate agent_id to prevent path traversal (CWE-22)
-        if !is_safe_path_segment(agent_id) {
-            eprintln!(
-                "[nubi-agent] Invalid agent_id for skills path: {}",
-                agent_id
-            );
-            return (Vec::new(), String::new());
-        }
-
-        let shared_dir = home.join(".nubi").join("skills");
-        let agent_skills_dir = home.join(".nubi-agents").join(agent_id).join("skills");
-
-        // Create directories if they don't exist (for discoverability)
-        let _ = fs::create_dir_all(&shared_dir);
-        let _ = fs::create_dir_all(&agent_skills_dir);
-
-        let loader = SkillLoader::new(shared_dir, Some(agent_skills_dir));
-        let skills = loader.load_all();
-        let prompt = SkillLoader::build_prompt_section(&skills);
-
-        (skills, prompt)
+        SkillLoader::new(shared_dir, Some(agent_dir)).load_all()
     }
 
-    /// Load skills with room-based loader, falling back to filesystem.
-    async fn load_skills_async(
-        agent_id: &str,
-        nubi: &NubiClient,
-    ) -> (Vec<Skill>, Option<RoomSkillLoader>) {
-        let home = match dirs::home_dir() {
-            Some(h) => h,
-            None => return (Vec::new(), None),
+    /// Load skills from skill rooms and the filesystem. Filesystem skills are
+    /// always read; whether they are injected is decided against the mandate
+    /// in `adhoc_skills`.
+    async fn load_skills_async(agent_id: &str, nubi: &NubiClient) -> Vec<Skill> {
+        let Some((shared_dir, agent_dir)) = Self::skill_dirs(agent_id) else {
+            return Vec::new();
         };
-
-        // Validate agent_id to prevent path traversal (CWE-22)
-        if !is_safe_path_segment(agent_id) {
-            eprintln!(
-                "[nubi-agent] Invalid agent_id for skills path: {}",
-                agent_id
-            );
-            return (Vec::new(), None);
-        }
-
-        let shared_dir = home.join(".nubi").join("skills");
-        let agent_skills_dir = home.join(".nubi-agents").join(agent_id).join("skills");
-
-        // Create directories if they don't exist (for discoverability)
-        let _ = fs::create_dir_all(&shared_dir);
-        let _ = fs::create_dir_all(&agent_skills_dir);
-
-        // Create loaders. Filesystem skills are always read; whether they are
-        // injected is decided against the mandate in `adhoc_section`.
-        let fs_loader = SkillLoader::new(shared_dir, Some(agent_skills_dir));
+        let fs_loader = SkillLoader::new(shared_dir, Some(agent_dir));
         let room_loader = RoomSkillLoader::new(nubi.base_url(), nubi.token(), nubi.space());
-
-        let composite = CompositeSkillLoader::new(Some(room_loader), fs_loader);
-        let skills = composite.load_all().await;
-
-        // Extract room loader with cache intact for SSE invalidation
-        let room_loader = composite.into_room_loader();
-
-        (skills, room_loader)
-    }
-
-    /// Load skills from shared and per-agent directories (legacy, kept for compatibility)
-    #[allow(dead_code)]
-    fn load_skills(agent_id: &str) -> (Vec<Skill>, String) {
-        Self::load_skills_sync(agent_id)
+        CompositeSkillLoader::new(Some(room_loader), fs_loader)
+            .load_all()
+            .await
     }
 
     /// A stable per-agent directory for the spawned CLI to run in.
     ///
-    /// Each message is a one-shot run that remembers nothing, so the directory
-    /// is the only thing that survives: the harness's memory file in it
-    /// (CLAUDE.md, AGENTS.md, GEMINI.md) is reloaded on every run. Agents get
+    /// The directory survives between runs: the harness's memory file in it
+    /// (CLAUDE.md, AGENTS.md, GEMINI.md) is reloaded on every run, and the
+    /// `.nubi/` directory holds sessions and the room journal. Agents get
     /// their own so one cannot read another's notes.
     ///
     /// Returns None if there is no home directory to anchor to, which just
     /// leaves the CLI in the launching cwd as before.
-    fn prepare_workspace(agent_id: &str, memory_file: &str) -> Option<PathBuf> {
+    fn prepare_workspace(agent_id: &str, harness: HarnessKind) -> Option<PathBuf> {
         // Validate agent_id to prevent path traversal (CWE-22)
         if !is_safe_path_segment(agent_id) {
             eprintln!("[nubi-agent] Invalid agent_id for workspace: {}", agent_id);
@@ -369,11 +376,11 @@ impl Agent {
         }
 
         let path = dirs::home_dir()?.join(".nubi-agents").join(agent_id);
-        if let Err(e) = fs::create_dir_all(&path) {
+        if let Err(e) = fs::create_dir_all(path.join(".nubi").join("rooms")) {
             eprintln!("[nubi-agent] Cannot create workspace {:?}: {}", path, e);
             return None;
         }
-        Self::seed_memory_file(&path, memory_file, agent_id);
+        Self::seed_memory_file(&path, harness.harness().memory_file(), agent_id);
         eprintln!("[nubi-agent] Workspace at {:?}", path);
         Some(path)
     }
@@ -390,10 +397,9 @@ impl Agent {
         }
         let seed = format!(
             "# {} — memory\n\n\
-             This file is reloaded at the start of every message you handle, and it is \
-             the only thing you remember between them. Keep durable facts here: who \
-             people are, what was decided, standing instructions you were given. \
-             Delete anything that stops being true, and keep it short.\n\n\
+             This file is loaded at the start of every message you handle. Keep durable \
+             facts here: who people are, what was decided, standing instructions you were \
+             given. Delete anything that stops being true, and keep it short.\n\n\
              Nothing recorded yet.\n",
             agent_id
         );
@@ -489,10 +495,10 @@ fn describe(hash: Option<&str>) -> &str {
     hash.unwrap_or("none")
 }
 
-/// The ad-hoc skills section: skills from room membership and files, minus
-/// any that collide with a mandated skill by room id or name (so a local file
-/// cannot shadow a mandate), and minus files when local skills are off.
-fn adhoc_section(skills: &[Skill], mandate: Option<&Mandate>, allow_local: bool) -> String {
+/// The ad-hoc skills: skills from room membership and files, minus any that
+/// collide with a mandated skill by room id or name (so a local file cannot
+/// shadow a mandate), and minus files when local skills are off.
+fn adhoc_skills(skills: &[Skill], mandate: Option<&Mandate>, allow_local: bool) -> Vec<Skill> {
     let mandated = |skill: &Skill| {
         mandate.is_some_and(|m| {
             m.skills.iter().any(|ms| {
@@ -502,13 +508,40 @@ fn adhoc_section(skills: &[Skill], mandate: Option<&Mandate>, allow_local: bool)
             })
         })
     };
-    let kept: Vec<Skill> = skills
+    skills
         .iter()
         .filter(|s| allow_local || s.room_id().is_some())
         .filter(|s| !mandated(s))
         .cloned()
-        .collect();
-    SkillLoader::build_prompt_section(&kept)
+        .collect()
+}
+
+fn sessions_path(workspace: &Path) -> PathBuf {
+    workspace.join(".nubi").join("sessions.json")
+}
+
+fn load_sessions(path: &Path) -> HashMap<String, SessionRecord> {
+    fs::read_to_string(path)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+/// `thread.<parent>.<index>` → (parent, index).
+fn parse_thread_room(room_id: &str) -> Option<(String, u64)> {
+    let rest = room_id.strip_prefix("thread.")?;
+    let (parent, index) = rest.rsplit_once('.')?;
+    Some((parent.to_string(), index.parse().ok()?))
+}
+
+/// One line, at most `max` characters.
+fn short(text: &str, max: usize) -> String {
+    let one_line = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if one_line.chars().count() <= max {
+        one_line
+    } else {
+        format!("{}…", one_line.chars().take(max).collect::<String>())
+    }
 }
 
 impl Shared {
@@ -517,7 +550,7 @@ impl Shared {
         let mandate = self.mandate.as_ref().and_then(MandateLoader::current);
         let allow_local =
             !self.config.no_local_skills && !mandate.as_ref().is_some_and(Mandate::is_mandate_only);
-        let adhoc = adhoc_section(&self.adhoc_skills, mandate.as_ref(), allow_local);
+        let adhoc = adhoc_skills(&self.adhoc_skills, mandate.as_ref(), allow_local);
         self.runtime.inject_mandate(mandate.as_ref(), &adhoc)
     }
 
@@ -778,7 +811,7 @@ impl Shared {
     }
 
     /// Handle one SSE entry: record its offset, buffer it for context, and
-    /// queue it as the room's next trigger if it's addressed to us.
+    /// queue it as a pending trigger for its room if it's addressed to us.
     async fn ingest(self: &Arc<Self>, data: &str) -> anyhow::Result<()> {
         let sse_data: SseData = serde_json::from_str(data)?;
         let room_id = sse_data.room_id;
@@ -820,6 +853,9 @@ impl Shared {
             Trigger {
                 sender: entry.sender.clone(),
                 text: entry.text(),
+                index: entry.global_index,
+                expect_reply: entry.expect_reply_list(),
+                timestamp_ms: entry.timestamp_ms,
             },
         );
 
@@ -864,10 +900,162 @@ impl Shared {
         }
     }
 
-    /// Make this the room's pending message, starting a worker if none runs.
+    /// The message a thread room was opened on, looked up once per room.
+    async fn thread_anchor(&self, room_id: &str) -> Option<ThreadAnchor> {
+        if let Some(cached) = self.anchors.lock().unwrap().get(room_id) {
+            return cached.clone();
+        }
+        let (parent, index) = parse_thread_room(room_id)?;
+        let anchor = match self.nubi.message_at(&parent, index).await {
+            Ok(Some(entry)) => Some(ThreadAnchor {
+                parent_room: parent,
+                index,
+                sender: entry.sender.clone(),
+                text: entry.text(),
+            }),
+            Ok(None) => None,
+            Err(e) => {
+                eprintln!(
+                    "[nubi-agent] Could not load thread anchor for {}: {}",
+                    room_id, e
+                );
+                // Not cached: the next turn tries again.
+                return None;
+            }
+        };
+        self.anchors
+            .lock()
+            .unwrap()
+            .insert(room_id.to_string(), anchor.clone());
+        anchor
+    }
+
+    fn journal_path(&self, room_id: &str) -> Option<PathBuf> {
+        if !is_safe_path_segment(room_id) {
+            return None;
+        }
+        Some(
+            self.workspace
+                .as_ref()?
+                .join(".nubi")
+                .join("rooms")
+                .join(format!("{room_id}.log")),
+        )
+    }
+
+    /// The agent's last few turns in a room, newest last, as prompt lines.
+    fn journal_tail(&self, room_id: &str) -> Vec<String> {
+        let Some(path) = self.journal_path(room_id) else {
+            return Vec::new();
+        };
+        let Ok(text) = fs::read_to_string(path) else {
+            return Vec::new();
+        };
+        let now = now_ms();
+        let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
+        lines
+            .iter()
+            .rev()
+            .take(JOURNAL_LINES)
+            .rev()
+            .map(|line| match line.split_once('\t') {
+                Some((ms, rest)) => match ms.parse::<u64>() {
+                    Ok(ms) => format!("{} {}", age(ms, now), rest),
+                    Err(_) => rest.to_string(),
+                },
+                None => line.to_string(),
+            })
+            .collect()
+    }
+
+    fn journal_append(&self, room_id: &str, line: &str) {
+        let Some(path) = self.journal_path(room_id) else {
+            return;
+        };
+        use std::io::Write;
+        let entry = format!("{}\t{}\n", now_ms(), short(line, 300));
+        let written = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .and_then(|mut f| f.write_all(entry.as_bytes()));
+        if let Err(e) = written {
+            eprintln!("[nubi-agent] Cannot write journal {:?}: {}", path, e);
+        }
+    }
+
+    /// The session to run this room's turn in, when the runtime keeps them:
+    /// the recorded one if it was used recently, else a fresh id.
+    fn session_for(&self, room_id: &str) -> Option<Session> {
+        if !self.runtime.supports_sessions() {
+            return None;
+        }
+        let now = now_ms();
+        let existing = self.sessions.lock().unwrap().get(room_id).cloned();
+        match existing {
+            Some(rec)
+                if now.saturating_sub(rec.last_used_ms) < SESSION_MAX_IDLE.as_millis() as u64 =>
+            {
+                Some(Session {
+                    id: rec.id,
+                    resume: true,
+                })
+            }
+            _ => Some(Session {
+                id: uuid::Uuid::new_v4().to_string(),
+                resume: false,
+            }),
+        }
+    }
+
+    fn session_last_index(&self, room_id: &str) -> u64 {
+        self.sessions
+            .lock()
+            .unwrap()
+            .get(room_id)
+            .map(|r| r.last_index)
+            .unwrap_or(0)
+    }
+
+    fn forget_session(&self, room_id: &str) {
+        self.sessions.lock().unwrap().remove(room_id);
+        self.save_sessions();
+    }
+
+    fn record_session(&self, room_id: &str, id: String, last_index: u64) {
+        self.sessions.lock().unwrap().insert(
+            room_id.to_string(),
+            SessionRecord {
+                id,
+                last_used_ms: now_ms(),
+                last_index,
+            },
+        );
+        self.save_sessions();
+    }
+
+    fn save_sessions(&self) {
+        let Some(ref ws) = self.workspace else {
+            return;
+        };
+        let path = sessions_path(ws);
+        let json = serde_json::to_string_pretty(&*self.sessions.lock().unwrap())
+            .expect("session map serializes");
+        // Written to a temp file and renamed, so a crash mid-write cannot
+        // leave a truncated file that drops every session on restart.
+        if let Err(e) = write_private(&path, &json) {
+            eprintln!("[nubi-agent] Cannot save sessions to {:?}: {}", path, e);
+        }
+    }
+
+    /// Make this one of the room's pending messages, starting a worker if none runs.
     fn enqueue(self: &Arc<Self>, room_id: &str, trigger: Trigger) {
         let mut dispatch = self.dispatch.lock().unwrap();
-        dispatch.pending.insert(room_id.to_string(), trigger);
+        dispatch
+            .pending
+            .entry(room_id.to_string())
+            .or_default()
+            .push(trigger);
         if !dispatch.active.insert(room_id.to_string()) {
             return;
         }
@@ -878,7 +1066,7 @@ impl Shared {
         tokio::spawn(async move { shared.serve_room(room_id).await });
     }
 
-    /// Answer a room's pending messages one at a time until none are left.
+    /// Answer a room's pending messages, all at once, until none are left.
     /// Rooms run independently, so a slow reply in one doesn't stall the others.
     async fn serve_room(self: Arc<Self>, room_id: String) {
         loop {
@@ -889,24 +1077,29 @@ impl Shared {
                 tokio::time::sleep(wait).await;
             }
 
-            let trigger = {
+            let triggers = {
                 let mut dispatch = self.dispatch.lock().unwrap();
                 match dispatch.pending.remove(&room_id) {
-                    Some(trigger) => trigger,
-                    None => {
+                    Some(triggers) if !triggers.is_empty() => triggers,
+                    _ => {
                         dispatch.active.remove(&room_id);
                         return;
                     }
                 }
             };
 
-            if let Err(e) = self.reply(&room_id, &trigger).await {
+            if let Err(e) = self.reply(&room_id, &triggers).await {
                 eprintln!("[nubi-agent] Error in {}: {}", room_id, e);
             }
         }
     }
 
-    async fn reply(&self, room_id: &str, trigger: &Trigger) -> anyhow::Result<()> {
+    /// One turn: run the harness for every pending message in the room, post
+    /// what it says, and tell the room when that could not be done.
+    async fn reply(&self, room_id: &str, triggers: &[Trigger]) -> anyhow::Result<()> {
+        let Some(newest) = triggers.last() else {
+            return Ok(());
+        };
         let _permit = self.replies.acquire().await?;
 
         if let Err(reason) = self.check_mandate().await {
@@ -915,97 +1108,282 @@ impl Shared {
         }
 
         eprintln!(
-            "[nubi-agent] @{} in {}: {}",
+            "[nubi-agent] @{} in {}: {}{}",
             self.config.agent_id,
             room_id,
-            trigger.text.chars().take(50).collect::<String>()
+            short(&newest.text, 50),
+            if triggers.len() > 1 {
+                format!(" (+{} more)", triggers.len() - 1)
+            } else {
+                String::new()
+            }
         );
 
         self.prime_buffer(room_id).await;
+        let thread = self.thread_anchor(room_id).await;
+        let journal = self.journal_tail(room_id);
+        let indexes: Vec<u64> = triggers.iter().map(|t| t.index).collect();
 
-        let context = self.buffer.lock().unwrap().context(room_id);
-        let prompt = self
-            .runtime
-            .build_prompt(room_id, &trigger.sender, &trigger.text, &context);
+        let started = Instant::now();
+        let mut session = self.session_for(room_id);
+        let mut runs = 0u32;
+        let mut nudged = false;
+        let outcome: Result<RunOutput, String> = loop {
+            runs += 1;
+            let resumed = session.as_ref().is_some_and(|s| s.resume);
+            let mut context = self
+                .buffer
+                .lock()
+                .unwrap()
+                .context_excluding(room_id, &indexes);
+            if resumed {
+                let last = self.session_last_index(room_id);
+                context.retain(|m| m.global_index > last);
+            }
+            let turn = TurnInput {
+                room_id: room_id.to_string(),
+                triggers: triggers.to_vec(),
+                context,
+                thread: thread.clone(),
+                journal: journal.clone(),
+                resumed,
+            };
+            let mut prompt = self.runtime.build_prompt(&turn);
+            if nudged {
+                prompt.push_str(
+                    "\n\n[Your previous attempt produced no reply at all. Answer in text, or \
+                     set post to false if you already answered this room with nubi_send.]",
+                );
+            }
 
-        eprintln!("[nubi-agent] Running {:?}...", self.config.harness);
-        let output = self.run_with_typing(room_id, &prompt).await?;
-        // Stamp what the prompt really carried, not what the check saw: a
-        // refresh can land between the two.
-        let (response, mandate_hash) = (output.text, output.mandate_hash);
-
-        if response.is_empty() {
-            eprintln!("[nubi-agent] Empty response, skipping");
-            return Ok(());
-        }
-
-        // Skip posting short confirmations (likely after tool use)
-        let trimmed = response.trim();
-        let trimmed_lower = trimmed.to_lowercase();
-        // Strip trailing punctuation for matching
-        let trimmed_clean = trimmed_lower.trim_end_matches(['.', '!', ',']);
-        let skip_words = [
-            "ok",
-            "done",
-            "sent",
-            "yes",
-            "no",
-            "empty",
-            "understood",
-            "got it",
-            "will do",
-            "on it",
-        ];
-        if trimmed_lower.len() <= 30
-            && skip_words.iter().any(|w| {
-                trimmed_clean == *w
-                    || trimmed_lower.contains("(no response)")
-                    || trimmed_lower.contains("(empty)")
-            })
-        {
             eprintln!(
-                "[nubi-agent] Short confirmation '{}', skipping post",
-                trimmed
+                "[nubi-agent] Running {:?}{}...",
+                self.config.harness,
+                match &session {
+                    Some(s) if s.resume => " (resuming session)",
+                    Some(_) => " (new session)",
+                    None => "",
+                }
             );
-            return Ok(());
-        }
+            let result = self
+                .run_with_typing(room_id, &prompt, session.as_ref())
+                .await;
 
-        // Skip responses with prompt format leaking at start
-        if trimmed.starts_with("Human:") || trimmed.starts_with("Assistant:") {
-            eprintln!(
-                "[nubi-agent] Prompt format leaked '{}', skipping post",
-                &trimmed[..trimmed.len().min(50)]
-            );
-            return Ok(());
-        }
-
-        // Truncate at "Human:" if it appears mid-response (model continuing past its turn)
-        let response =
-            if let Some(idx) = trimmed.find("\nHuman:").or_else(|| trimmed.find(" Human:")) {
-                eprintln!("[nubi-agent] Truncating at leaked 'Human:' (pos {})", idx);
-                trimmed[..idx].trim().to_string()
-            } else {
-                trimmed.to_string()
+            let last_error = match result {
+                Ok(out) if !out.is_error && !out.is_silent() => break Ok(out),
+                Ok(out) if !out.is_error && !nudged => {
+                    eprintln!("[nubi-agent] No reply from the model, asking once more");
+                    nudged = true;
+                    if runs < MAX_RUNS_PER_TURN {
+                        continue;
+                    }
+                    break Err("the model produced no reply".into());
+                }
+                // Silent again after the nudge: a third identical run would
+                // only cost money.
+                Ok(out) if !out.is_error => break Err("the model produced no reply twice".into()),
+                Ok(out) => out.error.unwrap_or_else(|| "the run failed".into()),
+                Err(e) => e.to_string(),
             };
 
-        if response.is_empty() {
-            eprintln!("[nubi-agent] Response empty after truncation, skipping");
-            return Ok(());
+            eprintln!(
+                "[nubi-agent] Run failed in {}: {}",
+                room_id,
+                short(&last_error, 200)
+            );
+            if runs >= MAX_RUNS_PER_TURN {
+                // A resume that failed on the last run would fail again on
+                // the room's next message; start that one fresh.
+                if resumed {
+                    eprintln!("[nubi-agent] Dropping the session for {}", room_id);
+                    self.forget_session(room_id);
+                }
+                break Err(last_error);
+            }
+            if resumed {
+                // The saved conversation may be gone or corrupt; a fresh one
+                // costs only the carried context.
+                eprintln!(
+                    "[nubi-agent] Dropping the session for {} and starting fresh",
+                    room_id
+                );
+                self.forget_session(room_id);
+                session = self.session_for(room_id);
+            } else {
+                tokio::time::sleep(RETRY_BACKOFF).await;
+            }
+        };
+
+        let elapsed_ms = started.elapsed().as_millis() as u64;
+        let session_kind = match &session {
+            Some(s) if s.resume => "resumed",
+            Some(_) => "new",
+            None => "none",
+        };
+
+        let out = match outcome {
+            Ok(out) => out,
+            Err(cause) => {
+                let apology = format!(
+                    "Couldn't finish that one ({}). Try again or ping me.",
+                    short(&cause, 160)
+                );
+                if let Err(e) = self
+                    .nubi
+                    .post(
+                        room_id,
+                        Outgoing {
+                            text: &apology,
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                {
+                    eprintln!(
+                        "[nubi-agent] Could not report the failure in {}: {}",
+                        room_id, e
+                    );
+                }
+                self.buffer.lock().unwrap().mark_responded(room_id);
+                self.journal_append(
+                    room_id,
+                    &format!(
+                        "#{} from {}: failed: {}",
+                        newest.index, newest.sender, cause
+                    ),
+                );
+                self.log_turn(
+                    room_id,
+                    newest.index,
+                    Outcome::Failed,
+                    runs,
+                    elapsed_ms,
+                    None,
+                    session_kind,
+                );
+                return Ok(());
+            }
+        };
+
+        // Remember the conversation for the room's next message.
+        if let Some(s) = &session {
+            let id = out.session_id.clone().unwrap_or_else(|| s.id.clone());
+            self.record_session(room_id, id, newest.index);
         }
 
-        eprintln!("[nubi-agent] Responding ({} chars)", response.len());
-        self.nubi
-            .post(room_id, &response, mandate_hash.as_deref())
-            .await?;
-        self.buffer.lock().unwrap().mark_responded(room_id);
+        let (post, text, mentions, expect_reply) = match out.reply.clone() {
+            Some(r) => (r.post, r.text, r.mentions, r.expect_reply),
+            None => (true, out.text.clone(), Vec::new(), None),
+        };
+        let text = text.trim().to_string();
+        let outcome = if !post || text.is_empty() {
+            Outcome::Tools
+        } else {
+            Outcome::Posted
+        };
+
+        let summary = match outcome {
+            Outcome::Tools => {
+                eprintln!("[nubi-agent] Answered via tools, nothing to post");
+                "answered via tools".to_string()
+            }
+            _ => {
+                eprintln!(
+                    "[nubi-agent] Responding ({} chars{})",
+                    text.len(),
+                    if expect_reply.as_ref().is_some_and(|w| !w.is_empty()) {
+                        format!(", reply from {}", expect_reply.as_ref().unwrap().join(", "))
+                    } else {
+                        String::new()
+                    }
+                );
+                let posted = self
+                    .nubi
+                    .post(
+                        room_id,
+                        Outgoing {
+                            text: &text,
+                            mentions: &mentions,
+                            expect_reply: expect_reply.as_deref(),
+                            mandate_hash: out.mandate_hash.as_deref(),
+                        },
+                    )
+                    .await;
+                // The room took a turn whether or not the post landed, so
+                // the cooldown applies either way.
+                self.buffer.lock().unwrap().mark_responded(room_id);
+                posted?;
+                format!("replied: {}", short(&text, 160))
+            }
+        };
+        if outcome == Outcome::Tools {
+            self.buffer.lock().unwrap().mark_responded(room_id);
+        }
+        self.journal_append(
+            room_id,
+            &format!(
+                "#{} from {} ({}): {}",
+                newest.index,
+                newest.sender,
+                short(&newest.text, 60),
+                summary
+            ),
+        );
+        self.log_turn(
+            room_id,
+            newest.index,
+            outcome,
+            runs,
+            elapsed_ms,
+            Some(&out),
+            session_kind,
+        );
 
         Ok(())
     }
 
-    /// Run the harness with typing indicator instead of heartbeat messages
-    async fn run_with_typing(&self, room_id: &str, prompt: &str) -> anyhow::Result<RunOutput> {
-        let typing_interval_secs = 5;
+    /// One structured line per turn, for grepping and for evals.
+    #[allow(clippy::too_many_arguments)]
+    fn log_turn(
+        &self,
+        room_id: &str,
+        index: u64,
+        outcome: Outcome,
+        runs: u32,
+        elapsed_ms: u64,
+        out: Option<&RunOutput>,
+        session: &str,
+    ) {
+        let mut line = format!(
+            "[nubi-agent] turn room={} idx={} outcome={} runs={} elapsed_ms={} session={}",
+            room_id,
+            index,
+            outcome.as_str(),
+            runs,
+            elapsed_ms,
+            session
+        );
+        if let Some(out) = out {
+            if let Some(n) = out.num_turns {
+                line.push_str(&format!(" model_turns={n}"));
+            }
+            if let Some(c) = out.cost_usd {
+                line.push_str(&format!(" cost_usd={c:.4}"));
+            }
+            if let Some(d) = out.duration_ms {
+                line.push_str(&format!(" cli_ms={d}"));
+            }
+        }
+        eprintln!("{line}");
+    }
 
+    /// Run the harness with a typing indicator held for as long as it runs.
+    async fn run_with_typing(
+        &self,
+        room_id: &str,
+        prompt: &str,
+        session: Option<&Session>,
+    ) -> anyhow::Result<RunOutput> {
         let done = Arc::new(AtomicBool::new(false));
         let done_clone = done.clone();
         let nubi = self.nubi.clone();
@@ -1016,31 +1394,35 @@ impl Shared {
             eprintln!("[nubi-agent] Failed to set typing: {}", e);
         }
 
-        // Spawn typing refresh task
-        let typing_handle = tokio::spawn(async move {
-            let mut ticker = interval(Duration::from_secs(typing_interval_secs));
-            ticker.tick().await; // Skip first immediate tick
+        // Refresh it while the run lasts, if asked to.
+        let refresh_secs = self.config.heartbeat_interval_secs;
+        let typing_handle = (refresh_secs > 0).then(|| {
+            tokio::spawn(async move {
+                let mut ticker = interval(Duration::from_secs(refresh_secs));
+                ticker.tick().await; // Skip first immediate tick
 
-            loop {
-                ticker.tick().await;
+                loop {
+                    ticker.tick().await;
 
-                if done_clone.load(Ordering::Relaxed) {
-                    break;
+                    if done_clone.load(Ordering::Relaxed) {
+                        break;
+                    }
+
+                    if let Err(e) = nubi.set_typing(&room_id_owned, true).await {
+                        eprintln!("[nubi-agent] Failed to refresh typing: {}", e);
+                    }
                 }
-
-                // Refresh typing indicator
-                if let Err(e) = nubi.set_typing(&room_id_owned, true).await {
-                    eprintln!("[nubi-agent] Failed to refresh typing: {}", e);
-                }
-            }
+            })
         });
 
         // Run the harness CLI
-        let result = self.runtime.run(prompt).await;
+        let result = self.runtime.run(prompt, session).await;
 
         // Signal typing to stop
         done.store(true, Ordering::Relaxed);
-        typing_handle.abort();
+        if let Some(handle) = typing_handle {
+            handle.abort();
+        }
 
         // Clear typing indicator
         if let Err(e) = self.nubi.set_typing(room_id, false).await {
@@ -1064,27 +1446,48 @@ mod tests {
         assert!(!config.skip_permissions);
     }
 
-    use crate::buffer::BufferedMessage;
+    #[test]
+    fn thread_rooms_name_their_parent_and_anchor() {
+        assert_eq!(
+            parse_thread_room("thread.pr-review-6ihc.540"),
+            Some(("pr-review-6ihc".into(), 540))
+        );
+        assert_eq!(parse_thread_room("pr-review-6ihc"), None);
+        assert_eq!(parse_thread_room("thread.x.notanumber"), None);
+    }
+
     use crate::mandate::tests::{fixture, resolve_body};
     use crate::mandate::MandateSkill;
     use crate::mock_engine::{etag_for, MockEngine, MockState};
+    use crate::runtime::StructuredReply;
     use crate::skills::SkillMeta;
     use async_trait::async_trait;
     use serde_json::json;
+    use std::sync::atomic::AtomicUsize;
     use std::sync::RwLock;
 
     /// What the fake runtime was given, readable after it is boxed away.
     #[derive(Default)]
     struct FakeState {
         mandate: RwLock<Option<Mandate>>,
+        /// Names of the ad-hoc skills last injected.
         adhoc: RwLock<String>,
-        injections: std::sync::atomic::AtomicUsize,
-        runs: std::sync::atomic::AtomicUsize,
+        injections: AtomicUsize,
+        runs: AtomicUsize,
+        prompts: Mutex<Vec<String>>,
+        sessions: Mutex<Vec<Option<Session>>>,
         /// Make `inject_mandate` fail, the way an unwritable prompt file does.
         fail_inject: AtomicBool,
         /// Hold every run until cleared, so a test can act between the
         /// mandate check and the run.
         block_runs: AtomicBool,
+        /// Runs still to fail with an Err, then with is_error, then silence.
+        fail_runs: AtomicUsize,
+        error_runs: AtomicUsize,
+        silent_runs: AtomicUsize,
+        /// A structured reply to return instead of plain text.
+        reply: RwLock<Option<StructuredReply>>,
+        sessions_supported: AtomicBool,
     }
 
     impl FakeState {
@@ -1095,6 +1498,18 @@ mod tests {
                 .as_ref()
                 .map(Mandate::computed_hash)
         }
+
+        /// Consume one unit of a countdown, if any is left.
+        fn take(counter: &AtomicUsize) -> bool {
+            let mut n = counter.load(Ordering::SeqCst);
+            while n > 0 {
+                match counter.compare_exchange(n, n - 1, Ordering::SeqCst, Ordering::SeqCst) {
+                    Ok(_) => return true,
+                    Err(actual) => n = actual,
+                }
+            }
+            false
+        }
     }
 
     struct FakeRuntime(Arc<FakeState>);
@@ -1104,31 +1519,79 @@ mod tests {
         async fn check_available(&self) -> anyhow::Result<()> {
             Ok(())
         }
-        fn build_prompt(&self, _: &str, _: &str, message: &str, _: &[BufferedMessage]) -> String {
-            message.to_string()
+        fn build_prompt(&self, turn: &TurnInput) -> String {
+            let mut prompt = String::new();
+            for m in &turn.context {
+                prompt.push_str(&format!(
+                    "ctx #{} {}: {}\n",
+                    m.global_index, m.sender, m.text
+                ));
+            }
+            for t in &turn.triggers {
+                prompt.push_str(&format!("new #{} {}: {}\n", t.index, t.sender, t.text));
+            }
+            if turn.resumed {
+                prompt.push_str("(resumed)\n");
+            }
+            prompt
         }
-        async fn run(&self, _prompt: &str) -> anyhow::Result<RunOutput> {
+        async fn run(&self, prompt: &str, session: Option<&Session>) -> anyhow::Result<RunOutput> {
             self.0.runs.fetch_add(1, Ordering::SeqCst);
+            self.0.prompts.lock().unwrap().push(prompt.to_string());
+            self.0.sessions.lock().unwrap().push(session.cloned());
             while self.0.block_runs.load(Ordering::SeqCst) {
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
+            if FakeState::take(&self.0.fail_runs) {
+                anyhow::bail!("claude failed (exit status: 1): boom");
+            }
             // Prompt and hash from the same read, as CliRuntime does.
             let mandate_hash = self.0.hash();
+            if FakeState::take(&self.0.error_runs) {
+                return Ok(RunOutput {
+                    is_error: true,
+                    error: Some("error_during_execution (HTTP 529): Overloaded".into()),
+                    mandate_hash,
+                    num_turns: Some(1),
+                    ..Default::default()
+                });
+            }
+            if FakeState::take(&self.0.silent_runs) {
+                return Ok(RunOutput {
+                    mandate_hash,
+                    num_turns: Some(1),
+                    ..Default::default()
+                });
+            }
+            let reply = self.0.reply.read().unwrap().clone();
             Ok(RunOutput {
-                text: "Refunds take 30 days from purchase.".into(),
+                text: reply
+                    .as_ref()
+                    .map(|r| r.text.clone())
+                    .unwrap_or_else(|| "Refunds take 30 days from purchase.".into()),
+                reply,
                 mandate_hash,
+                num_turns: Some(2),
+                session_id: session.map(|s| s.id.clone()),
+                ..Default::default()
             })
+        }
+        fn supports_sessions(&self) -> bool {
+            self.0.sessions_supported.load(Ordering::SeqCst)
         }
         fn supports_mcp(&self) -> bool {
             false
         }
-        fn inject_context(&mut self, _: &str) {}
-        fn inject_mandate(&self, mandate: Option<&Mandate>, adhoc: &str) -> anyhow::Result<()> {
+        fn inject_mandate(&self, mandate: Option<&Mandate>, adhoc: &[Skill]) -> anyhow::Result<()> {
             if self.0.fail_inject.load(Ordering::SeqCst) {
                 anyhow::bail!("prompt file is read-only");
             }
             *self.0.mandate.write().unwrap() = mandate.cloned();
-            *self.0.adhoc.write().unwrap() = adhoc.to_string();
+            *self.0.adhoc.write().unwrap() = adhoc
+                .iter()
+                .map(|s| s.meta.name.clone())
+                .collect::<Vec<_>>()
+                .join(",");
             self.0.injections.fetch_add(1, Ordering::SeqCst);
             Ok(())
         }
@@ -1171,8 +1634,32 @@ mod tests {
             .collect()
     }
 
+    fn posted_texts(engine: &MockEngine) -> Vec<String> {
+        engine
+            .state()
+            .posts
+            .iter()
+            .map(|(_, body)| body["parts"][0]["text"].as_str().unwrap_or("").to_string())
+            .collect()
+    }
+
+    fn temp_workspace() -> PathBuf {
+        let ws = std::env::temp_dir().join(format!("nubi-agent-ws-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(ws.join(".nubi").join("rooms")).unwrap();
+        ws
+    }
+
     /// An agent against the mock engine, mandate fetched as `connect` does.
     async fn agent(engine: &MockEngine, config: AgentConfig) -> (Agent, Arc<FakeState>) {
+        agent_with(engine, config, Vec::new(), true).await
+    }
+
+    async fn agent_with(
+        engine: &MockEngine,
+        config: AgentConfig,
+        skills: Vec<Skill>,
+        fetch_mandate: bool,
+    ) -> (Agent, Arc<FakeState>) {
         let state = Arc::new(FakeState::default());
         let nubi = NubiClient::new(&engine.url, "tok", "s1", ME);
         let loader = MandateLoader::new(&engine.url, "tok", "s1", ME);
@@ -1184,18 +1671,27 @@ mod tests {
                 ..config
             },
             Box::new(FakeRuntime(state.clone())),
-            Vec::new(),
-            None,
+            skills,
+            Some(temp_workspace()),
             Some(loader),
         );
-        agent.shared.init_mandate().await;
+        if fetch_mandate {
+            agent.shared.init_mandate().await;
+        }
         (agent, state)
     }
 
     fn trigger() -> Trigger {
+        trigger_at(10, "alice", "how long do refunds take?")
+    }
+
+    fn trigger_at(index: u64, sender: &str, text: &str) -> Trigger {
         Trigger {
-            sender: "alice".into(),
-            text: "how long do refunds take?".into(),
+            sender: sender.into(),
+            text: text.into(),
+            index,
+            expect_reply: None,
+            timestamp_ms: now_ms(),
         }
     }
 
@@ -1213,11 +1709,12 @@ mod tests {
             2
         );
 
-        agent.shared.reply("general", &trigger()).await.unwrap();
+        agent.shared.reply("general", &[trigger()]).await.unwrap();
 
         let s = engine.state();
         assert_eq!(s.posts.len(), 1);
         assert_eq!(s.posts[0].1["metadata"]["mandate_hash"], body["hash"]);
+        assert_eq!(s.posts[0].1["metadata"]["expect_reply"], json!([]));
         // Startup fetch, then a conditional check before the turn.
         assert_eq!(s.mandate_requests, vec![None, Some(etag_for(&body))]);
     }
@@ -1228,11 +1725,241 @@ mod tests {
         let (agent, fake) = agent(&engine, AgentConfig::default()).await;
         assert!(fake.mandate.read().unwrap().is_none());
 
-        agent.shared.reply("general", &trigger()).await.unwrap();
+        agent.shared.reply("general", &[trigger()]).await.unwrap();
 
         let s = engine.state();
         assert_eq!(s.posts.len(), 1);
         assert!(s.posts[0].1["metadata"].get("mandate_hash").is_none());
+    }
+
+    #[tokio::test]
+    async fn every_pending_message_reaches_the_prompt_and_the_journal_remembers() {
+        let engine = MockEngine::start(MockState::default()).await;
+        let (agent, fake) = agent(&engine, AgentConfig::default()).await;
+        let triggers = vec![
+            trigger_at(5, "alice", "first question"),
+            trigger_at(6, "bob", "second question"),
+        ];
+        agent.shared.reply("general", &triggers).await.unwrap();
+
+        let prompts = fake.prompts.lock().unwrap().clone();
+        assert_eq!(prompts.len(), 1);
+        assert!(prompts[0].contains("new #5 alice: first question"));
+        assert!(prompts[0].contains("new #6 bob: second question"));
+
+        let journal = agent.shared.journal_tail("general");
+        assert_eq!(journal.len(), 1);
+        assert!(journal[0].contains("#6 from bob"), "{journal:?}");
+        assert!(journal[0].contains("replied: Refunds take 30 days"));
+    }
+
+    #[tokio::test]
+    async fn a_structured_reply_carries_its_own_routing() {
+        let engine = MockEngine::start(MockState::default()).await;
+        let (agent, fake) = agent(&engine, AgentConfig::default()).await;
+        *fake.reply.write().unwrap() = Some(StructuredReply {
+            text: "pine, can you re-review?".into(),
+            mentions: vec!["pine".into()],
+            expect_reply: Some(vec!["pine".into()]),
+            post: true,
+        });
+        agent.shared.reply("general", &[trigger()]).await.unwrap();
+        {
+            let s = engine.state();
+            assert_eq!(s.posts[0].1["mentions"], json!(["pine"]));
+            assert_eq!(s.posts[0].1["metadata"]["expect_reply"], json!(["pine"]));
+        }
+
+        // post: false means the answer already went out via tools.
+        *fake.reply.write().unwrap() = Some(StructuredReply {
+            text: "".into(),
+            post: false,
+            ..Default::default()
+        });
+        agent.shared.reply("general", &[trigger()]).await.unwrap();
+        assert_eq!(engine.state().posts.len(), 1, "nothing more was posted");
+        let journal = agent.shared.journal_tail("general");
+        assert!(journal.last().unwrap().contains("answered via tools"));
+    }
+
+    #[tokio::test]
+    async fn a_failed_run_is_retried_then_reported_to_the_room() {
+        let engine = MockEngine::start(MockState::default()).await;
+        let (agent, fake) = agent(&engine, AgentConfig::default()).await;
+
+        // One transport failure, then success: the room sees only the answer.
+        fake.fail_runs.store(1, Ordering::SeqCst);
+        agent.shared.reply("general", &[trigger()]).await.unwrap();
+        assert_eq!(fake.runs.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            posted_texts(&engine),
+            vec!["Refunds take 30 days from purchase."]
+        );
+
+        // Failing every time: the room is told, with the cause.
+        fake.error_runs.store(10, Ordering::SeqCst);
+        agent.shared.reply("general", &[trigger()]).await.unwrap();
+        let texts = posted_texts(&engine);
+        assert_eq!(texts.len(), 2);
+        assert!(
+            texts[1].starts_with(
+                "Couldn't finish that one (error_during_execution (HTTP 529): Overloaded)"
+            ),
+            "{}",
+            texts[1]
+        );
+        assert_eq!(
+            fake.runs.load(Ordering::SeqCst),
+            2 + MAX_RUNS_PER_TURN as usize
+        );
+        let journal = agent.shared.journal_tail("general");
+        assert!(journal
+            .last()
+            .unwrap()
+            .contains("failed: error_during_execution"));
+    }
+
+    #[tokio::test]
+    async fn a_silent_run_is_nudged_once() {
+        let engine = MockEngine::start(MockState::default()).await;
+        let (agent, fake) = agent(&engine, AgentConfig::default()).await;
+        fake.silent_runs.store(1, Ordering::SeqCst);
+        agent.shared.reply("general", &[trigger()]).await.unwrap();
+        let prompts = fake.prompts.lock().unwrap().clone();
+        assert_eq!(prompts.len(), 2);
+        assert!(!prompts[0].contains("previous attempt"));
+        assert!(prompts[1].contains("previous attempt produced no reply"));
+        assert_eq!(posted_texts(&engine).len(), 1);
+    }
+
+    #[tokio::test]
+    async fn two_silent_runs_end_the_turn_with_a_note_to_the_room() {
+        let engine = MockEngine::start(MockState::default()).await;
+        let (agent, fake) = agent(&engine, AgentConfig::default()).await;
+        fake.silent_runs.store(10, Ordering::SeqCst);
+        agent.shared.reply("general", &[trigger()]).await.unwrap();
+        assert_eq!(
+            fake.runs.load(Ordering::SeqCst),
+            2,
+            "nudged once, then given up"
+        );
+        let texts = posted_texts(&engine);
+        assert_eq!(texts.len(), 1);
+        assert!(texts[0].contains("no reply twice"), "{}", texts[0]);
+    }
+
+    #[tokio::test]
+    async fn rooms_keep_a_session_and_resume_it_with_only_new_context() {
+        let engine = MockEngine::start(MockState::default()).await;
+        let (agent, fake) = agent(&engine, AgentConfig::default()).await;
+        fake.sessions_supported.store(true, Ordering::SeqCst);
+
+        // Room history: two old messages, then the trigger.
+        {
+            let mut buffer = agent.shared.buffer.lock().unwrap();
+            for (i, text) in [(1u64, "hello"), (2, "anyone here?")] {
+                buffer.push(
+                    "general",
+                    &crate::types::LogEntry {
+                        global_index: i,
+                        sender: "alice".into(),
+                        timestamp_ms: now_ms(),
+                        payload: crate::types::Payload {
+                            payload_type: "message".into(),
+                            parts: vec![crate::types::Part {
+                                kind: "text".into(),
+                                text: Some(text.into()),
+                            }],
+                            mentions: None,
+                            metadata: None,
+                        },
+                    },
+                );
+            }
+        }
+        agent
+            .shared
+            .reply("general", &[trigger_at(3, "alice", "refunds?")])
+            .await
+            .unwrap();
+        let first = fake.sessions.lock().unwrap()[0].clone().unwrap();
+        assert!(!first.resume, "first turn starts a session");
+        assert!(fake.prompts.lock().unwrap()[0].contains("ctx #1 alice: hello"));
+        let saved = load_sessions(&sessions_path(agent.shared.workspace.as_ref().unwrap()));
+        assert_eq!(saved["general"].id, first.id);
+        assert_eq!(saved["general"].last_index, 3);
+
+        // Next message in the room resumes it, and the old context is not resent.
+        agent
+            .shared
+            .reply("general", &[trigger_at(4, "alice", "and exchanges?")])
+            .await
+            .unwrap();
+        let second = fake.sessions.lock().unwrap()[1].clone().unwrap();
+        assert!(second.resume);
+        assert_eq!(second.id, first.id);
+        let prompt = fake.prompts.lock().unwrap()[1].clone();
+        assert!(!prompt.contains("ctx #1"), "{prompt}");
+        assert!(prompt.contains("(resumed)"));
+
+        // A resume that keeps failing is forgotten, so the next message
+        // starts fresh instead of failing the same way first.
+        fake.fail_runs
+            .store(MAX_RUNS_PER_TURN as usize, Ordering::SeqCst);
+        agent
+            .shared
+            .reply("general", &[trigger_at(5, "alice", "hello?")])
+            .await
+            .unwrap();
+        assert!(
+            !agent
+                .shared
+                .sessions
+                .lock()
+                .unwrap()
+                .contains_key("general"),
+            "a session that failed on the last run is dropped"
+        );
+        fake.fail_runs.store(0, Ordering::SeqCst);
+        agent
+            .shared
+            .reply("general", &[trigger_at(6, "alice", "back")])
+            .await
+            .unwrap();
+        assert!(
+            !fake
+                .sessions
+                .lock()
+                .unwrap()
+                .last()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .resume
+        );
+        let after = agent.shared.sessions.lock().unwrap()["general"].clone();
+
+        // A resume that fails falls back to a fresh session in the same turn.
+        fake.fail_runs.store(1, Ordering::SeqCst);
+        agent
+            .shared
+            .reply("general", &[trigger_at(7, "alice", "still there?")])
+            .await
+            .unwrap();
+        let sessions = fake.sessions.lock().unwrap().clone();
+        let n = sessions.len();
+        assert!(sessions[n - 2].as_ref().unwrap().resume);
+        assert_eq!(sessions[n - 2].as_ref().unwrap().id, after.id);
+        let fresh = sessions[n - 1].as_ref().unwrap();
+        assert!(!fresh.resume);
+        assert_ne!(fresh.id, after.id);
+        let texts = posted_texts(&engine);
+        assert_eq!(
+            texts.len(),
+            5,
+            "every turn got a post, including the failure note"
+        );
+        assert!(texts[2].starts_with("Couldn't finish"));
     }
 
     #[tokio::test]
@@ -1247,7 +1974,7 @@ mod tests {
         .await;
         let (agent, fake) = agent(&engine, AgentConfig::default()).await;
 
-        agent.shared.reply("general", &trigger()).await.unwrap();
+        agent.shared.reply("general", &[trigger()]).await.unwrap();
 
         let s = engine.state();
         assert!(s.posts.is_empty(), "a refused turn posts nothing");
@@ -1301,7 +2028,7 @@ mod tests {
 
         engine.state().mandate_fail = Some(500);
         agent.shared.on_mandate_update(&update_for(&new)).await;
-        agent.shared.reply("general", &trigger()).await.unwrap();
+        agent.shared.reply("general", &[trigger()]).await.unwrap();
         assert!(engine.state().posts.is_empty());
 
         // The engine answers again but still serves the old mandate: the 304
@@ -1309,7 +2036,7 @@ mod tests {
         // unconditional refetch, then the turn is refused.
         engine.state().mandate_fail = None;
         let before = engine.state().mandate_requests.len();
-        agent.shared.reply("general", &trigger()).await.unwrap();
+        agent.shared.reply("general", &[trigger()]).await.unwrap();
         assert!(
             engine.state().posts.is_empty(),
             "old mandate is not current"
@@ -1323,7 +2050,7 @@ mod tests {
 
         // Once the engine serves the announced mandate, replies resume.
         engine.state().mandate = Some(new.clone());
-        agent.shared.reply("general", &trigger()).await.unwrap();
+        agent.shared.reply("general", &[trigger()]).await.unwrap();
         assert_eq!(stamped_hashes(&engine), vec![hash_of(&new)]);
         assert!(!agent.shared.mandate_status.lock().unwrap().dirty);
     }
@@ -1363,7 +2090,7 @@ mod tests {
         assert_eq!(fake.hash(), hash_of(&old));
 
         // The next turn fetches the announced mandate and is stamped with it.
-        agent.shared.reply("general", &trigger()).await.unwrap();
+        agent.shared.reply("general", &[trigger()]).await.unwrap();
         assert_eq!(stamped_hashes(&engine), vec![hash_of(&new)]);
         assert!(agent
             .shared
@@ -1393,14 +2120,14 @@ mod tests {
         assert!(agent.shared.mandate_status.lock().unwrap().dirty);
 
         // Not stamped with the new hash while the prompt still carries the old.
-        agent.shared.reply("general", &trigger()).await.unwrap();
+        agent.shared.reply("general", &[trigger()]).await.unwrap();
         assert!(engine.state().posts.is_empty());
         assert_eq!(fake.runs.load(Ordering::SeqCst), 0);
         assert_eq!(fake.hash(), hash_of(&old));
 
         // Once the rewrite works again, the next turn injects and answers.
         fake.fail_inject.store(false, Ordering::SeqCst);
-        agent.shared.reply("general", &trigger()).await.unwrap();
+        agent.shared.reply("general", &[trigger()]).await.unwrap();
         assert_eq!(fake.hash(), hash_of(&new));
         assert_eq!(stamped_hashes(&engine), vec![hash_of(&new)]);
     }
@@ -1416,7 +2143,7 @@ mod tests {
         let (agent, fake) = agent(&engine, AgentConfig::default()).await;
 
         engine.state().mandate = None;
-        agent.shared.reply("general", &trigger()).await.unwrap();
+        agent.shared.reply("general", &[trigger()]).await.unwrap();
 
         assert_eq!(fake.hash(), hash_of(&old), "not un-injected");
         assert_eq!(stamped_hashes(&engine), vec![hash_of(&old)]);
@@ -1424,7 +2151,7 @@ mod tests {
 
         // The engine serving it again clears the doubt.
         engine.state().mandate = Some(old.clone());
-        agent.shared.reply("general", &trigger()).await.unwrap();
+        agent.shared.reply("general", &[trigger()]).await.unwrap();
         assert_eq!(engine.state().posts.len(), 2);
         assert!(!agent.shared.mandate_status.lock().unwrap().unverified);
     }
@@ -1444,13 +2171,13 @@ mod tests {
         let (agent, fake) = agent(&engine, config).await;
 
         engine.state().mandate = None;
-        agent.shared.reply("general", &trigger()).await.unwrap();
+        agent.shared.reply("general", &[trigger()]).await.unwrap();
         assert!(engine.state().posts.is_empty());
         assert_eq!(fake.runs.load(Ordering::SeqCst), 0);
         assert_eq!(fake.hash(), hash_of(&old), "kept, not wiped");
 
         engine.state().mandate = Some(old.clone());
-        agent.shared.reply("general", &trigger()).await.unwrap();
+        agent.shared.reply("general", &[trigger()]).await.unwrap();
         assert_eq!(stamped_hashes(&engine), vec![hash_of(&old)]);
     }
 
@@ -1467,7 +2194,7 @@ mod tests {
         // 200 with a body missing `hash`: a 304 is impossible (new ETag) so
         // every check sees the broken body.
         engine.state().mandate = Some(json!({"agent_id": ME, "skills": []}));
-        agent.shared.reply("general", &trigger()).await.unwrap();
+        agent.shared.reply("general", &[trigger()]).await.unwrap();
 
         assert_eq!(fake.hash(), hash_of(&old));
         assert_eq!(stamped_hashes(&engine), vec![hash_of(&old)]);
@@ -1489,7 +2216,7 @@ mod tests {
         let (agent, fake) = agent(&engine, config).await;
 
         engine.state().mandate = Some(json!({"agent_id": ME, "skills": []}));
-        agent.shared.reply("general", &trigger()).await.unwrap();
+        agent.shared.reply("general", &[trigger()]).await.unwrap();
         assert!(engine.state().posts.is_empty());
         assert_eq!(fake.runs.load(Ordering::SeqCst), 0);
         assert_eq!(
@@ -1499,7 +2226,7 @@ mod tests {
         );
 
         engine.state().mandate = Some(old.clone());
-        agent.shared.reply("general", &trigger()).await.unwrap();
+        agent.shared.reply("general", &[trigger()]).await.unwrap();
         assert_eq!(stamped_hashes(&engine), vec![hash_of(&old)]);
     }
 
@@ -1511,21 +2238,13 @@ mod tests {
         })
         .await;
         for strict in [false, true] {
-            let state = Arc::new(FakeState::default());
-            let agent = Agent::assemble(
-                NubiClient::new(&engine.url, "tok", "s1", ME),
-                AgentConfig {
-                    agent_id: ME.into(),
-                    mandate_strict: strict,
-                    ..Default::default()
-                },
-                Box::new(FakeRuntime(state.clone())),
-                Vec::new(),
-                None,
-                Some(MandateLoader::new(&engine.url, "tok", "s1", ME)),
-            );
+            let config = AgentConfig {
+                mandate_strict: strict,
+                ..Default::default()
+            };
             // No init_mandate: it would back off (and in strict mode never stop).
-            agent.shared.reply("general", &trigger()).await.unwrap();
+            let (agent, state) = agent_with(&engine, config, Vec::new(), false).await;
+            agent.shared.reply("general", &[trigger()]).await.unwrap();
             assert!(state.mandate.read().unwrap().is_none());
         }
         // Only the lenient agent answered, and without a stamp.
@@ -1546,7 +2265,7 @@ mod tests {
         // The turn passes its check with the old mandate and starts running...
         fake.block_runs.store(true, Ordering::SeqCst);
         let shared = Arc::clone(&agent.shared);
-        let turn = tokio::spawn(async move { shared.reply("general", &trigger()).await });
+        let turn = tokio::spawn(async move { shared.reply("general", &[trigger()]).await });
         while fake.runs.load(Ordering::SeqCst) == 0 {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
@@ -1569,40 +2288,18 @@ mod tests {
             ..Default::default()
         })
         .await;
-        let state = Arc::new(FakeState::default());
-        let agent = Agent::assemble(
-            NubiClient::new(&engine.url, "tok", "s1", ME),
-            AgentConfig {
-                agent_id: ME.into(),
-                mandate_strict: true,
-                ..Default::default()
-            },
-            Box::new(FakeRuntime(state)),
-            Vec::new(),
-            None,
-            Some(MandateLoader::new(&engine.url, "tok", "s1", ME)),
-        );
+        let config = AgentConfig {
+            mandate_strict: true,
+            ..Default::default()
+        };
         // No init_mandate: it would retry forever in strict mode.
-        agent.shared.reply("general", &trigger()).await.unwrap();
+        let (agent, _) = agent_with(&engine, config, Vec::new(), false).await;
+        agent.shared.reply("general", &[trigger()]).await.unwrap();
         assert!(engine.state().posts.is_empty());
 
         // Without strict, the same outage answers without a mandate.
-        let (lenient, _) = {
-            let state = Arc::new(FakeState::default());
-            let a = Agent::assemble(
-                NubiClient::new(&engine.url, "tok", "s1", ME),
-                AgentConfig {
-                    agent_id: ME.into(),
-                    ..Default::default()
-                },
-                Box::new(FakeRuntime(state.clone())),
-                Vec::new(),
-                None,
-                Some(MandateLoader::new(&engine.url, "tok", "s1", ME)),
-            );
-            (a, state)
-        };
-        lenient.shared.reply("general", &trigger()).await.unwrap();
+        let (lenient, _) = agent_with(&engine, AgentConfig::default(), Vec::new(), false).await;
+        lenient.shared.reply("general", &[trigger()]).await.unwrap();
         assert_eq!(engine.state().posts.len(), 1);
     }
 
@@ -1625,6 +2322,10 @@ mod tests {
         }
     }
 
+    fn names(skills: &[Skill]) -> Vec<String> {
+        skills.iter().map(|s| s.meta.name.clone()).collect()
+    }
+
     #[test]
     fn adhoc_skills_colliding_with_the_mandate_are_dropped() {
         let mandate: Mandate = serde_json::from_value(resolve_body(&fixture())).unwrap();
@@ -1636,21 +2337,15 @@ mod tests {
             room("faq-1", "FAQ"),
         ];
 
-        let section = adhoc_section(&skills, Some(&mandate), true);
-        assert!(!section.contains("Old refund name"));
-        assert!(!section.contains("### Tone"));
-        assert!(!section.contains("tone from a file"));
-        assert!(section.contains("### deploys"));
-        assert!(section.contains("### FAQ"));
+        let kept = names(&adhoc_skills(&skills, Some(&mandate), true));
+        assert_eq!(kept, vec!["deploys", "FAQ"]);
 
         // mandate_only / --no-local-skills: files are skipped entirely.
-        let section = adhoc_section(&skills, Some(&mandate), false);
-        assert!(!section.contains("deploys"));
-        assert!(section.contains("### FAQ"));
+        let kept = names(&adhoc_skills(&skills, Some(&mandate), false));
+        assert_eq!(kept, vec!["FAQ"]);
 
         // No mandate: everything stays.
-        let section = adhoc_section(&skills, None, true);
-        assert!(section.contains("Old refund name") && section.contains("### Tone"));
+        assert_eq!(adhoc_skills(&skills, None, true).len(), 5);
     }
 
     #[tokio::test]
@@ -1662,23 +2357,18 @@ mod tests {
             ..Default::default()
         })
         .await;
-        let state = Arc::new(FakeState::default());
-        let agent = Agent::assemble(
-            NubiClient::new(&engine.url, "tok", "s1", ME),
-            AgentConfig {
-                agent_id: ME.into(),
-                ..Default::default()
-            },
-            Box::new(FakeRuntime(state.clone())),
+        let (agent, state) = agent_with(
+            &engine,
+            AgentConfig::default(),
             vec![local("deploys"), room("faq-1", "FAQ")],
-            None,
-            Some(MandateLoader::new(&engine.url, "tok", "s1", ME)),
-        );
+            false,
+        )
+        .await;
         assert!(state.adhoc.read().unwrap().contains("deploys"));
 
         agent.shared.init_mandate().await;
         let adhoc = state.adhoc.read().unwrap().clone();
         assert!(!adhoc.contains("deploys"));
-        assert!(adhoc.contains("### FAQ"));
+        assert!(adhoc.contains("FAQ"));
     }
 }

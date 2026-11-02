@@ -1,4 +1,5 @@
 use super::{pass_mcp_token, toml_string, Harness, Invocation, Settings, MCP_TOKEN_ENV};
+use crate::runtime::Session;
 
 /// OpenAI Codex CLI: `codex exec`.
 pub struct Codex;
@@ -16,7 +17,13 @@ impl Harness for Codex {
         "AGENTS.md"
     }
 
-    fn invocation(&self, settings: &Settings, system_prompt: &str, prompt: &str) -> Invocation {
+    fn invocation(
+        &self,
+        settings: &Settings,
+        system_prompt: &str,
+        prompt: &str,
+        _session: Option<&Session>,
+    ) -> Invocation {
         let mut inv = Invocation::default();
         // The answer goes to a file of its own; stdout also carries progress.
         let out = settings

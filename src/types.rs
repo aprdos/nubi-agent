@@ -101,6 +101,32 @@ impl LogEntry {
         false
     }
 
+    /// Agents named in `mentions`, if any.
+    pub fn mention_list(&self) -> Vec<String> {
+        self.payload
+            .mentions
+            .as_ref()
+            .map(|m| m.iter().map(|s| normalize_id(s).to_string()).collect())
+            .unwrap_or_default()
+    }
+
+    /// `metadata.expect_reply` when it is a well-formed list, else None.
+    pub fn expect_reply_list(&self) -> Option<Vec<String>> {
+        let arr = self
+            .payload
+            .metadata
+            .as_ref()
+            .and_then(|m| m.get("expect_reply"))
+            .and_then(|v| v.as_array())?;
+        Some(
+            arr.iter()
+                .filter_map(|v| v.as_str())
+                .map(|s| normalize_id(s).to_string())
+                .filter(|s| !s.is_empty())
+                .collect(),
+        )
+    }
+
     /// Check if this is a regular message (not system event)
     pub fn is_message(&self) -> bool {
         self.payload.payload_type == "message"

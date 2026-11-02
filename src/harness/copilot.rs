@@ -1,4 +1,5 @@
 use super::{pass_mcp_token, with_instructions, Harness, Invocation, Settings, MCP_TOKEN_ENV};
+use crate::runtime::Session;
 
 /// GitHub Copilot CLI: `copilot -p`.
 pub struct Copilot;
@@ -16,7 +17,13 @@ impl Harness for Copilot {
         "AGENTS.md"
     }
 
-    fn invocation(&self, settings: &Settings, system_prompt: &str, prompt: &str) -> Invocation {
+    fn invocation(
+        &self,
+        settings: &Settings,
+        system_prompt: &str,
+        prompt: &str,
+        _session: Option<&Session>,
+    ) -> Invocation {
         let mut inv = Invocation::default();
         // -s prints only the agent's response, without usage stats.
         inv.arg("-p")

@@ -189,10 +189,16 @@ impl SkillLoader {
             .and_then(|v| v.as_str())
             .map(String::from);
 
+        // `trigger: text` or `triggers: [a, b]`; both are common in the wild.
         let trigger = yaml
             .get("trigger")
             .and_then(|v| v.as_str())
-            .map(String::from);
+            .map(String::from)
+            .or_else(|| {
+                let list = yaml.get("triggers")?.as_sequence()?;
+                let items: Vec<&str> = list.iter().filter_map(|v| v.as_str()).collect();
+                (!items.is_empty()).then(|| items.join("; "))
+            });
 
         let enabled = yaml
             .get("enabled")
