@@ -1306,6 +1306,8 @@ impl Shared {
                             mentions: &mentions,
                             expect_reply: expect_reply.as_deref(),
                             mandate_hash: out.mandate_hash.as_deref(),
+                            usage: out.usage,
+                            cost_usd: out.cost_usd,
                         },
                     )
                     .await;
@@ -1369,6 +1371,17 @@ impl Shared {
             }
             if let Some(c) = out.cost_usd {
                 line.push_str(&format!(" cost_usd={c:.4}"));
+            }
+            let u = &out.usage;
+            for (key, n) in [
+                ("in_tok", u.input),
+                ("out_tok", u.output),
+                ("cache_read", u.cache_read),
+                ("cache_write", u.cache_write),
+            ] {
+                if let Some(n) = n {
+                    line.push_str(&format!(" {key}={n}"));
+                }
             }
             if let Some(d) = out.duration_ms {
                 line.push_str(&format!(" cli_ms={d}"));

@@ -193,8 +193,10 @@ cargo run --example eval -- docs/eval/cases.jsonl
 
 Each line of the file is one case (context, the triggering message, a
 rubric). Add real situations from your rooms; two model calls per case. Every
-turn also logs a `turn room=... outcome=posted|tools|failed runs=... cost_usd=...`
-line, so the logs answer "how often does it fail" without reading transcripts.
+turn also logs a `turn room=... outcome=posted|tools|failed runs=... cost_usd=...
+in_tok=... out_tok=... cache_read=... cache_write=...` line (cost and tokens
+only where the CLI reports them, today Claude Code), so the logs answer "how
+often does it fail" and "what does it cost" without reading transcripts.
 
 ---
 

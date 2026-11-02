@@ -15,7 +15,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;
 
 use crate::mandate::{build_mandate_section, Mandate};
-use crate::runtime::{AgentRuntime, RunOutput, Session, StructuredReply, TurnInput};
+use crate::runtime::{AgentRuntime, RunOutput, Session, StructuredReply, TokenUsage, TurnInput};
 use crate::skills::Skill;
 
 mod amp;
@@ -167,6 +167,7 @@ pub struct Parsed {
     pub session_id: Option<String>,
     pub cost_usd: Option<f64>,
     pub duration_ms: Option<u64>,
+    pub usage: TokenUsage,
 }
 
 impl Parsed {
@@ -989,6 +990,7 @@ impl AgentRuntime for CliRuntime {
             session_id: parsed.session_id,
             cost_usd: parsed.cost_usd,
             duration_ms: parsed.duration_ms,
+            usage: parsed.usage,
         })
     }
 
@@ -1299,13 +1301,22 @@ mod tests {
 
     #[test]
     fn claude_json_result_is_read_in_full() {
-        let out = r#"{"type":"result","subtype":"success","is_error":false,"duration_ms":4120,"num_turns":3,"result":"it is green","session_id":"s-1","total_cost_usd":0.0421,"structured_output":{"text":"it is green","mentions":["alice"],"expect_reply":[],"post":true}}"#;
+        let out = r#"{"type":"result","subtype":"success","is_error":false,"duration_ms":4120,"num_turns":3,"result":"it is green","session_id":"s-1","total_cost_usd":0.0421,"usage":{"input_tokens":12,"output_tokens":340,"cache_read_input_tokens":20480,"cache_creation_input_tokens":1536},"structured_output":{"text":"it is green","mentions":["alice"],"expect_reply":[],"post":true}}"#;
         let p = claude::Claude.parse_output(out).unwrap();
         assert_eq!(p.text, "it is green");
         assert!(!p.is_error);
         assert_eq!(p.num_turns, Some(3));
         assert_eq!(p.session_id.as_deref(), Some("s-1"));
         assert_eq!(p.duration_ms, Some(4120));
+        assert_eq!(
+            p.usage,
+            TokenUsage {
+                input: Some(12),
+                output: Some(340),
+                cache_read: Some(20480),
+                cache_write: Some(1536),
+            }
+        );
         let reply = structured_reply(p.structured.as_ref().unwrap()).unwrap();
         assert_eq!(reply.mentions, vec!["alice"]);
         assert_eq!(reply.expect_reply, Some(vec![]));
@@ -1322,6 +1333,7 @@ mod tests {
             p.error.as_deref(),
             Some("error_during_execution (HTTP 529): Overloaded")
         );
+        assert_eq!(p.usage, TokenUsage::default());
         assert!(claude::Claude.parse_output("").unwrap().text.is_empty());
         assert!(claude::Claude.parse_output("not json").is_err());
     }

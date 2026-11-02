@@ -3,6 +3,7 @@ use serde::Deserialize;
 use std::time::Duration;
 use uuid::Uuid;
 
+use crate::runtime::TokenUsage;
 use crate::types::{LogEntry, SendMessage, SendPart};
 
 #[derive(Deserialize)]
@@ -48,12 +49,40 @@ fn http_client() -> Client {
 /// nubi-agent falls back to parsing "@name" out of message text, so a reply
 /// that merely says "@foo" in prose must not trigger foo. A reply that
 /// genuinely wants an answer names who in `expect_reply`.
-fn post_metadata(expect_reply: Option<&[String]>, mandate_hash: Option<&str>) -> serde_json::Value {
+fn post_metadata(
+    expect_reply: Option<&[String]>,
+    mandate_hash: Option<&str>,
+    usage: Option<serde_json::Value>,
+) -> serde_json::Value {
     let mut meta = serde_json::json!({"expect_reply": expect_reply.unwrap_or(&[])});
     if let Some(hash) = mandate_hash {
         meta["mandate_hash"] = hash.into();
     }
+    if let Some(usage) = usage {
+        meta["usage"] = usage;
+    }
     meta
+}
+
+/// `metadata.usage`: what the run that wrote the reply cost, for the engine
+/// to add up per agent. Only the fields the CLI reported; None when it
+/// reported nothing.
+fn usage_metadata(usage: &TokenUsage, cost_usd: Option<f64>) -> Option<serde_json::Value> {
+    let mut meta = serde_json::Map::new();
+    for (key, n) in [
+        ("input_tokens", usage.input),
+        ("output_tokens", usage.output),
+        ("cache_read_tokens", usage.cache_read),
+        ("cache_write_tokens", usage.cache_write),
+    ] {
+        if let Some(n) = n {
+            meta.insert(key.into(), n.into());
+        }
+    }
+    if let Some(c) = cost_usd {
+        meta.insert("cost_usd".into(), c.into());
+    }
+    (!meta.is_empty()).then_some(serde_json::Value::Object(meta))
 }
 
 /// What to post: the text plus who it is for.
@@ -66,6 +95,9 @@ pub struct Outgoing<'a> {
     /// `metadata.mandate_hash` so an engine in strict mode can tell the reply
     /// was written under the current mandate.
     pub mandate_hash: Option<&'a str>,
+    /// Tokens the run that wrote this reply used, stamped as `metadata.usage`.
+    pub usage: TokenUsage,
+    pub cost_usd: Option<f64>,
 }
 
 /// Nubi API client for posting messages
@@ -164,7 +196,11 @@ impl NubiClient {
                 text: out.text.to_string(),
             }],
             mentions: out.mentions.to_vec(),
-            metadata: Some(post_metadata(out.expect_reply, out.mandate_hash)),
+            metadata: Some(post_metadata(
+                out.expect_reply,
+                out.mandate_hash,
+                usage_metadata(&out.usage, out.cost_usd),
+            )),
         };
 
         let url = format!(
@@ -351,17 +387,42 @@ mod tests {
     #[test]
     fn metadata_carries_the_mandate_hash_only_when_given() {
         assert_eq!(
-            post_metadata(None, None),
+            post_metadata(None, None, None),
             serde_json::json!({"expect_reply": []})
         );
         assert_eq!(
-            post_metadata(None, Some("sha256:ab")),
+            post_metadata(None, Some("sha256:ab"), None),
             serde_json::json!({"expect_reply": [], "mandate_hash": "sha256:ab"})
         );
         let who = vec!["pine".to_string()];
         assert_eq!(
-            post_metadata(Some(&who), None),
+            post_metadata(Some(&who), None, None),
             serde_json::json!({"expect_reply": ["pine"]})
+        );
+    }
+
+    #[test]
+    fn usage_metadata_carries_only_what_the_cli_reported() {
+        assert_eq!(usage_metadata(&TokenUsage::default(), None), None);
+        let usage = TokenUsage {
+            input: Some(12),
+            output: Some(340),
+            cache_read: Some(20480),
+            cache_write: None,
+        };
+        let meta = usage_metadata(&usage, Some(0.0421));
+        assert_eq!(
+            meta,
+            Some(serde_json::json!({
+                "input_tokens": 12,
+                "output_tokens": 340,
+                "cache_read_tokens": 20480,
+                "cost_usd": 0.0421
+            }))
+        );
+        assert_eq!(
+            post_metadata(None, None, meta.clone())["usage"],
+            meta.unwrap()
         );
     }
 

@@ -84,6 +84,19 @@ pub struct RunOutput {
     pub session_id: Option<String>,
     pub cost_usd: Option<f64>,
     pub duration_ms: Option<u64>,
+    pub usage: TokenUsage,
+}
+
+/// Tokens one run used, as far as the CLI reports them. Fields the CLI
+/// leaves out stay None.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct TokenUsage {
+    pub input: Option<u64>,
+    pub output: Option<u64>,
+    /// Prompt tokens served from the cache.
+    pub cache_read: Option<u64>,
+    /// Prompt tokens written to the cache.
+    pub cache_write: Option<u64>,
 }
 
 impl RunOutput {
