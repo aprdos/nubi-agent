@@ -227,6 +227,13 @@ pub trait Harness: Send + Sync {
         false
     }
 
+    /// Where this CLI loads on-demand skills from inside the workspace, if it
+    /// loads any. Ad-hoc skills are written there as `<name>/SKILL.md`;
+    /// CLIs that return None get them inlined into the system prompt.
+    fn skills_dir(&self, _workspace: &Path) -> Option<PathBuf> {
+        None
+    }
+
     /// Write whatever config this CLI needs before the first run. Called once,
     /// with the final system prompt.
     fn prepare(&self, _settings: &Settings, _system_prompt: &str) -> anyhow::Result<()> {
@@ -603,13 +610,11 @@ impl CliRuntime {
 
     /// Where ad-hoc skills go when the CLI loads skills from the workspace.
     fn skills_dir(&self) -> Option<PathBuf> {
-        self.settings
-            .workspace
-            .as_ref()
-            .map(|ws| ws.join(".claude").join("skills"))
+        let ws = self.settings.workspace.as_ref()?;
+        self.harness.skills_dir(ws)
     }
 
-    /// Write the ad-hoc skills as `.claude/skills/nubi-<name>/SKILL.md` so the
+    /// Write the ad-hoc skills as `<skills dir>/nubi-<name>/SKILL.md` so the
     /// CLI loads a skill's body only when it applies, and return the index
     /// that goes into the system prompt. Directories from a previous set that
     /// are no longer wanted are removed; the agent's own skills are not touched.
@@ -996,8 +1001,9 @@ impl AgentRuntime for CliRuntime {
     }
 
     fn inject_mandate(&self, mandate: Option<&Mandate>, adhoc: &[Skill]) -> anyhow::Result<()> {
-        // Skills in files when the CLI can load them on demand from the
-        // workspace; inline otherwise (no workspace, or a write failure).
+        // Skills in files when the CLI loads them on demand from the
+        // workspace; inline otherwise (a CLI without skill loading, no
+        // workspace, or a write failure).
         let adhoc_section = match self.skills_dir() {
             Some(dir) => match self.write_skill_files(&dir, adhoc) {
                 Ok(index) => index,
@@ -1637,6 +1643,22 @@ mod tests {
         rt.inject_mandate(None, &[]).unwrap();
         assert!(!rt.build_system_prompt().contains("## Skills"));
         assert!(!ws.join(".claude/skills/nubi-deploys").exists());
+        let _ = std::fs::remove_dir_all(ws);
+    }
+
+    #[test]
+    fn harnesses_without_skill_loading_get_skills_inlined() {
+        let ws = std::env::temp_dir().join(format!("nubi-skills-{}", uuid::Uuid::new_v4()));
+        let rt = CliRuntime::new(HarnessKind::Gemini, "bot").with_workspace(Some(ws.clone()));
+        rt.inject_mandate(None, &[local("Code Review", "Look at every file.")])
+            .unwrap();
+        let sp = rt.build_system_prompt();
+        assert!(sp.contains("## Available Skills"));
+        assert!(sp.contains("Look at every file."), "body is inlined");
+        assert!(
+            !ws.join(".claude").exists(),
+            "nothing written for a CLI that would not read it"
+        );
         let _ = std::fs::remove_dir_all(ws);
     }
 

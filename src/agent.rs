@@ -1039,11 +1039,13 @@ impl Shared {
             return;
         };
         let path = sessions_path(ws);
+        let Some(parent) = path.parent() else {
+            eprintln!("[nubi-agent] Sessions path {:?} has no directory", path);
+            return;
+        };
         let json = serde_json::to_string_pretty(&*self.sessions.lock().unwrap())
             .expect("session map serializes");
-        if let Err(e) =
-            fs::create_dir_all(path.parent().unwrap()).and_then(|_| fs::write(&path, json))
-        {
+        if let Err(e) = fs::create_dir_all(parent).and_then(|_| fs::write(&path, json)) {
             eprintln!("[nubi-agent] Cannot save sessions to {:?}: {}", path, e);
         }
     }

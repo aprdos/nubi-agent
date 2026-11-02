@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use super::{write_private, Harness, Invocation, Parsed, Settings, REPLY_SCHEMA};
 use crate::runtime::Session;
@@ -27,6 +27,11 @@ impl Harness for Claude {
 
     fn supports_sessions(&self) -> bool {
         true
+    }
+
+    /// Claude Code loads project skills from `.claude/skills/` in its cwd.
+    fn skills_dir(&self, workspace: &Path) -> Option<PathBuf> {
+        Some(workspace.join(".claude").join("skills"))
     }
 
     fn prepare(&self, settings: &Settings, _system_prompt: &str) -> anyhow::Result<()> {
