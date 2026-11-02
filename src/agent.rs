@@ -11,7 +11,7 @@ use tokio::sync::Semaphore;
 use tokio::time::interval;
 
 use crate::buffer::RoomBuffer;
-use crate::harness::{age, now_ms, CliRuntime, HarnessKind, McpServer};
+use crate::harness::{age, now_ms, write_private, CliRuntime, HarnessKind, McpServer};
 use crate::mandate::{FetchError, Fetched, Mandate, MandateLoader};
 use crate::nubi::{NubiClient, Outgoing};
 use crate::runtime::{AgentRuntime, RunOutput, Session, ThreadAnchor, Trigger, TurnInput};
@@ -1039,13 +1039,11 @@ impl Shared {
             return;
         };
         let path = sessions_path(ws);
-        let Some(parent) = path.parent() else {
-            eprintln!("[nubi-agent] Sessions path {:?} has no directory", path);
-            return;
-        };
         let json = serde_json::to_string_pretty(&*self.sessions.lock().unwrap())
             .expect("session map serializes");
-        if let Err(e) = fs::create_dir_all(parent).and_then(|_| fs::write(&path, json)) {
+        // Written to a temp file and renamed, so a crash mid-write cannot
+        // leave a truncated file that drops every session on restart.
+        if let Err(e) = write_private(&path, &json) {
             eprintln!("[nubi-agent] Cannot save sessions to {:?}: {}", path, e);
         }
     }
@@ -1181,9 +1179,10 @@ impl Shared {
                     }
                     break Err("the model produced no reply".into());
                 }
-                Ok(out) => out
-                    .error
-                    .unwrap_or_else(|| "the model produced no reply".into()),
+                // Silent again after the nudge: a third identical run would
+                // only cost money.
+                Ok(out) if !out.is_error => break Err("the model produced no reply twice".into()),
+                Ok(out) => out.error.unwrap_or_else(|| "the run failed".into()),
                 Err(e) => e.to_string(),
             };
 
@@ -1292,7 +1291,8 @@ impl Shared {
                         String::new()
                     }
                 );
-                self.nubi
+                let posted = self
+                    .nubi
                     .post(
                         room_id,
                         Outgoing {
@@ -1302,11 +1302,17 @@ impl Shared {
                             mandate_hash: out.mandate_hash.as_deref(),
                         },
                     )
-                    .await?;
+                    .await;
+                // The room took a turn whether or not the post landed, so
+                // the cooldown applies either way.
+                self.buffer.lock().unwrap().mark_responded(room_id);
+                posted?;
                 format!("replied: {}", short(&text, 160))
             }
         };
-        self.buffer.lock().unwrap().mark_responded(room_id);
+        if outcome == Outcome::Tools {
+            self.buffer.lock().unwrap().mark_responded(room_id);
+        }
         self.journal_append(
             room_id,
             &format!(
@@ -1818,6 +1824,22 @@ mod tests {
         assert!(!prompts[0].contains("previous attempt"));
         assert!(prompts[1].contains("previous attempt produced no reply"));
         assert_eq!(posted_texts(&engine).len(), 1);
+    }
+
+    #[tokio::test]
+    async fn two_silent_runs_end_the_turn_with_a_note_to_the_room() {
+        let engine = MockEngine::start(MockState::default()).await;
+        let (agent, fake) = agent(&engine, AgentConfig::default()).await;
+        fake.silent_runs.store(10, Ordering::SeqCst);
+        agent.shared.reply("general", &[trigger()]).await.unwrap();
+        assert_eq!(
+            fake.runs.load(Ordering::SeqCst),
+            2,
+            "nudged once, then given up"
+        );
+        let texts = posted_texts(&engine);
+        assert_eq!(texts.len(), 1);
+        assert!(texts[0].contains("no reply twice"), "{}", texts[0]);
     }
 
     #[tokio::test]

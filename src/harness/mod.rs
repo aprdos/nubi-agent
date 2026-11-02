@@ -286,7 +286,7 @@ fn toml_string(s: &str) -> String {
 
 /// Write a generated file only its owner can read: several of them carry the
 /// nubi token.
-fn write_private(path: &Path, contents: &str) -> anyhow::Result<()> {
+pub(crate) fn write_private(path: &Path, contents: &str) -> anyhow::Result<()> {
     use std::io::Write;
 
     let dir = path.parent().unwrap_or(Path::new("."));
