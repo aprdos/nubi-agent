@@ -1517,6 +1517,27 @@ mod tests {
     }
 
     #[test]
+    fn claude_watch_names_a_repeated_reply_over_the_step_limit() {
+        let mut lines = vec![
+            stream::tool_use("m0", "t0", "StructuredOutput", stream::SENT),
+            stream::tool_result("t0", false),
+        ];
+        for i in 1..=3 {
+            lines.push(stream::text(&format!("m{i}"), "waiting"));
+        }
+        // The fourth step is over the limit and is also a repeated reply.
+        lines.push(stream::tool_use(
+            "m4",
+            "t4",
+            "StructuredOutput",
+            stream::SENT,
+        ));
+        let mut w = claude::Claude.watch().unwrap();
+        let reason = lines.iter().find_map(|l| w.line(l)).unwrap();
+        assert!(reason.contains("StructuredOutput again"), "{reason}");
+    }
+
+    #[test]
     fn claude_watch_does_not_count_a_call_streamed_twice() {
         let call = stream::tool_use("m1", "t1", "StructuredOutput", stream::SENT);
         let lines = vec![
