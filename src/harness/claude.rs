@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 
 use super::{write_private, Harness, Invocation, Parsed, Settings, REPLY_SCHEMA};
-use crate::runtime::Session;
+use crate::runtime::{Session, TokenUsage};
 
 /// Anthropic Claude Code: `claude -p`.
 pub struct Claude;
@@ -156,6 +156,12 @@ impl Harness for Claude {
             session_id: value["session_id"].as_str().map(String::from),
             cost_usd: value["total_cost_usd"].as_f64(),
             duration_ms: value["duration_ms"].as_u64(),
+            usage: TokenUsage {
+                input: value["usage"]["input_tokens"].as_u64(),
+                output: value["usage"]["output_tokens"].as_u64(),
+                cache_read: value["usage"]["cache_read_input_tokens"].as_u64(),
+                cache_write: value["usage"]["cache_creation_input_tokens"].as_u64(),
+            },
         })
     }
 }
