@@ -527,6 +527,15 @@ fn load_sessions(path: &Path) -> HashMap<String, SessionRecord> {
         .unwrap_or_default()
 }
 
+/// Give a session that was never resumed a new id before running again. The
+/// CLI creates the conversation as soon as a run starts, so reusing the id
+/// with `--session-id` fails with "Session ID ... is already in use".
+fn renew_new_session(session: &mut Option<Session>) {
+    if let Some(s) = session.as_mut().filter(|s| !s.resume) {
+        s.id = uuid::Uuid::new_v4().to_string();
+    }
+}
+
 /// `thread.<parent>.<index>` → (parent, index).
 fn parse_thread_room(room_id: &str) -> Option<(String, u64)> {
     let rest = room_id.strip_prefix("thread.")?;
@@ -1175,6 +1184,7 @@ impl Shared {
                     eprintln!("[nubi-agent] No reply from the model, asking once more");
                     nudged = true;
                     if runs < MAX_RUNS_PER_TURN {
+                        renew_new_session(&mut session);
                         continue;
                     }
                     break Err("the model produced no reply".into());
@@ -1210,6 +1220,7 @@ impl Shared {
                 self.forget_session(room_id);
                 session = self.session_for(room_id);
             } else {
+                renew_new_session(&mut session);
                 tokio::time::sleep(RETRY_BACKOFF).await;
             }
         };
@@ -1551,7 +1562,22 @@ mod tests {
         async fn run(&self, prompt: &str, session: Option<&Session>) -> anyhow::Result<RunOutput> {
             self.0.runs.fetch_add(1, Ordering::SeqCst);
             self.0.prompts.lock().unwrap().push(prompt.to_string());
-            self.0.sessions.lock().unwrap().push(session.cloned());
+            let reused = {
+                let mut seen = self.0.sessions.lock().unwrap();
+                let reused = session.is_some_and(|s| {
+                    !s.resume && seen.iter().flatten().any(|prev| prev.id == s.id)
+                });
+                seen.push(session.cloned());
+                reused
+            };
+            // As the claude CLI does: a started conversation cannot be
+            // started again under the same id.
+            if reused {
+                anyhow::bail!(
+                    "claude failed (exit status: 1): Error: Session ID {} is already in use.",
+                    session.unwrap().id
+                );
+            }
             while self.0.block_runs.load(Ordering::SeqCst) {
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
@@ -1859,6 +1885,41 @@ mod tests {
         let texts = posted_texts(&engine);
         assert_eq!(texts.len(), 1);
         assert!(texts[0].contains("no reply twice"), "{}", texts[0]);
+    }
+
+    #[tokio::test]
+    async fn a_new_session_gets_a_new_id_on_every_rerun() {
+        let engine = MockEngine::start(MockState::default()).await;
+        let (agent, fake) = agent(&engine, AgentConfig::default()).await;
+        fake.sessions_supported.store(true, Ordering::SeqCst);
+
+        // A failed run, then a silent one, then the answer: three runs of a
+        // session that was never saved, each under its own id.
+        fake.fail_runs.store(1, Ordering::SeqCst);
+        fake.silent_runs.store(1, Ordering::SeqCst);
+        agent.shared.reply("general", &[trigger()]).await.unwrap();
+        let sessions: Vec<Session> = fake
+            .sessions
+            .lock()
+            .unwrap()
+            .iter()
+            .flatten()
+            .cloned()
+            .collect();
+        assert_eq!(sessions.len(), 3);
+        assert!(sessions.iter().all(|s| !s.resume));
+        assert_ne!(sessions[0].id, sessions[1].id);
+        assert_ne!(sessions[1].id, sessions[2].id);
+        assert_ne!(sessions[0].id, sessions[2].id);
+        assert_eq!(
+            posted_texts(&engine),
+            vec!["Refunds take 30 days from purchase."]
+        );
+        // The id that answered is the one kept for the room.
+        assert_eq!(
+            agent.shared.sessions.lock().unwrap()["general"].id,
+            sessions[2].id
+        );
     }
 
     #[tokio::test]
