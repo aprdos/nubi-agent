@@ -1306,6 +1306,8 @@ impl Shared {
                             mentions: &mentions,
                             expect_reply: expect_reply.as_deref(),
                             mandate_hash: out.mandate_hash.as_deref(),
+                            usage: out.usage,
+                            cost_usd: out.cost_usd,
                         },
                     )
                     .await;
