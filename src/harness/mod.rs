@@ -1511,7 +1511,7 @@ mod tests {
             lines.push(stream::tool_result(&format!("t{i}"), false));
         }
         let (stop, p) = watch_lines(&lines);
-        // The fourth step after the reply.
+        // STEPS_AFTER_REPLY steps are allowed; the fourth is stopped.
         assert_eq!(stop, Some(8));
         assert!(p.structured.is_some());
     }

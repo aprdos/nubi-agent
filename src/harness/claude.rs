@@ -192,8 +192,8 @@ impl Harness for Claude {
     }
 }
 
-/// Assistant messages a run may send after its reply was accepted before it
-/// is stopped. A healthy run sends one, a short closing line.
+/// Assistant messages a run may send after its reply was accepted; the next
+/// one stops it. A healthy run sends one, a short closing line.
 const STEPS_AFTER_REPLY: u64 = 3;
 
 /// Stops a Claude run that keeps going after its structured reply was
@@ -295,7 +295,9 @@ impl OutputWatch for ReplyWatch {
         let mut model_usage: BTreeMap<String, TokenUsage> = BTreeMap::new();
         for (model, u) in self.messages.values() {
             add_usage(&mut total, u);
-            add_usage(model_usage.entry(model.clone()).or_default(), u);
+            if !model.is_empty() {
+                add_usage(model_usage.entry(model.clone()).or_default(), u);
+            }
         }
         Parsed {
             structured: self.reply.clone(),
