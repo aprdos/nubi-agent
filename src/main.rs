@@ -190,9 +190,11 @@ async fn main() -> anyhow::Result<()> {
     agent.run().await
 }
 
-/// The provider behind an LLM base URL: `anthropic` for none or Anthropic's
-/// own API, `bedrock`/`vertex` when Claude Code is told to use them (only
-/// Claude Code reads those), else `custom:<host>`.
+/// The provider behind an LLM base URL. Without one, the harness's own
+/// vendor (`anthropic` for Claude Code, `openai` for Codex, `google` for
+/// Gemini, else the CLI's name); `bedrock`/`vertex` when Claude Code is told
+/// to use them (only Claude Code reads those); `anthropic` for Anthropic's
+/// API, else `custom:<host>`.
 fn infer_provider(base_url: Option<&str>, harness: HarnessKind) -> String {
     if harness == HarnessKind::Claude {
         if std::env::var_os("CLAUDE_CODE_USE_BEDROCK").is_some() {
@@ -203,7 +205,16 @@ fn infer_provider(base_url: Option<&str>, harness: HarnessKind) -> String {
         }
     }
     let Some(url) = base_url else {
-        return "anthropic".to_string();
+        return match harness {
+            HarnessKind::Claude => "anthropic",
+            HarnessKind::Codex => "openai",
+            HarnessKind::Gemini => "google",
+            HarnessKind::Cursor => "cursor",
+            HarnessKind::Opencode => "opencode",
+            HarnessKind::Amp => "amp",
+            HarnessKind::Copilot => "copilot",
+        }
+        .to_string();
     };
     let host = url
         .split("://")
@@ -227,7 +238,9 @@ mod tests {
 
     #[test]
     fn provider_is_read_off_the_base_url() {
-        assert_eq!(infer_provider(None, HarnessKind::Codex), "anthropic");
+        assert_eq!(infer_provider(None, HarnessKind::Claude), "anthropic");
+        assert_eq!(infer_provider(None, HarnessKind::Codex), "openai");
+        assert_eq!(infer_provider(None, HarnessKind::Gemini), "google");
         assert_eq!(
             infer_provider(Some("https://api.anthropic.com"), HarnessKind::Codex),
             "anthropic"
