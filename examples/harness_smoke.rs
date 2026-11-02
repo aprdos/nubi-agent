@@ -12,7 +12,7 @@
 
 use clap::ValueEnum;
 use nubi_agent::harness::{CliRuntime, HarnessKind, McpServer};
-use nubi_agent::AgentRuntime;
+use nubi_agent::{AgentRuntime, Trigger, TurnInput};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -41,11 +41,58 @@ async fn main() -> anyhow::Result<()> {
     let rt = CliRuntime::new(kind, "smoke-bot")
         .with_workspace(Some(workspace))
         .with_model(model)
+        .with_effort(std::env::var("NUBI_LLM_EFFORT").ok())
         .with_llm_base_url(base_url)
         .with_llm_api_key(key)
         .with_mcp(mcp);
+    let rt = match std::env::var("NUBI_TURN_TIMEOUT_SECS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+    {
+        Some(secs) => rt.with_turn_timeout(std::time::Duration::from_secs(secs)),
+        None => rt,
+    };
     rt.check_available().await?;
-    let prompt = rt.build_prompt("dm.alice.smoke-bot", "alice", &message, &[]);
-    println!("{}", rt.run(&prompt).await?.text);
+    if std::env::var_os("NUBI_SMOKE_PRINT_SYSTEM_PROMPT").is_some() {
+        eprintln!(
+            "[smoke] system prompt:\n{}\n[smoke] end of system prompt",
+            rt.build_system_prompt()
+        );
+    }
+    let turn = TurnInput {
+        room_id: "dm.alice.smoke-bot".into(),
+        triggers: vec![Trigger {
+            sender: "alice".into(),
+            text: message,
+            index: 1,
+            expect_reply: None,
+            timestamp_ms: 0,
+        }],
+        ..Default::default()
+    };
+    // NUBI_SMOKE_SESSION_ID starts (or, with NUBI_SMOKE_RESUME=1, continues)
+    // a harness conversation, to check that sessions survive between runs.
+    let session = std::env::var("NUBI_SMOKE_SESSION_ID")
+        .ok()
+        .map(|id| nubi_agent::Session {
+            id,
+            resume: std::env::var_os("NUBI_SMOKE_RESUME").is_some(),
+        });
+    let prompt = rt.build_prompt(&turn);
+    let out = rt.run(&prompt, session.as_ref()).await?;
+    if out.is_error {
+        anyhow::bail!("run failed: {}", out.error.unwrap_or_default());
+    }
+    println!("{}", out.text);
+    if let Some(reply) = out.reply {
+        eprintln!(
+            "[smoke] mentions={:?} expect_reply={:?} post={}",
+            reply.mentions, reply.expect_reply, reply.post
+        );
+    }
+    eprintln!(
+        "[smoke] turns={:?} cost_usd={:?} session={:?}",
+        out.num_turns, out.cost_usd, out.session_id
+    );
     Ok(())
 }

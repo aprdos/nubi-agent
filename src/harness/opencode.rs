@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 
-use super::{pass_mcp_token, write_private, Harness, Invocation, Settings, MCP_TOKEN_ENV};
+use super::{pass_mcp_token, write_private, Harness, Invocation, Parsed, Settings, MCP_TOKEN_ENV};
+use crate::runtime::Session;
 
 /// OpenCode: `opencode run`.
 pub struct OpenCode;
@@ -73,7 +74,13 @@ impl Harness for OpenCode {
         write_private(&Self::instructions_path(settings), system_prompt)
     }
 
-    fn invocation(&self, settings: &Settings, _system_prompt: &str, prompt: &str) -> Invocation {
+    fn invocation(
+        &self,
+        settings: &Settings,
+        _system_prompt: &str,
+        prompt: &str,
+        _session: Option<&Session>,
+    ) -> Invocation {
         let mut inv = Invocation::default();
         inv.arg("run").arg("--format").arg("json");
         if settings.skip_permissions {
@@ -94,7 +101,7 @@ impl Harness for OpenCode {
 
     /// JSON lines; the answer is the text of the last `text` event. Earlier
     /// ones are what the model said between tool calls.
-    fn parse_output(&self, stdout: &str) -> anyhow::Result<String> {
+    fn parse_output(&self, stdout: &str) -> anyhow::Result<Parsed> {
         let mut answer = None;
         for line in stdout.lines().filter(|l| !l.trim().is_empty()) {
             let Ok(event) = serde_json::from_str::<serde_json::Value>(line) else {
@@ -106,6 +113,6 @@ impl Harness for OpenCode {
                 _ => {}
             }
         }
-        Ok(answer.unwrap_or_default())
+        Ok(Parsed::text(&answer.unwrap_or_default()))
     }
 }

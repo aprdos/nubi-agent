@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 
-use super::{pass_mcp_token, write_private, Harness, Invocation, Settings, MCP_TOKEN_ENV};
+use super::{pass_mcp_token, write_private, Harness, Invocation, Parsed, Settings, MCP_TOKEN_ENV};
+use crate::runtime::Session;
 
 /// Google Gemini CLI: `gemini -p`.
 pub struct Gemini;
@@ -50,7 +51,13 @@ impl Harness for Gemini {
         )
     }
 
-    fn invocation(&self, settings: &Settings, _system_prompt: &str, prompt: &str) -> Invocation {
+    fn invocation(
+        &self,
+        settings: &Settings,
+        _system_prompt: &str,
+        prompt: &str,
+        _session: Option<&Session>,
+    ) -> Invocation {
         let mut inv = Invocation::default();
         inv.arg("--output-format").arg("json");
         if settings.skip_permissions {
@@ -84,12 +91,12 @@ impl Harness for Gemini {
         inv
     }
 
-    fn parse_output(&self, stdout: &str) -> anyhow::Result<String> {
+    fn parse_output(&self, stdout: &str) -> anyhow::Result<Parsed> {
         let value: serde_json::Value = serde_json::from_str(stdout.trim())
             .map_err(|e| anyhow::anyhow!("gemini printed something other than JSON: {e}"))?;
         if let Some(err) = value.get("error").filter(|e| !e.is_null()) {
             anyhow::bail!("gemini reported an error: {err}");
         }
-        Ok(value["response"].as_str().unwrap_or_default().to_string())
+        Ok(Parsed::text(value["response"].as_str().unwrap_or_default()))
     }
 }

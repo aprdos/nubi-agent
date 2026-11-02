@@ -43,12 +43,29 @@ fn http_client() -> Client {
 }
 
 /// Metadata on every reply nubi-agent posts.
-fn post_metadata(mandate_hash: Option<&str>) -> serde_json::Value {
-    let mut meta = serde_json::json!({"expect_reply": []});
+///
+/// `expect_reply` defaults to `[]`, the loop-brake: unlike the engine,
+/// nubi-agent falls back to parsing "@name" out of message text, so a reply
+/// that merely says "@foo" in prose must not trigger foo. A reply that
+/// genuinely wants an answer names who in `expect_reply`.
+fn post_metadata(expect_reply: Option<&[String]>, mandate_hash: Option<&str>) -> serde_json::Value {
+    let mut meta = serde_json::json!({"expect_reply": expect_reply.unwrap_or(&[])});
     if let Some(hash) = mandate_hash {
         meta["mandate_hash"] = hash.into();
     }
     meta
+}
+
+/// What to post: the text plus who it is for.
+#[derive(Debug, Clone, Default)]
+pub struct Outgoing<'a> {
+    pub text: &'a str,
+    pub mentions: &'a [String],
+    pub expect_reply: Option<&'a [String]>,
+    /// Hash of the mandate that was in the prompt for this reply, stamped as
+    /// `metadata.mandate_hash` so an engine in strict mode can tell the reply
+    /// was written under the current mandate.
+    pub mandate_hash: Option<&'a str>,
 }
 
 /// Nubi API client for posting messages
@@ -137,31 +154,17 @@ impl NubiClient {
 
     /// Post a message to a room.
     ///
-    /// `expect_reply: []` is the loop-brake. Unlike the engine, nubi-agent
-    /// falls back to parsing "@name" out of message text, so without this an
-    /// agent writing "@foo" in prose would trigger foo, who answers, and so on.
-    /// Agents that genuinely want a reply use the nubi_send tool instead.
-    ///
-    /// `mandate_hash` is the hash of the mandate that was in the prompt for
-    /// this reply; it is stamped as `metadata.mandate_hash` so an engine in
-    /// strict mode can tell the reply was written under the current mandate.
-    ///
     /// Retried on transport and 5xx failures. The message_id is generated once
     /// up front so a retry is deduplicated server-side instead of double-posting.
-    pub async fn post(
-        &self,
-        room_id: &str,
-        text: &str,
-        mandate_hash: Option<&str>,
-    ) -> anyhow::Result<()> {
+    pub async fn post(&self, room_id: &str, out: Outgoing<'_>) -> anyhow::Result<()> {
         let msg = SendMessage {
             message_id: Uuid::new_v4().to_string(),
             parts: vec![SendPart {
                 kind: "text",
-                text: text.to_string(),
+                text: out.text.to_string(),
             }],
-            mentions: vec![],
-            metadata: Some(post_metadata(mandate_hash)),
+            mentions: out.mentions.to_vec(),
+            metadata: Some(post_metadata(out.expect_reply, out.mandate_hash)),
         };
 
         let url = format!(
@@ -285,6 +288,39 @@ impl NubiClient {
         Ok(resp.json::<PollResp>().await?.entries)
     }
 
+    /// Fetch one message by its global index, if the room has it.
+    pub async fn message_at(&self, room_id: &str, index: u64) -> anyhow::Result<Option<LogEntry>> {
+        let resp = self
+            .client
+            .get(format!(
+                "{}/v1/spaces/{}/rooms/{}/messages",
+                self.base_url, self.space, room_id
+            ))
+            .header("Authorization", format!("Bearer {}", self.token))
+            .query(&[("from_index", index.to_string()), ("limit", "1".into())])
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            anyhow::bail!(
+                "Failed to fetch message {} in {}: {} - {}",
+                index,
+                room_id,
+                status,
+                body
+            );
+        }
+
+        Ok(resp
+            .json::<PollResp>()
+            .await?
+            .entries
+            .into_iter()
+            .find(|e| e.global_index == index))
+    }
+
     /// Set typing status in a room
     pub async fn set_typing(&self, room_id: &str, typing: bool) -> anyhow::Result<()> {
         let resp = self
@@ -314,10 +350,18 @@ mod tests {
 
     #[test]
     fn metadata_carries_the_mandate_hash_only_when_given() {
-        assert_eq!(post_metadata(None), serde_json::json!({"expect_reply": []}));
         assert_eq!(
-            post_metadata(Some("sha256:ab")),
+            post_metadata(None, None),
+            serde_json::json!({"expect_reply": []})
+        );
+        assert_eq!(
+            post_metadata(None, Some("sha256:ab")),
             serde_json::json!({"expect_reply": [], "mandate_hash": "sha256:ab"})
+        );
+        let who = vec!["pine".to_string()];
+        assert_eq!(
+            post_metadata(Some(&who), None),
+            serde_json::json!({"expect_reply": ["pine"]})
         );
     }
 

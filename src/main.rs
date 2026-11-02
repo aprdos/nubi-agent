@@ -33,7 +33,8 @@ struct Args {
     #[arg(long)]
     skip_permissions: bool,
 
-    /// Number of recent messages to include as context
+    /// Most recent room messages to include as context (the newest win a
+    /// fixed character budget as well)
     #[arg(long, default_value = "30")]
     context_size: usize,
 
@@ -46,8 +47,9 @@ struct Args {
     #[arg(long, env = "NUBI_MCP_URL")]
     mcp_url: Option<String>,
 
-    /// Heartbeat interval in seconds (0 to disable)
-    #[arg(long, default_value = "30")]
+    /// How often the typing indicator is refreshed while a turn runs, in
+    /// seconds (0 sets it once and leaves it)
+    #[arg(long, default_value = "5")]
     heartbeat_secs: u64,
 
     /// LLM backend for the spawned CLI. With --harness claude this defaults
@@ -61,10 +63,31 @@ struct Args {
     llm_key: Option<String>,
 
     /// Model for the spawned CLI. With --harness claude this defaults to
-    /// claude-opus-4.5 (the gateway needs dotted IDs, not the dashed form).
-    /// Other harnesses use their own default unless set.
+    /// claude-opus-4-5, the newest Opus the local gateway's upstream serves.
+    /// Use the dashed form: Claude Code hangs on a dotted id such as
+    /// claude-opus-4.5. Other harnesses use their own default unless set.
     #[arg(long, env = "NUBI_LLM_MODEL")]
     model: Option<String>,
+
+    /// Model the CLI falls back to when the primary one is overloaded
+    /// (Claude Code only). Defaults to claude-sonnet-4-6 with --harness claude.
+    #[arg(long, env = "NUBI_LLM_FALLBACK_MODEL")]
+    fallback_model: Option<String>,
+
+    /// Reasoning effort for the spawned CLI: low, medium, high, xhigh or max.
+    /// Defaults to high with --harness claude; other CLIs get none.
+    #[arg(long, env = "NUBI_LLM_EFFORT")]
+    effort: Option<String>,
+
+    /// Compact the CLI's conversation once it fills this percentage of the
+    /// context window (Claude Code only). 0 leaves the CLI's own default.
+    #[arg(long, env = "NUBI_COMPACT_AT_PCT", default_value = "60")]
+    compact_at_pct: u8,
+
+    /// Kill a harness run that takes longer than this many seconds and tell
+    /// the room.
+    #[arg(long, env = "NUBI_TURN_TIMEOUT_SECS", default_value = "900")]
+    turn_timeout_secs: u64,
 
     /// Do not answer anything until the agent's mandate (the skill sets
     /// bound to it) has been fetched from the engine, and refuse a turn
@@ -105,15 +128,25 @@ async fn main() -> anyhow::Result<()> {
     let agent_id = nubi.agent_id().to_string();
     let mcp_url = Some(args.mcp_url.unwrap_or_else(|| default_mcp_url(&args.url)));
 
-    let (llm_base_url, model) = match args.harness {
+    let (llm_base_url, model, fallback_model, effort) = match args.harness {
         HarnessKind::Claude => (
             Some(
                 args.llm_base_url
                     .unwrap_or_else(|| "http://localhost:5000".to_string()),
             ),
-            Some(args.model.unwrap_or_else(|| "claude-opus-4.5".to_string())),
+            Some(args.model.unwrap_or_else(|| "claude-opus-4-5".to_string())),
+            Some(
+                args.fallback_model
+                    .unwrap_or_else(|| "claude-sonnet-4-6".to_string()),
+            ),
+            Some(args.effort.unwrap_or_else(|| "high".to_string())),
         ),
-        _ => (args.llm_base_url, args.model),
+        _ => (
+            args.llm_base_url,
+            args.model,
+            args.fallback_model,
+            args.effort,
+        ),
     };
 
     let config = AgentConfig {
@@ -128,6 +161,10 @@ async fn main() -> anyhow::Result<()> {
         llm_base_url,
         llm_api_key: args.llm_key,
         llm_model: model,
+        llm_fallback_model: fallback_model,
+        llm_effort: effort,
+        compact_at_pct: (args.compact_at_pct > 0).then_some(args.compact_at_pct.min(100)),
+        turn_timeout_secs: args.turn_timeout_secs,
         harness: args.harness,
         mandate_strict: args.mandate_strict,
         no_local_skills: args.no_local_skills,

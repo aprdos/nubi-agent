@@ -14,15 +14,34 @@ pub struct BufferedMessage {
     pub sender: String,
     pub text: String,
     pub timestamp_ms: u64,
+    /// Who the message was addressed to.
+    pub mentions: Vec<String>,
+    /// Who it asked to answer, when the sender said.
+    pub expect_reply: Option<Vec<String>>,
 }
 
 impl BufferedMessage {
-    fn from_entry(entry: &LogEntry) -> Self {
+    /// A plain message with no mentions, for tools and tests that build
+    /// context by hand.
+    pub fn plain(global_index: u64, sender: &str, text: &str, timestamp_ms: u64) -> Self {
+        Self {
+            global_index,
+            sender: sender.to_string(),
+            text: text.to_string(),
+            timestamp_ms,
+            mentions: vec![],
+            expect_reply: None,
+        }
+    }
+
+    pub fn from_entry(entry: &LogEntry) -> Self {
         Self {
             global_index: entry.global_index,
             sender: entry.sender.clone(),
             text: entry.text(),
             timestamp_ms: entry.timestamp_ms,
+            mentions: entry.mention_list(),
+            expect_reply: entry.expect_reply_list(),
         }
     }
 }
@@ -143,6 +162,23 @@ impl RoomBuffer {
                     .take(take)
                     .cloned()
                     .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Recent messages for context, leaving out the given indexes (the
+    /// messages being answered, which the prompt shows separately).
+    pub fn context_excluding(&self, room_id: &str, exclude: &[u64]) -> Vec<BufferedMessage> {
+        self.rooms
+            .get(room_id)
+            .map(|state| {
+                let kept: Vec<&BufferedMessage> = state
+                    .messages
+                    .iter()
+                    .filter(|m| !exclude.contains(&m.global_index))
+                    .collect();
+                let skip = kept.len().saturating_sub(self.context_size);
+                kept.into_iter().skip(skip).cloned().collect()
             })
             .unwrap_or_default()
     }

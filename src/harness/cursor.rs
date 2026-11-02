@@ -2,6 +2,7 @@ use super::{
     pass_mcp_token, warn_unsupported, with_instructions, write_private, Harness, Invocation,
     Settings, MCP_TOKEN_ENV,
 };
+use crate::runtime::Session;
 
 /// Cursor CLI: `cursor-agent -p`.
 pub struct Cursor;
@@ -52,7 +53,13 @@ impl Harness for Cursor {
         )
     }
 
-    fn invocation(&self, settings: &Settings, system_prompt: &str, prompt: &str) -> Invocation {
+    fn invocation(
+        &self,
+        settings: &Settings,
+        system_prompt: &str,
+        prompt: &str,
+        _session: Option<&Session>,
+    ) -> Invocation {
         let mut inv = Invocation::default();
         // `text` prints only the final message, after the last tool call.
         inv.arg("-p")

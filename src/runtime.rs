@@ -2,16 +2,102 @@ use async_trait::async_trait;
 
 use crate::buffer::BufferedMessage;
 use crate::mandate::Mandate;
+use crate::skills::Skill;
+
+/// A message addressed to the agent that it has not answered yet.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Trigger {
+    pub sender: String,
+    pub text: String,
+    /// The message's global index in its room, so the model can thread on
+    /// it or scroll back from it.
+    pub index: u64,
+    /// `metadata.expect_reply` as sent, when well-formed.
+    pub expect_reply: Option<Vec<String>>,
+    pub timestamp_ms: u64,
+}
+
+/// The message a thread room was opened on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ThreadAnchor {
+    pub parent_room: String,
+    pub index: u64,
+    pub sender: String,
+    pub text: String,
+}
+
+/// Everything one turn is built from. The runtime renders it into a prompt.
+#[derive(Debug, Clone, Default)]
+pub struct TurnInput {
+    pub room_id: String,
+    /// All pending messages for the room, oldest first. Never empty.
+    pub triggers: Vec<Trigger>,
+    /// Room history before the triggers, oldest first. When a session is
+    /// resumed this holds only what arrived since the agent's last turn.
+    pub context: Vec<BufferedMessage>,
+    pub thread: Option<ThreadAnchor>,
+    /// The agent's own recent turns in this room, as one line each.
+    pub journal: Vec<String>,
+    /// The harness session for this room is being continued, so the model
+    /// already saw everything up to the agent's last turn.
+    pub resumed: bool,
+}
+
+/// The harness conversation to run a turn in.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Session {
+    pub id: String,
+    /// Continue an existing conversation rather than start one with this id.
+    pub resume: bool,
+}
+
+/// A reply the model shaped itself instead of leaving routing to the harness.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct StructuredReply {
+    pub text: String,
+    /// Agents who should see the message. Empty wakes nobody.
+    pub mentions: Vec<String>,
+    /// Who must answer. None falls back to the loop-brake `[]`.
+    pub expect_reply: Option<Vec<String>>,
+    /// False when the model already delivered its answer via tools and
+    /// nothing should be posted.
+    pub post: bool,
+}
 
 /// What one run of the LLM produced.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct RunOutput {
-    /// The model's answer.
+    /// The model's answer as plain text (empty when it only used tools).
     pub text: String,
+    /// The answer in structured form when the harness supports it.
+    pub reply: Option<StructuredReply>,
     /// Hash of the mandate that was in the system prompt for this run (see
     /// [`AgentRuntime::mandate_hash`]), read together with the prompt so the
     /// two cannot drift apart. None when no mandate was injected.
     pub mandate_hash: Option<String>,
+    /// The CLI finished but reported a failure (API error, max turns, ...).
+    pub is_error: bool,
+    pub error: Option<String>,
+    /// Model turns the CLI took, when it says.
+    pub num_turns: Option<u64>,
+    /// The CLI's conversation id, for resuming.
+    pub session_id: Option<String>,
+    pub cost_usd: Option<f64>,
+    pub duration_ms: Option<u64>,
+}
+
+impl RunOutput {
+    /// The run ended without the model producing any reply at all, as
+    /// opposed to answering through tools over several turns.
+    pub fn is_silent(&self) -> bool {
+        !self.is_error
+            && self.text.trim().is_empty()
+            && self
+                .reply
+                .as_ref()
+                .is_none_or(|r| r.post && r.text.trim().is_empty())
+            && self.num_turns.unwrap_or(1) <= 1
+    }
 }
 
 /// A runtime that can execute LLM invocations.
@@ -23,31 +109,23 @@ pub trait AgentRuntime: Send + Sync {
     /// Check if the runtime is available (CLI installed, API reachable, etc.)
     async fn check_available(&self) -> anyhow::Result<()>;
 
-    /// Build the prompt with conversation context.
-    ///
-    /// The runtime decides how to format room context, sender info, and the
-    /// new message into a prompt suitable for its LLM.
-    fn build_prompt(
-        &self,
-        room_id: &str,
-        sender: &str,
-        message: &str,
-        context: &[BufferedMessage],
-    ) -> String;
+    /// Render a turn into the prompt the LLM sees.
+    fn build_prompt(&self, turn: &TurnInput) -> String;
 
-    /// Run the LLM with the given prompt and return the response, together
-    /// with the hash of the mandate that was in the system prompt it used.
-    async fn run(&self, prompt: &str) -> anyhow::Result<RunOutput>;
+    /// Run the LLM with the given prompt, in `session` when given, and return
+    /// the response together with the hash of the mandate that was in the
+    /// system prompt it used.
+    async fn run(&self, prompt: &str, session: Option<&Session>) -> anyhow::Result<RunOutput>;
+
+    /// Whether `run` honours [`Session`]s.
+    fn supports_sessions(&self) -> bool {
+        false
+    }
 
     /// Whether this runtime supports MCP tools.
     fn supports_mcp(&self) -> bool;
 
-    /// Inject additional context into the system prompt.
-    ///
-    /// Called before run() to add skills, custom instructions, etc.
-    fn inject_context(&mut self, context: &str);
-
-    /// Replace the agent's mandate and its ad-hoc skills section.
+    /// Replace the agent's mandate and its ad-hoc skills.
     ///
     /// The two are set together because ad-hoc skills are deduplicated
     /// against the mandate. Takes `&self` so a running agent can swap them
@@ -55,7 +133,11 @@ pub trait AgentRuntime: Send + Sync {
     /// with. Runtimes that write the system prompt to disk rewrite it here,
     /// and on an error keep the previous mandate injected, so what
     /// [`Self::mandate_hash`] reports never runs ahead of what is on disk.
-    fn inject_mandate(&self, mandate: Option<&Mandate>, adhoc_skills: &str) -> anyhow::Result<()>;
+    fn inject_mandate(
+        &self,
+        mandate: Option<&Mandate>,
+        adhoc_skills: &[Skill],
+    ) -> anyhow::Result<()>;
 
     /// Hash of the mandate as currently injected, recomputed from the parsed
     /// skills the prompt section was rendered from (see

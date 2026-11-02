@@ -10,9 +10,11 @@ pub mod skills;
 pub mod types;
 
 pub use agent::{Agent, AgentConfig};
-pub use buffer::RoomBuffer;
+pub use buffer::{BufferedMessage, RoomBuffer};
 pub use mandate::{Mandate, MandateLoader, MandateSkill};
 pub use nubi::NubiClient;
-pub use runtime::AgentRuntime;
+pub use runtime::{
+    AgentRuntime, RunOutput, Session, StructuredReply, ThreadAnchor, Trigger, TurnInput,
+};
 pub use skills::{CompositeSkillLoader, RoomSkillLoader, Skill, SkillLoader, SkillMeta};
 pub use types::*;
