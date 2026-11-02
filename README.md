@@ -193,10 +193,18 @@ cargo run --example eval -- docs/eval/cases.jsonl
 
 Each line of the file is one case (context, the triggering message, a
 rubric). Add real situations from your rooms; two model calls per case. Every
-turn also logs a `turn room=... outcome=posted|tools|failed runs=... cost_usd=...
-in_tok=... out_tok=... cache_read=... cache_write=...` line (cost and tokens
-only where the CLI reports them, today Claude Code), so the logs answer "how
-often does it fail" and "what does it cost" without reading transcripts.
+turn also logs a `turn room=... outcome=posted|tools|failed runs=...
+cli_cost_usd=... in_tok=... out_tok=... cache_read=... cache_write=...` line
+(tokens only where the CLI reports them, today Claude Code), so the logs
+answer "how often does it fail" and "what does it use" without reading
+transcripts. `cli_cost_usd` is the CLI's own estimate at its list prices,
+whatever actually served the model.
+
+Each posted reply also carries its tokens per model as `metadata.usage`,
+with the provider that served them (`--llm-provider`: `anthropic`, `kiro`,
+`bedrock`, ...). The engine adds them up per agent and day; nubi-app prices
+them from its own table, and shows a subscription provider such as Kiro as
+tokens only.
 
 ---
 

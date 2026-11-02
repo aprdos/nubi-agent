@@ -162,6 +162,23 @@ impl Harness for Claude {
                 cache_read: value["usage"]["cache_read_input_tokens"].as_u64(),
                 cache_write: value["usage"]["cache_creation_input_tokens"].as_u64(),
             },
+            model_usage: value["modelUsage"]
+                .as_object()
+                .map(|models| {
+                    models
+                        .iter()
+                        .map(|(model, u)| {
+                            let usage = TokenUsage {
+                                input: u["inputTokens"].as_u64(),
+                                output: u["outputTokens"].as_u64(),
+                                cache_read: u["cacheReadInputTokens"].as_u64(),
+                                cache_write: u["cacheCreationInputTokens"].as_u64(),
+                            };
+                            (model.clone(), usage)
+                        })
+                        .collect()
+                })
+                .unwrap_or_default(),
         })
     }
 }

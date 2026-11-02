@@ -13,7 +13,7 @@ use tokio::time::interval;
 use crate::buffer::RoomBuffer;
 use crate::harness::{age, now_ms, write_private, CliRuntime, HarnessKind, McpServer};
 use crate::mandate::{FetchError, Fetched, Mandate, MandateLoader};
-use crate::nubi::{NubiClient, Outgoing};
+use crate::nubi::{usage_metadata, NubiClient, Outgoing};
 use crate::runtime::{AgentRuntime, RunOutput, Session, ThreadAnchor, Trigger, TurnInput};
 use crate::skills::{CompositeSkillLoader, RoomSkillLoader, Skill, SkillLoader};
 use crate::types::{MandateUpdate, SseData};
@@ -71,6 +71,9 @@ pub struct AgentConfig {
     /// sets it once and leaves it.
     pub heartbeat_interval_secs: u64,
     pub llm_base_url: Option<String>,
+    /// Who serves the model (`anthropic`, `kiro`, `bedrock`, ...), reported
+    /// with the tokens so nubi-app can price them.
+    pub llm_provider: String,
     pub llm_api_key: Option<String>,
     pub llm_model: Option<String>,
     pub llm_fallback_model: Option<String>,
@@ -98,6 +101,7 @@ impl Default for AgentConfig {
             mcp_url: None,
             heartbeat_interval_secs: 5,
             llm_base_url: None,
+            llm_provider: "anthropic".to_string(),
             llm_api_key: None,
             llm_model: None,
             llm_fallback_model: None,
@@ -1317,8 +1321,10 @@ impl Shared {
                             mentions: &mentions,
                             expect_reply: expect_reply.as_deref(),
                             mandate_hash: out.mandate_hash.as_deref(),
-                            usage: out.usage,
-                            cost_usd: out.cost_usd,
+                            usage: usage_metadata(
+                                &self.config.llm_provider,
+                                &per_model_usage(&out, self.config.llm_model.as_deref()),
+                            ),
                         },
                     )
                     .await;
@@ -1380,8 +1386,10 @@ impl Shared {
             if let Some(n) = out.num_turns {
                 line.push_str(&format!(" model_turns={n}"));
             }
+            // The CLI's own estimate, at its list prices: for debugging only,
+            // nubi-app prices the tokens itself.
             if let Some(c) = out.cost_usd {
-                line.push_str(&format!(" cost_usd={c:.4}"));
+                line.push_str(&format!(" cli_cost_usd={c:.4}"));
             }
             let u = &out.usage;
             for (key, n) in [
@@ -1455,6 +1463,22 @@ impl Shared {
 
         result
     }
+}
+
+/// The run's tokens per model. A CLI that reports only a total gets it
+/// filed under the model it was asked to use.
+fn per_model_usage(
+    out: &RunOutput,
+    configured: Option<&str>,
+) -> std::collections::BTreeMap<String, crate::runtime::TokenUsage> {
+    if !out.model_usage.is_empty() {
+        return out.model_usage.clone();
+    }
+    let mut models = std::collections::BTreeMap::new();
+    if out.usage != crate::runtime::TokenUsage::default() {
+        models.insert(configured.unwrap_or("unknown").to_string(), out.usage);
+    }
+    models
 }
 
 #[cfg(test)]

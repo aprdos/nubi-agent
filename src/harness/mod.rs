@@ -168,6 +168,7 @@ pub struct Parsed {
     pub cost_usd: Option<f64>,
     pub duration_ms: Option<u64>,
     pub usage: TokenUsage,
+    pub model_usage: std::collections::BTreeMap<String, TokenUsage>,
 }
 
 impl Parsed {
@@ -991,6 +992,7 @@ impl AgentRuntime for CliRuntime {
             cost_usd: parsed.cost_usd,
             duration_ms: parsed.duration_ms,
             usage: parsed.usage,
+            model_usage: parsed.model_usage,
         })
     }
 
@@ -1301,7 +1303,7 @@ mod tests {
 
     #[test]
     fn claude_json_result_is_read_in_full() {
-        let out = r#"{"type":"result","subtype":"success","is_error":false,"duration_ms":4120,"num_turns":3,"result":"it is green","session_id":"s-1","total_cost_usd":0.0421,"usage":{"input_tokens":12,"output_tokens":340,"cache_read_input_tokens":20480,"cache_creation_input_tokens":1536},"structured_output":{"text":"it is green","mentions":["alice"],"expect_reply":[],"post":true}}"#;
+        let out = r#"{"type":"result","subtype":"success","is_error":false,"duration_ms":4120,"num_turns":3,"result":"it is green","session_id":"s-1","total_cost_usd":0.0421,"usage":{"input_tokens":12,"output_tokens":340,"cache_read_input_tokens":20480,"cache_creation_input_tokens":1536},"modelUsage":{"claude-opus-4-5":{"inputTokens":10,"outputTokens":300,"cacheReadInputTokens":20480,"cacheCreationInputTokens":1536,"costUSD":0.04},"claude-haiku-4-5-20251001":{"inputTokens":2,"outputTokens":40,"costUSD":0.0001}},"structured_output":{"text":"it is green","mentions":["alice"],"expect_reply":[],"post":true}}"#;
         let p = claude::Claude.parse_output(out).unwrap();
         assert_eq!(p.text, "it is green");
         assert!(!p.is_error);
@@ -1317,6 +1319,10 @@ mod tests {
                 cache_write: Some(1536),
             }
         );
+        assert_eq!(p.model_usage.len(), 2);
+        assert_eq!(p.model_usage["claude-opus-4-5"].output, Some(300));
+        let haiku = p.model_usage["claude-haiku-4-5-20251001"];
+        assert_eq!((haiku.input, haiku.cache_read), (Some(2), None));
         let reply = structured_reply(p.structured.as_ref().unwrap()).unwrap();
         assert_eq!(reply.mentions, vec!["alice"]);
         assert_eq!(reply.expect_reply, Some(vec![]));
