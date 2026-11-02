@@ -1537,6 +1537,16 @@ mod tests {
     }
 
     #[test]
+    fn claude_watch_counts_messages_without_an_id_apart() {
+        let lines = vec![
+            stream::text("", "one"),
+            stream::text("", "two"),
+            stream::text("", "three"),
+        ];
+        assert_eq!(watch_lines(&lines).1.num_turns, Some(3));
+    }
+
+    #[test]
     fn claude_watch_does_not_count_a_call_streamed_twice() {
         let call = stream::tool_use("m1", "t1", "StructuredOutput", stream::SENT);
         let lines = vec![

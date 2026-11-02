@@ -218,6 +218,22 @@ struct ReplyWatch {
     /// Usage per assistant message: the stream repeats a message once per
     /// content block, with the same id and usage each time.
     messages: HashMap<String, (String, TokenUsage)>,
+    /// Events that came without an id, each counted as its own.
+    unnamed: u64,
+}
+
+impl ReplyWatch {
+    /// An event's id, or a fresh one when it has none, so events without
+    /// an id are never merged into one.
+    fn id_or_fresh(&mut self, id: &serde_json::Value) -> String {
+        match id.as_str() {
+            Some(id) if !id.is_empty() => id.to_string(),
+            _ => {
+                self.unnamed += 1;
+                format!("unnamed-{}", self.unnamed)
+            }
+        }
+    }
 }
 
 impl OutputWatch for ReplyWatch {
@@ -237,7 +253,7 @@ impl OutputWatch for ReplyWatch {
             }
             Some("assistant") => {
                 let message = &event["message"];
-                let id = message["id"].as_str().unwrap_or_default().to_string();
+                let id = self.id_or_fresh(&message["id"]);
                 if let std::collections::hash_map::Entry::Vacant(e) = self.messages.entry(id) {
                     let model = message["model"].as_str().unwrap_or_default().to_string();
                     e.insert((model, usage(&message["usage"])));
@@ -249,7 +265,7 @@ impl OutputWatch for ReplyWatch {
                     if block["type"] != "tool_use" || block["name"] != "StructuredOutput" {
                         continue;
                     }
-                    let call = block["id"].as_str().unwrap_or_default().to_string();
+                    let call = self.id_or_fresh(&block["id"]);
                     // The same call streamed again is not a new call.
                     if !self.calls.insert(call.clone()) {
                         continue;
