@@ -1192,6 +1192,12 @@ impl Shared {
                 short(&last_error, 200)
             );
             if runs >= MAX_RUNS_PER_TURN {
+                // A resume that failed on the last run would fail again on
+                // the room's next message; start that one fresh.
+                if resumed {
+                    eprintln!("[nubi-agent] Dropping the session for {}", room_id);
+                    self.forget_session(room_id);
+                }
                 break Err(last_error);
             }
             if resumed {
@@ -1896,20 +1902,64 @@ mod tests {
         assert!(!prompt.contains("ctx #1"), "{prompt}");
         assert!(prompt.contains("(resumed)"));
 
+        // A resume that keeps failing is forgotten, so the next message
+        // starts fresh instead of failing the same way first.
+        fake.fail_runs
+            .store(MAX_RUNS_PER_TURN as usize, Ordering::SeqCst);
+        agent
+            .shared
+            .reply("general", &[trigger_at(5, "alice", "hello?")])
+            .await
+            .unwrap();
+        assert!(
+            !agent
+                .shared
+                .sessions
+                .lock()
+                .unwrap()
+                .contains_key("general"),
+            "a session that failed on the last run is dropped"
+        );
+        fake.fail_runs.store(0, Ordering::SeqCst);
+        agent
+            .shared
+            .reply("general", &[trigger_at(6, "alice", "back")])
+            .await
+            .unwrap();
+        assert!(
+            !fake
+                .sessions
+                .lock()
+                .unwrap()
+                .last()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .resume
+        );
+        let after = agent.shared.sessions.lock().unwrap()["general"].clone();
+
         // A resume that fails falls back to a fresh session in the same turn.
         fake.fail_runs.store(1, Ordering::SeqCst);
         agent
             .shared
-            .reply("general", &[trigger_at(5, "alice", "still there?")])
+            .reply("general", &[trigger_at(7, "alice", "still there?")])
             .await
             .unwrap();
         let sessions = fake.sessions.lock().unwrap().clone();
-        assert_eq!(sessions.len(), 4);
-        assert!(sessions[2].as_ref().unwrap().resume);
-        let fresh = sessions[3].as_ref().unwrap();
+        let n = sessions.len();
+        assert!(sessions[n - 2].as_ref().unwrap().resume);
+        assert_eq!(sessions[n - 2].as_ref().unwrap().id, after.id);
+        let fresh = sessions[n - 1].as_ref().unwrap();
         assert!(!fresh.resume);
-        assert_ne!(fresh.id, first.id);
-        assert_eq!(posted_texts(&engine).len(), 3, "every turn was answered");
+        assert_ne!(fresh.id, after.id);
+        let texts = posted_texts(&engine);
+        assert_eq!(
+            texts.len(),
+            5,
+            "every turn got a post, including the failure note"
+        );
+        assert!(texts[2].starts_with("Couldn't finish"));
     }
 
     #[tokio::test]
