@@ -1910,6 +1910,7 @@ mod tests {
         assert!(sessions.iter().all(|s| !s.resume));
         assert_ne!(sessions[0].id, sessions[1].id);
         assert_ne!(sessions[1].id, sessions[2].id);
+        assert_ne!(sessions[0].id, sessions[2].id);
         assert_eq!(
             posted_texts(&engine),
             vec!["Refunds take 30 days from purchase."]
