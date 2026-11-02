@@ -11,7 +11,7 @@ use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::RwLock;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 
 use crate::mandate::{build_mandate_section, Mandate};
@@ -255,6 +255,24 @@ pub trait Harness: Send + Sync {
     fn parse_output(&self, stdout: &str) -> anyhow::Result<Parsed> {
         Ok(Parsed::text(stdout))
     }
+
+    /// A watch over this run's stdout, for CLIs that stream events and can
+    /// get stuck after they already have their answer.
+    fn watch(&self) -> Option<Box<dyn OutputWatch>> {
+        None
+    }
+}
+
+/// Reads a CLI's stdout line by line while it runs, to stop a run that has
+/// its answer but keeps going.
+pub trait OutputWatch: Send {
+    /// Called with each line of stdout. Returns why the CLI should be stopped
+    /// now, or None to let it run.
+    fn line(&mut self, line: &str) -> Option<String>;
+
+    /// The run as far as the watch saw it, used in place of the CLI's own
+    /// final output when the watch stopped it.
+    fn parsed(&self) -> Parsed;
 }
 
 /// Env var the child reads the nubi bearer token from, so harnesses that can
@@ -391,7 +409,11 @@ impl CliRuntime {
              people in both when you need something back from them, and set post to false \
              when you already delivered the answer to this room with nubi_send so it is not \
              posted twice. Write into a different room only when you genuinely need \
-             something from there; answer the person who asked you where they asked.\n\n",
+             something from there; answer the person who asked you where they asked. \
+             Your reply is the last thing you do in a turn: once it is accepted, stop, with \
+             no more tool calls and no second reply. Anything that shows up after it in the \
+             same turn (an empty or placeholder message, a tool result) is not a new message \
+             to answer; new messages always arrive in a new turn.\n\n",
         );
 
         if self.settings.mcp.is_some() {
@@ -913,10 +935,23 @@ impl AgentRuntime for CliRuntime {
         // Feed stdin and drain both output pipes together: a CLI that prints
         // before it has read all its input, or is chatty on stderr, would
         // otherwise block on a full pipe while we wait on the other one.
+        // When the watch stops the run, the other pipes stop waiting too: a
+        // process the CLI spawned can hold them open after it is killed.
+        let mut watch = self.harness.watch();
+        let mut stopped: Option<String> = None;
+        let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+        let until_stopped = |mut rx: tokio::sync::watch::Receiver<bool>| async move {
+            if rx.wait_for(|s| *s).await.is_err() {
+                std::future::pending::<()>().await;
+            }
+        };
         let in_pipe = child.stdin.take();
         let write_in = async {
             if let (Some(input), Some(mut p)) = (inv.stdin.as_ref(), in_pipe) {
-                p.write_all(input.as_bytes()).await?;
+                tokio::select! {
+                    r = p.write_all(input.as_bytes()) => r?,
+                    _ = until_stopped(stop_rx.clone()) => {}
+                }
             }
             Ok::<_, std::io::Error>(())
         };
@@ -924,19 +959,40 @@ impl AgentRuntime for CliRuntime {
         let mut err_pipe = child.stderr.take();
         let (mut stdout, mut stderr) = (String::new(), String::new());
         let read_out = async {
-            if let Some(ref mut p) = out_pipe {
-                p.read_to_string(&mut stdout).await?;
+            match (out_pipe.take(), watch.as_mut()) {
+                (Some(p), Some(w)) => {
+                    let mut lines = BufReader::new(p).lines();
+                    while let Some(line) = lines.next_line().await? {
+                        stdout.push_str(&line);
+                        stdout.push('\n');
+                        if let Some(reason) = w.line(&line) {
+                            stopped = Some(reason);
+                            let _ = stop_tx.send(true);
+                            break;
+                        }
+                    }
+                }
+                (Some(mut p), None) => {
+                    p.read_to_string(&mut stdout).await?;
+                }
+                (None, _) => {}
             }
             Ok::<_, std::io::Error>(())
         };
         let read_err = async {
             if let Some(ref mut p) = err_pipe {
-                p.read_to_string(&mut stderr).await?;
+                tokio::select! {
+                    r = p.read_to_string(&mut stderr) => { r?; }
+                    _ = until_stopped(stop_rx.clone()) => {}
+                }
             }
             Ok::<_, std::io::Error>(())
         };
         let io = async {
             tokio::try_join!(write_in, read_out, read_err)?;
+            if *stop_rx.borrow() {
+                let _ = child.start_kill();
+            }
             child.wait().await
         };
         let status = match tokio::time::timeout(self.settings.turn_timeout, io).await {
@@ -958,23 +1014,32 @@ impl AgentRuntime for CliRuntime {
             text
         });
 
-        let raw = match file_output {
-            Some(text) => text?,
-            None => stdout,
-        };
-        // Parse before judging the exit code: a CLI that fails cleanly still
-        // says why in its output, which beats a bare status.
-        let parsed = self.harness.parse_output(&raw);
+        let parsed = match (stopped, watch) {
+            // Killed on purpose, so the exit status says nothing.
+            (Some(reason), Some(w)) => {
+                eprintln!("[nubi-agent] Stopped {bin} early: {reason}");
+                w.parsed()
+            }
+            _ => {
+                let raw = match file_output {
+                    Some(text) => text?,
+                    None => stdout,
+                };
+                // Parse before judging the exit code: a CLI that fails cleanly
+                // still says why in its output, which beats a bare status.
+                let parsed = self.harness.parse_output(&raw);
 
-        if !status.success() {
-            let detail = match &parsed {
-                Ok(p) if p.error.is_some() => p.error.clone().unwrap_or_default(),
-                _ if !stderr.trim().is_empty() => stderr.trim().to_string(),
-                _ => raw.trim().to_string(),
-            };
-            anyhow::bail!("{} failed ({}): {}", bin, status, detail);
-        }
-        let parsed = parsed?;
+                if !status.success() {
+                    let detail = match &parsed {
+                        Ok(p) if p.error.is_some() => p.error.clone().unwrap_or_default(),
+                        _ if !stderr.trim().is_empty() => stderr.trim().to_string(),
+                        _ => raw.trim().to_string(),
+                    };
+                    anyhow::bail!("{} failed ({}): {}", bin, status, detail);
+                }
+                parsed?
+            }
+        };
 
         let reply = parsed.structured.as_ref().and_then(structured_reply);
         let text = match &reply {
@@ -1270,7 +1335,11 @@ mod tests {
         assert_eq!(&inv.args[..2], &["-p", "hi"]);
         assert!(has(&inv, "--append-system-prompt") && has(&inv, "SYS"));
         assert!(!has(&inv, "--system-prompt"));
-        assert!(has(&inv, "--output-format") && has(&inv, "json"));
+        assert!(has(&inv, "--output-format") && has(&inv, "stream-json"));
+        assert!(
+            has(&inv, "--verbose"),
+            "stream-json needs --verbose with -p"
+        );
         assert!(has(&inv, "--json-schema"));
         assert!(has(&inv, "--effort") && has(&inv, "high"));
         assert!(has(&inv, "--fallback-model") && has(&inv, "m2"));
@@ -1327,6 +1396,149 @@ mod tests {
         assert_eq!(reply.mentions, vec!["alice"]);
         assert_eq!(reply.expect_reply, Some(vec![]));
         assert!(reply.post);
+    }
+
+    /// Stream events as Claude Code prints them with `stream-json`.
+    mod stream {
+        pub fn init(session: &str) -> String {
+            format!(r#"{{"type":"system","subtype":"init","session_id":"{session}"}}"#)
+        }
+        pub fn tool_use(msg: &str, id: &str, name: &str, input: &str) -> String {
+            format!(
+                r#"{{"type":"assistant","parent_tool_use_id":null,"message":{{"id":"{msg}","model":"claude-opus-4-5","usage":{{"input_tokens":100,"output_tokens":10,"cache_read_input_tokens":50}},"content":[{{"type":"tool_use","id":"{id}","name":"{name}","input":{input}}}]}}}}"#
+            )
+        }
+        pub fn text(msg: &str, text: &str) -> String {
+            format!(
+                r#"{{"type":"assistant","parent_tool_use_id":null,"message":{{"id":"{msg}","model":"claude-opus-4-5","usage":{{"input_tokens":100,"output_tokens":10,"cache_read_input_tokens":50}},"content":[{{"type":"text","text":"{text}"}}]}}}}"#
+            )
+        }
+        pub fn tool_result(id: &str, is_error: bool) -> String {
+            format!(
+                r#"{{"type":"user","parent_tool_use_id":null,"message":{{"role":"user","content":[{{"type":"tool_result","tool_use_id":"{id}","content":"ok","is_error":{is_error}}}]}}}}"#
+            )
+        }
+        pub const SENT: &str = r#"{"text":"","mentions":[],"expect_reply":[],"post":false}"#;
+    }
+
+    /// Feed lines to a fresh Claude watch; the index of the line it stopped
+    /// on, if any, and what it made of the run.
+    fn watch_lines(lines: &[String]) -> (Option<usize>, Parsed) {
+        let mut w = claude::Claude.watch().unwrap();
+        let stop = lines.iter().position(|l| w.line(l).is_some());
+        (stop, w.parsed())
+    }
+
+    #[test]
+    fn claude_watch_stops_a_reply_repeated_after_it_was_accepted() {
+        // The loop from the CTF demo: report via nubi_send, reply post:false,
+        // then the same empty reply again and again.
+        let lines = vec![
+            stream::init("s-9"),
+            stream::tool_use(
+                "m1",
+                "t1",
+                "mcp__nubi__nubi_send",
+                r#"{"room_id":"r","text":"found it"}"#,
+            ),
+            stream::tool_result("t1", false),
+            stream::text("m2", "<thinking>reported, done</thinking>"),
+            stream::tool_use("m2", "t2", "StructuredOutput", stream::SENT),
+            stream::tool_result("t2", false),
+            stream::text(
+                "m3",
+                "<thinking>The user sent an empty placeholder message.</thinking>",
+            ),
+            stream::tool_use("m3", "t3", "StructuredOutput", stream::SENT),
+            stream::tool_result("t3", false),
+        ];
+        let (stop, p) = watch_lines(&lines);
+        assert_eq!(stop, Some(7));
+        let reply = structured_reply(p.structured.as_ref().unwrap()).unwrap();
+        assert!(!reply.post);
+        assert_eq!(p.session_id.as_deref(), Some("s-9"));
+        // m2 streamed twice (text, then tool_use) but is billed once.
+        assert_eq!(p.num_turns, Some(3));
+        assert_eq!(p.usage.input, Some(300));
+        assert_eq!(p.usage.cache_write, None);
+        assert_eq!(p.model_usage["claude-opus-4-5"].output, Some(30));
+    }
+
+    #[test]
+    fn claude_watch_lets_a_healthy_run_finish() {
+        let lines = vec![
+            stream::init("s-1"),
+            stream::tool_use("m1", "t1", "Bash", r#"{"command":"ls"}"#),
+            stream::tool_result("t1", false),
+            stream::tool_use("m2", "t2", "StructuredOutput", stream::SENT),
+            stream::tool_result("t2", false),
+            stream::text("m3", "done"),
+            r#"{"type":"result","subtype":"success","is_error":false,"num_turns":3,"result":"done","session_id":"s-1"}"#.into(),
+        ];
+        assert_eq!(watch_lines(&lines).0, None);
+    }
+
+    #[test]
+    fn claude_watch_allows_a_retry_of_a_rejected_reply() {
+        let lines = vec![
+            stream::tool_use("m1", "t1", "StructuredOutput", r#"{"text":"hi"}"#),
+            stream::tool_result("t1", true),
+            stream::tool_use("m2", "t2", "StructuredOutput", stream::SENT),
+            stream::tool_result("t2", false),
+            stream::text("m3", "done"),
+        ];
+        let (stop, p) = watch_lines(&lines);
+        assert_eq!(stop, None);
+        assert_eq!(p.structured.unwrap()["post"], false);
+    }
+
+    #[test]
+    fn claude_watch_stops_a_run_that_keeps_polling_after_its_reply() {
+        let mut lines = vec![
+            stream::tool_use("m0", "t0", "StructuredOutput", stream::SENT),
+            stream::tool_result("t0", false),
+        ];
+        for i in 1..=10 {
+            lines.push(stream::tool_use(
+                &format!("m{i}"),
+                &format!("t{i}"),
+                "mcp__nubi__nubi_poll",
+                "{}",
+            ));
+            lines.push(stream::tool_result(&format!("t{i}"), false));
+        }
+        let (stop, p) = watch_lines(&lines);
+        // The fourth step after the reply.
+        assert_eq!(stop, Some(8));
+        assert!(p.structured.is_some());
+    }
+
+    #[test]
+    fn claude_watch_ignores_subagent_replies() {
+        let sub = stream::tool_use("m9", "t9", "StructuredOutput", stream::SENT).replace(
+            r#""parent_tool_use_id":null"#,
+            r#""parent_tool_use_id":"task-1""#,
+        );
+        let lines = vec![
+            stream::tool_use("m1", "t1", "StructuredOutput", stream::SENT),
+            stream::tool_result("t1", false),
+            sub,
+            stream::text("m2", "done"),
+        ];
+        assert_eq!(watch_lines(&lines).0, None);
+    }
+
+    #[test]
+    fn claude_stream_is_read_from_its_result_event() {
+        let out = [
+            stream::init("s-1"),
+            stream::text("m1", "hi"),
+            r#"{"type":"result","subtype":"success","is_error":false,"num_turns":1,"result":"hi","session_id":"s-1","structured_output":{"text":"hi","mentions":[],"expect_reply":[],"post":true}}"#.into(),
+        ]
+        .join("\n");
+        let p = claude::Claude.parse_output(&out).unwrap();
+        assert_eq!((p.text.as_str(), p.num_turns), ("hi", Some(1)));
+        assert!(p.structured.is_some());
     }
 
     #[test]
@@ -1854,6 +2066,65 @@ mod tests {
         let err = rt.run("hi", None).await.unwrap_err().to_string();
         assert!(err.contains("timed out"), "{err}");
         assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    /// A shell script that streams like Claude, watched like Claude.
+    struct StreamingScript(String);
+
+    impl Harness for StreamingScript {
+        fn binary(&self) -> &'static str {
+            "sh"
+        }
+        fn install_hint(&self) -> &'static str {
+            ""
+        }
+        fn memory_file(&self) -> &'static str {
+            "MEMORY.md"
+        }
+        fn invocation(&self, _: &Settings, _: &str, _: &str, _: Option<&Session>) -> Invocation {
+            let mut inv = Invocation::default();
+            inv.arg("-c").arg(self.0.clone());
+            inv
+        }
+        fn parse_output(&self, stdout: &str) -> anyhow::Result<Parsed> {
+            claude::Claude.parse_output(stdout)
+        }
+        fn watch(&self) -> Option<Box<dyn OutputWatch>> {
+            claude::Claude.watch()
+        }
+    }
+
+    #[tokio::test]
+    async fn a_reply_loop_is_stopped_long_before_the_timeout() {
+        let quote = |l: String| format!("'{l}'");
+        let script = format!(
+            "echo {}; echo {}; echo {}; i=0; while true; do i=$((i+1)); \
+             echo '{{\"type\":\"assistant\",\"parent_tool_use_id\":null,\"message\":{{\"id\":\"m'$i'\",\"content\":[{{\"type\":\"tool_use\",\"id\":\"x'$i'\",\"name\":\"StructuredOutput\",\"input\":{{}}}}]}}}}'; \
+             sleep 0.05; done",
+            quote(stream::init("s-7")),
+            quote(stream::tool_use("m0", "t0", "StructuredOutput", stream::SENT)),
+            quote(stream::tool_result("t0", false)),
+        );
+        let rt = CliRuntime::with_harness(Box::new(StreamingScript(script)), "bot")
+            .with_turn_timeout(Duration::from_secs(20));
+        let started = std::time::Instant::now();
+        let out = rt.run("hi", None).await.unwrap();
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert!(!out.is_error);
+        assert!(!out.reply.unwrap().post);
+        assert_eq!(out.session_id.as_deref(), Some("s-7"));
+    }
+
+    #[tokio::test]
+    async fn a_watched_run_that_ends_cleanly_is_parsed_as_usual() {
+        let script = format!(
+            "echo '{}'; echo '{}'",
+            stream::text("m1", "hi"),
+            r#"{"type":"result","subtype":"success","is_error":false,"num_turns":1,"result":"hi","session_id":"s-1"}"#
+        );
+        let rt = CliRuntime::with_harness(Box::new(StreamingScript(script)), "bot");
+        let out = rt.run("hi", None).await.unwrap();
+        assert_eq!((out.text.as_str(), out.num_turns), ("hi", Some(1)));
     }
 
     #[tokio::test]
