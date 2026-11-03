@@ -18,6 +18,19 @@ impl Harness for Claude {
         "claude"
     }
 
+    fn env_prefixes(&self) -> Vec<&'static str> {
+        // Bedrock and Vertex need the cloud's own credentials, but only when
+        // Claude Code is told to use them.
+        let mut p = vec!["ANTHROPIC_", "CLAUDE_"];
+        if std::env::var_os("CLAUDE_CODE_USE_BEDROCK").is_some() {
+            p.push("AWS_");
+        }
+        if std::env::var_os("CLAUDE_CODE_USE_VERTEX").is_some() {
+            p.extend(["GOOGLE_", "CLOUD_ML_", "VERTEX_"]);
+        }
+        p
+    }
+
     fn install_hint(&self) -> &'static str {
         "npm install -g @anthropic-ai/claude-code"
     }

@@ -20,6 +20,9 @@ dirs = "5"
 sha2 = "0.10"
 hex = "0.4"
 
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 axum = "0.8"
 tokio-test = "0.4"

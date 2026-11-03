@@ -77,6 +77,17 @@ struct Args {
     #[arg(long, help_heading = "Agent")]
     skip_permissions: bool,
 
+    /// Env vars (comma-separated names) the CLI may see on top of the basics
+    /// and its own credentials, e.g. SSH_AUTH_SOCK,AWS_PROFILE. Nothing else
+    /// from this environment reaches it
+    #[arg(
+        long,
+        env = "NUBI_PASS_ENV",
+        value_delimiter = ',',
+        help_heading = "Agent"
+    )]
+    pass_env: Vec<String>,
+
     /// Model for the CLI. Unset means the CLI's own default
     #[arg(long, env = "NUBI_LLM_MODEL", help_heading = "Model")]
     model: Option<String>,
@@ -228,6 +239,7 @@ async fn main() -> anyhow::Result<()> {
         rooms: args.rooms,
         system_prompt: args.system_prompt,
         skip_permissions: args.skip_permissions,
+        pass_env: args.pass_env,
         context_size: args.context_size,
         rate_limit_ms: args.rate_limit_ms,
         mcp_url,

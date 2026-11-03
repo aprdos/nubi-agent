@@ -9,6 +9,10 @@ impl Harness for Copilot {
         "copilot"
     }
 
+    fn env_prefixes(&self) -> Vec<&'static str> {
+        vec!["COPILOT_", "GH_TOKEN", "GITHUB_TOKEN"]
+    }
+
     fn install_hint(&self) -> &'static str {
         "npm install -g @github/copilot"
     }

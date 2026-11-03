@@ -56,6 +56,20 @@ impl Harness for OpenCode {
         "opencode"
     }
 
+    fn env_prefixes(&self) -> Vec<&'static str> {
+        // OpenCode talks to many providers; each reads its own key.
+        vec![
+            "OPENCODE_",
+            "ANTHROPIC_",
+            "OPENAI_",
+            "GEMINI_",
+            "GOOGLE_",
+            "OPENROUTER_",
+            "GROQ_",
+            "XAI_",
+        ]
+    }
+
     fn install_hint(&self) -> &'static str {
         "npm install -g opencode-ai"
     }
