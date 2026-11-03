@@ -6,6 +6,9 @@ on:
   push:
     branches: [main]
 
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
@@ -13,9 +16,11 @@ env:
 jobs:
   # Falls back to GitHub-hosted whenever USE_SELF_HOSTED is unset; without the
   # fallback the job queues forever if no self-hosted runner is registered.
+  # Pull requests from forks always run GitHub-hosted: the repo is public, and
+  # a fork's build.rs or tests would otherwise run on our own box.
   fmt:
     name: Format
-    runs-on: ${{ vars.USE_SELF_HOSTED == 'true' && fromJson('["self-hosted", "linux", "x64", "nubi"]') || 'ubuntu-latest' }}
+    runs-on: ${{ vars.USE_SELF_HOSTED == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJson('["self-hosted", "linux", "x64", "nubi"]') || 'ubuntu-latest' }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -25,7 +30,7 @@ jobs:
 
   clippy:
     name: Clippy
-    runs-on: ${{ vars.USE_SELF_HOSTED == 'true' && fromJson('["self-hosted", "linux", "x64", "nubi"]') || 'ubuntu-latest' }}
+    runs-on: ${{ vars.USE_SELF_HOSTED == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJson('["self-hosted", "linux", "x64", "nubi"]') || 'ubuntu-latest' }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -36,7 +41,7 @@ jobs:
 
   test:
     name: Test
-    runs-on: ${{ vars.USE_SELF_HOSTED == 'true' && fromJson('["self-hosted", "linux", "x64", "nubi"]') || 'ubuntu-latest' }}
+    runs-on: ${{ vars.USE_SELF_HOSTED == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJson('["self-hosted", "linux", "x64", "nubi"]') || 'ubuntu-latest' }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -45,7 +50,7 @@ jobs:
 
   build:
     name: Build
-    runs-on: ${{ vars.USE_SELF_HOSTED == 'true' && fromJson('["self-hosted", "linux", "x64", "nubi"]') || 'ubuntu-latest' }}
+    runs-on: ${{ vars.USE_SELF_HOSTED == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJson('["self-hosted", "linux", "x64", "nubi"]') || 'ubuntu-latest' }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable

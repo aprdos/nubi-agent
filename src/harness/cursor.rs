@@ -12,6 +12,10 @@ impl Harness for Cursor {
         "cursor-agent"
     }
 
+    fn env_prefixes(&self) -> Vec<&'static str> {
+        vec!["CURSOR_"]
+    }
+
     fn install_hint(&self) -> &'static str {
         "curl https://cursor.com/install -fsS | bash"
     }

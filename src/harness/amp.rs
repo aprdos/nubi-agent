@@ -12,6 +12,10 @@ impl Harness for Amp {
         "amp"
     }
 
+    fn env_prefixes(&self) -> Vec<&'static str> {
+        vec!["AMP_"]
+    }
+
     fn install_hint(&self) -> &'static str {
         "curl -fsSL https://ampcode.com/install.sh | bash"
     }

@@ -64,6 +64,8 @@ pub struct AgentConfig {
     pub rooms: String,
     pub system_prompt: Option<String>,
     pub skip_permissions: bool,
+    /// Env vars, by name, the CLI may see beyond the basics and its own.
+    pub pass_env: Vec<String>,
     pub context_size: usize,
     pub rate_limit_ms: u64,
     pub mcp_url: Option<String>,
@@ -96,6 +98,7 @@ impl Default for AgentConfig {
             rooms: "*".to_string(),
             system_prompt: None,
             skip_permissions: false,
+            pass_env: Vec::new(),
             context_size: 30,
             rate_limit_ms: 5000,
             mcp_url: None,
@@ -256,6 +259,7 @@ impl Agent {
         let team_memory = dirs::home_dir().map(|h| h.join(".nubi").join("TEAM.md"));
         CliRuntime::new(config.harness, &config.agent_id)
             .with_skip_permissions(config.skip_permissions)
+            .with_pass_env(config.pass_env.clone())
             .with_system_prompt(config.system_prompt.clone())
             .with_mcp(mcp)
             .with_workspace(workspace)
@@ -427,43 +431,74 @@ impl Agent {
             self.shared.config.agent_id
         );
 
-        let flusher = tokio::spawn(flush_offsets(Arc::clone(&self.shared)));
+        tokio::spawn(flush_offsets(Arc::clone(&self.shared)));
 
         let sse_url = self.shared.nubi.stream_url(&self.shared.config.rooms);
-        let es = eventsource_client::ClientBuilder::for_url(&sse_url)?
-            .header(
-                "Authorization",
-                &format!("Bearer {}", self.shared.nubi.token()),
-            )?
-            .build();
 
-        let mut stream = es.stream();
+        // A fresh client per connection: once eventsource-client gives up
+        // (StreamClosed) it never reconnects on its own, and a stream that
+        // ends or goes silent would otherwise leave the agent deaf for good.
+        loop {
+            let es = eventsource_client::ClientBuilder::for_url(&sse_url)?
+                .header(
+                    "Authorization",
+                    &format!("Bearer {}", self.shared.nubi.token()),
+                )?
+                .read_timeout(SSE_IDLE_TIMEOUT)
+                .build();
+            let mut stream = es.stream();
 
-        while let Some(event) = stream.next().await {
-            match event {
-                Ok(eventsource_client::SSE::Event(ev)) if ev.event_type == "entry" => {
-                    if let Err(e) = self.shared.ingest(&ev.data).await {
-                        eprintln!("[nubi-agent] Error: {}", e);
+            loop {
+                let event = match tokio::time::timeout(SSE_IDLE_TIMEOUT, stream.next()).await {
+                    Ok(Some(event)) => event,
+                    Ok(None) => {
+                        eprintln!("[nubi-agent] SSE stream ended, reconnecting...");
+                        break;
+                    }
+                    Err(_) => {
+                        eprintln!(
+                            "[nubi-agent] SSE stream silent for {}s, reconnecting...",
+                            SSE_IDLE_TIMEOUT.as_secs()
+                        );
+                        break;
+                    }
+                };
+                match event {
+                    Ok(eventsource_client::SSE::Event(ev)) if ev.event_type == "entry" => {
+                        if let Err(e) = self.shared.ingest(&ev.data).await {
+                            eprintln!("[nubi-agent] Error: {}", e);
+                        }
+                    }
+                    Ok(eventsource_client::SSE::Event(ev)) if ev.event_type == "mandate_update" => {
+                        // Off the SSE loop: a slow mandate endpoint must not hold
+                        // up room ingestion. Refreshes serialise on their own lock.
+                        let shared = Arc::clone(&self.shared);
+                        tokio::spawn(async move { shared.on_mandate_update(&ev.data).await });
+                    }
+                    Ok(_) => {}
+                    Err(eventsource_client::Error::StreamClosed) => {
+                        eprintln!("[nubi-agent] SSE client closed, reconnecting...");
+                        break;
+                    }
+                    Err(e) => {
+                        eprintln!("[nubi-agent] SSE error: {}, reconnecting...", e);
+                        tokio::time::sleep(SSE_RETRY).await;
                     }
                 }
-                Ok(eventsource_client::SSE::Event(ev)) if ev.event_type == "mandate_update" => {
-                    // Off the SSE loop: a slow mandate endpoint must not hold
-                    // up room ingestion. Refreshes serialise on their own lock.
-                    let shared = Arc::clone(&self.shared);
-                    tokio::spawn(async move { shared.on_mandate_update(&ev.data).await });
-                }
-                Ok(_) => {}
-                Err(e) => {
-                    eprintln!("[nubi-agent] SSE error: {}, reconnecting...", e);
-                    tokio::time::sleep(Duration::from_secs(5)).await;
-                }
             }
+            tokio::time::sleep(SSE_RETRY).await;
         }
-
-        flusher.abort();
-        Ok(())
     }
 }
+
+/// How long the space stream may stay silent before it counts as dead. The
+/// engine sends a keep-alive comment every 15 s, so this is four missed
+/// beats. Without it a connection dropped with no FIN (a NAT or load
+/// balancer timing it out, an engine host that died) blocks forever.
+const SSE_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Pause between SSE reconnect attempts.
+const SSE_RETRY: Duration = Duration::from_secs(5);
 
 /// Push pending read offsets to the server so a reconnect resumes where we
 /// stopped instead of replaying the room from the first entry.

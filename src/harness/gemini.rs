@@ -21,6 +21,10 @@ impl Harness for Gemini {
         "gemini"
     }
 
+    fn env_prefixes(&self) -> Vec<&'static str> {
+        vec!["GEMINI_", "GOOGLE_"]
+    }
+
     fn install_hint(&self) -> &'static str {
         "npm install -g @google/gemini-cli"
     }
