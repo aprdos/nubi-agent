@@ -189,17 +189,22 @@ async fn main() -> anyhow::Result<()> {
     // Cheap, and before the engine: a missing CLI is the most common
     // first-run problem, and it should not hide behind a connection retry.
     let bin = args.harness.harness().binary();
-    if tokio::process::Command::new(bin)
+    if let Err(e) = tokio::process::Command::new(bin)
         .arg("--version")
         .output()
         .await
-        .is_err()
     {
-        anyhow::bail!(
-            "'{}' not found on PATH. Install it first:\n  {}\nor pick another CLI with --harness.",
-            bin,
-            args.harness.harness().install_hint()
-        );
+        // `output` fails only when the process cannot be started; a CLI
+        // that runs and exits non-zero is present, and the first turn
+        // reports what it prints.
+        if e.kind() == std::io::ErrorKind::NotFound {
+            anyhow::bail!(
+                "'{}' not found on PATH. Install it first:\n  {}\nor pick another CLI with --harness.",
+                bin,
+                args.harness.harness().install_hint()
+            );
+        }
+        anyhow::bail!("Cannot run '{}': {}", bin, e);
     }
 
     let nubi = NubiClient::connect(&args.url, &token).await?;

@@ -10,7 +10,7 @@
 
 use std::convert::Infallible;
 use std::os::unix::fs::PermissionsExt;
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -172,7 +172,7 @@ async fn the_readme_quick_start_gets_a_reply() {
 
     // Exactly the quick start: a token and (because this engine is not the
     // hosted one) its URL. Nothing about models, keys or gateways.
-    let mut child = Command::new("sh")
+    let mut child = tokio::process::Command::new("sh")
         .arg(script)
         .env_clear()
         .env("PATH", path)
@@ -205,8 +205,8 @@ async fn the_readme_quick_start_gets_a_reply() {
         );
         tokio::time::sleep(Duration::from_millis(100)).await;
     };
-    let _ = child.kill();
-    let _ = child.wait();
+    let _ = child.kill().await;
+    let _ = child.wait().await;
 
     let (room, body) = &posts[0];
     assert_eq!(room, &format!("dm.alice.{AGENT}"), "{body}");
@@ -235,7 +235,7 @@ async fn the_readme_quick_start_gets_a_reply() {
 #[test]
 fn the_quick_start_asks_for_a_token() {
     let script = concat!(env!("CARGO_MANIFEST_DIR"), "/examples/quickstart.sh");
-    let out = Command::new("sh")
+    let out = std::process::Command::new("sh")
         .arg(script)
         .env_clear()
         .env("PATH", std::env::var("PATH").unwrap_or_default())
@@ -251,7 +251,7 @@ fn the_quick_start_asks_for_a_token() {
 /// where it comes from, not clap's "required argument" line.
 #[test]
 fn the_binary_explains_a_missing_token() {
-    let out = Command::new(env!("CARGO_BIN_EXE_nubi-agent"))
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_nubi-agent"))
         .env_clear()
         .output()
         .unwrap();

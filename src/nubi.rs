@@ -35,6 +35,17 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const CONNECT_BACKOFF_START: Duration = Duration::from_secs(1);
 const CONNECT_BACKOFF_MAX: Duration = Duration::from_secs(60);
 
+/// The start of an error body, for a message: the engine's own error JSON is
+/// short, and anything longer is not worth echoing into a log.
+fn short(body: &str) -> String {
+    const MAX: usize = 300;
+    let mut out: String = body.chars().take(MAX).collect();
+    if body.chars().count() > MAX {
+        out.push_str("...");
+    }
+    out
+}
+
 /// Every request here is short — the SSE stream runs on its own
 /// eventsource-client, so a whole-request timeout is safe.
 fn http_client() -> Client {
@@ -221,7 +232,7 @@ impl NubiClient {
 
         if !resp.status().is_success() {
             let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
+            let body = short(&resp.text().await.unwrap_or_default());
             if status == reqwest::StatusCode::UNAUTHORIZED
                 || status == reqwest::StatusCode::FORBIDDEN
             {
