@@ -1224,7 +1224,11 @@ impl AgentRuntime for CliRuntime {
             }
             _ => {
                 let raw = match file_output {
-                    Some(text) => text?,
+                    Some(Ok(text)) => text,
+                    // A CLI that failed may never write its reply file; its
+                    // exit status and stderr say why, the missing file does not.
+                    Some(Err(_)) if !status.success() => stdout,
+                    Some(Err(e)) => anyhow::bail!("{bin} exited cleanly but wrote no reply: {e}"),
                     None => stdout,
                 };
                 // Parse before judging the exit code: a CLI that fails cleanly
@@ -1669,6 +1673,30 @@ mod tests {
             )
         }
         pub const SENT: &str = r#"{"text":"","mentions":[],"expect_reply":[],"post":false}"#;
+    }
+
+    #[test]
+    fn claude_stops_on_a_rejected_key_instead_of_retrying() {
+        let retry = |status: u16| {
+            format!(
+                r#"{{"type":"system","subtype":"api_retry","attempt":1,"max_retries":10,"retry_delay_ms":500,"error_status":{status},"error":"authentication_failed","session_id":"s"}}"#
+            )
+        };
+        let (stop, parsed) = watch_lines(&[retry(401)]);
+        assert_eq!(stop, Some(0));
+        assert!(parsed.is_error);
+        let error = parsed.error.unwrap();
+        assert!(
+            error.contains("HTTP 401") && error.contains("NUBI_LLM_KEY"),
+            "{error}"
+        );
+
+        // Overload and rate limits are worth Claude Code's own retries.
+        for status in [429, 500, 529] {
+            let (stop, parsed) = watch_lines(&[retry(status)]);
+            assert_eq!(stop, None, "{status}");
+            assert!(!parsed.is_error);
+        }
     }
 
     /// Feed lines to a fresh Claude watch; the index of the line it stopped
@@ -2351,6 +2379,57 @@ mod tests {
             inv.arg("-c").arg(self.0);
             inv
         }
+    }
+
+    /// A Script that, like Codex, is expected to leave its reply in a file.
+    struct FileScript(&'static str, PathBuf);
+
+    impl Harness for FileScript {
+        fn binary(&self) -> &'static str {
+            "sh"
+        }
+        fn install_hint(&self) -> &'static str {
+            ""
+        }
+        fn memory_file(&self) -> &'static str {
+            "MEMORY.md"
+        }
+        fn invocation(&self, _: &Settings, _: &str, _: &str, _: Option<&Session>) -> Invocation {
+            let mut inv = Invocation::default();
+            inv.arg("-c").arg(self.0);
+            inv.output_file = Some(self.1.clone());
+            inv
+        }
+    }
+
+    #[tokio::test]
+    async fn a_failed_run_without_its_reply_file_reports_the_cli_error() {
+        let path = std::env::temp_dir().join(format!("nubi-nofile-{}", uuid::Uuid::new_v4()));
+        let script =
+            "echo 'unexpected status 401 Unauthorized: Invalid or inactive API key' >&2; exit 1";
+        let rt = CliRuntime::with_harness(Box::new(FileScript(script, path)), "bot");
+        let err = rt.run("hi", None).await.unwrap_err().to_string();
+        assert!(err.contains("401 Unauthorized"), "{err}");
+        assert!(!err.contains("No such file"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn a_failed_run_without_its_reply_file_reports_what_it_printed() {
+        let path = std::env::temp_dir().join(format!("nubi-nofile-{}", uuid::Uuid::new_v4()));
+        let script =
+            "echo 'unexpected status 401 Unauthorized: Invalid or inactive API key'; exit 1";
+        let rt = CliRuntime::with_harness(Box::new(FileScript(script, path)), "bot");
+        let err = rt.run("hi", None).await.unwrap_err().to_string();
+        assert!(err.contains("401 Unauthorized"), "{err}");
+        assert!(!err.contains("No such file"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn a_clean_exit_without_its_reply_file_says_so() {
+        let path = std::env::temp_dir().join(format!("nubi-nofile-{}", uuid::Uuid::new_v4()));
+        let rt = CliRuntime::with_harness(Box::new(FileScript("true", path)), "bot");
+        let err = rt.run("hi", None).await.unwrap_err().to_string();
+        assert!(err.contains("wrote no reply"), "{err}");
     }
 
     #[tokio::test]
