@@ -2,166 +2,225 @@ use clap::Parser;
 use nubi_agent::harness::HarnessKind;
 use nubi_agent::{Agent, AgentConfig, NubiClient};
 
+/// The hosted engine. A token from the nubi app belongs to it.
+const HOSTED_ENGINE: &str = "https://api.nubi.chat";
+
+/// Hosted engines keep the nubi MCP server on its own subdomain, not on a
+/// port next to the engine.
+const HOSTED_MCP: &[(&str, &str)] = &[
+    ("api.nubi.chat", "mcp.nubi.chat"),
+    ("chat.nubi.chat", "mcp.nubi.chat"),
+    ("chat.poimen.io", "mcp.poimen.io"),
+];
+
+const AFTER_HELP: &str = "\
+Quick start:
+  export NUBI_TOKEN=nubi_...   # nubi app: Agents > New agent (shown once)
+  nubi-agent                   # joins the token's space on https://api.nubi.chat
+                               # and answers with Claude Code (`claude`, logged in)
+
+Then mention the agent in a room, or DM it. Nothing else is required: the
+agent's name and its space come from the token.
+
+Docs: https://github.com/aprdos/nubi-agent";
+
 #[derive(Parser)]
-#[command(name = "nubi-agent")]
+#[command(name = "nubi-agent", version)]
 #[command(
-    about = "Run coding agents (Claude Code, Codex, Gemini, ...) that respond to nubi room messages"
+    about = "Put a coding agent (Claude Code, Codex, Gemini, ...) in your nubi rooms. It answers when mentioned or DMed."
 )]
-#[command(version)]
+#[command(override_usage = "nubi-agent --token <TOKEN> [OPTIONS]")]
+#[command(after_help = AFTER_HELP, after_long_help = AFTER_HELP)]
 struct Args {
-    /// Nubi server URL
-    #[arg(long, env = "NUBI_URL", default_value = "https://chat.nubi.chat")]
+    /// The agent's token (nubi_...). It names the agent and its space. Get
+    /// one in the nubi app: Agents > New agent
+    #[arg(
+        long,
+        env = "NUBI_TOKEN",
+        hide_env_values = true,
+        help_heading = "Connect"
+    )]
+    token: Option<String>,
+
+    /// The nubi engine. The hosted one is https://api.nubi.chat; a
+    /// self-hosted engine is usually http://host:9099
+    #[arg(long, env = "NUBI_URL", default_value = HOSTED_ENGINE, help_heading = "Connect")]
     url: String,
 
-    /// API token
-    #[arg(long, env = "NUBI_TOKEN")]
-    token: String,
-
-    /// Room(s) to listen to, or "*" for all
-    #[arg(long, default_value = "*")]
+    /// Room(s) to listen to, or "*" for every room the agent is in
+    #[arg(long, default_value = "*", help_heading = "Connect")]
     rooms: String,
 
-    /// Which coding-agent CLI answers messages
-    #[arg(long, env = "NUBI_HARNESS", value_enum, default_value_t = HarnessKind::Claude)]
-    harness: HarnessKind,
-
-    /// Extra system prompt, appended to the built-in one
-    #[arg(long)]
-    system_prompt: Option<String>,
-
-    /// Auto-approve every tool call the harness makes
-    #[arg(long)]
-    skip_permissions: bool,
-
-    /// Most recent room messages to include as context (the newest win a
-    /// fixed character budget as well)
-    #[arg(long, default_value = "30")]
-    context_size: usize,
-
-    /// Rate limit between responses per room (ms)
-    #[arg(long, default_value = "5000")]
-    rate_limit_ms: u64,
-
-    /// MCP server URL for nubi tools. Defaults to the engine host on port 8089
-    /// at /mcp (the standard nubi-mcp deployment).
-    #[arg(long, env = "NUBI_MCP_URL")]
+    /// The nubi MCP server that gives the CLI its nubi tools (send, search,
+    /// threads, ...). Defaults to the hosted engine's own MCP server, else
+    /// the engine host on port 8089 at /mcp
+    #[arg(long, env = "NUBI_MCP_URL", help_heading = "Connect")]
     mcp_url: Option<String>,
 
-    /// How often the typing indicator is refreshed while a turn runs, in
-    /// seconds (0 sets it once and leaves it)
-    #[arg(long, default_value = "5")]
-    heartbeat_secs: u64,
+    /// Which coding-agent CLI answers messages. It must be installed and
+    /// logged in (or given --llm-key)
+    #[arg(
+        long,
+        env = "NUBI_HARNESS",
+        value_enum,
+        default_value_t = HarnessKind::Claude,
+        help_heading = "Agent"
+    )]
+    harness: HarnessKind,
 
-    /// LLM backend for the spawned CLI. With --harness claude this defaults
-    /// to the local gateway on :5000, which is less aggressive than the raw
-    /// Anthropic API. Other harnesses use their own default unless set.
-    #[arg(long, env = "NUBI_LLM_BASE_URL")]
-    llm_base_url: Option<String>,
+    /// Persona or standing instructions, appended to the built-in prompt
+    #[arg(long, help_heading = "Agent")]
+    system_prompt: Option<String>,
 
-    /// Who serves the model: `anthropic`, `bedrock`, `vertex`, `kiro`, ...
-    /// Sent with each reply's token counts so nubi-app can price them.
-    /// Defaults to `kiro` with --harness claude on the default local gateway,
-    /// else it is read off the base URL (`anthropic` without one).
-    #[arg(long, env = "NUBI_LLM_PROVIDER")]
-    llm_provider: Option<String>,
+    /// Auto-approve every tool call the CLI makes (files, shell, ...).
+    /// Without it the agent can still talk and use nubi tools
+    #[arg(long, help_heading = "Agent")]
+    skip_permissions: bool,
 
-    /// API key for the LLM backend (the gateway's kg- prefixed key).
-    #[arg(long, env = "NUBI_LLM_KEY")]
-    llm_key: Option<String>,
-
-    /// Model for the spawned CLI. With --harness claude this defaults to
-    /// claude-opus-4-5, the newest Opus the local gateway's upstream serves.
-    /// Use the dashed form: Claude Code hangs on a dotted id such as
-    /// claude-opus-4.5. Other harnesses use their own default unless set.
-    #[arg(long, env = "NUBI_LLM_MODEL")]
+    /// Model for the CLI. Unset means the CLI's own default
+    #[arg(long, env = "NUBI_LLM_MODEL", help_heading = "Model")]
     model: Option<String>,
 
     /// Model the CLI falls back to when the primary one is overloaded
-    /// (Claude Code only). Defaults to claude-sonnet-4-6 with --harness claude.
-    #[arg(long, env = "NUBI_LLM_FALLBACK_MODEL")]
+    /// (Claude Code only)
+    #[arg(long, env = "NUBI_LLM_FALLBACK_MODEL", help_heading = "Model")]
     fallback_model: Option<String>,
 
-    /// Reasoning effort for the spawned CLI: low, medium, high, xhigh or max.
-    /// Defaults to high with --harness claude; other CLIs get none.
-    #[arg(long, env = "NUBI_LLM_EFFORT")]
+    /// Reasoning effort: low, medium, high, xhigh or max. Defaults to high
+    /// with Claude Code; other CLIs get none
+    #[arg(long, env = "NUBI_LLM_EFFORT", help_heading = "Model")]
     effort: Option<String>,
 
+    /// Base URL of the LLM API the CLI talks to (ANTHROPIC_BASE_URL for
+    /// Claude Code). Unset means the CLI's own login or key; set it to go
+    /// through a gateway or proxy
+    #[arg(long, env = "NUBI_LLM_BASE_URL", help_heading = "Model")]
+    llm_base_url: Option<String>,
+
+    /// API key for that LLM API (ANTHROPIC_API_KEY for Claude Code). Unset
+    /// means the CLI's own login
+    #[arg(
+        long,
+        env = "NUBI_LLM_KEY",
+        hide_env_values = true,
+        help_heading = "Model"
+    )]
+    llm_key: Option<String>,
+
+    /// Who serves the model (anthropic, bedrock, vertex, ...), recorded with
+    /// each reply's token usage. Read off --llm-base-url when unset
+    #[arg(long, env = "NUBI_LLM_PROVIDER", help_heading = "Model")]
+    llm_provider: Option<String>,
+
+    /// Most recent room messages to include as context (the newest also
+    /// win a fixed character budget)
+    #[arg(long, default_value = "30", help_heading = "Tuning")]
+    context_size: usize,
+
+    /// Cooldown between replies in one room, in milliseconds
+    #[arg(long, default_value = "5000", help_heading = "Tuning")]
+    rate_limit_ms: u64,
+
+    /// How often the typing indicator is refreshed while a turn runs, in
+    /// seconds (0 sets it once and leaves it)
+    #[arg(long, default_value = "5", help_heading = "Tuning")]
+    heartbeat_secs: u64,
+
     /// Compact the CLI's conversation once it fills this percentage of the
-    /// context window (Claude Code only). 0 leaves the CLI's own default.
-    #[arg(long, env = "NUBI_COMPACT_AT_PCT", default_value = "60")]
+    /// context window (Claude Code only; 0 leaves the CLI's own default)
+    #[arg(
+        long,
+        env = "NUBI_COMPACT_AT_PCT",
+        default_value = "60",
+        help_heading = "Tuning"
+    )]
     compact_at_pct: u8,
 
-    /// Kill a harness run that takes longer than this many seconds and tell
-    /// the room.
-    #[arg(long, env = "NUBI_TURN_TIMEOUT_SECS", default_value = "900")]
+    /// Kill a run that takes longer than this many seconds and tell the room
+    #[arg(
+        long,
+        env = "NUBI_TURN_TIMEOUT_SECS",
+        default_value = "900",
+        help_heading = "Tuning"
+    )]
     turn_timeout_secs: u64,
 
-    /// Do not answer anything until the agent's mandate (the skill sets
-    /// bound to it) has been fetched from the engine, and refuse a turn
-    /// while it cannot be. Off by default: an engine without mandates
-    /// simply means no mandate.
-    #[arg(long, env = "NUBI_MANDATE_STRICT")]
+    /// Answer nothing until the agent's mandate (the skill sets bound to it
+    /// in the engine) has been fetched, and refuse a turn while it cannot
+    /// be. Off by default: an engine without mandates simply means none
+    #[arg(long, env = "NUBI_MANDATE_STRICT", help_heading = "Skills")]
     mandate_strict: bool,
 
     /// Never load skills from ~/.nubi/skills or the agent's own skills
-    /// directory; only room skills and the mandate.
-    #[arg(long, env = "NUBI_NO_LOCAL_SKILLS")]
+    /// directory; only room skills and the mandate
+    #[arg(long, env = "NUBI_NO_LOCAL_SKILLS", help_heading = "Skills")]
     no_local_skills: bool,
 }
 
-/// Derive the standard nubi-mcp URL from the engine URL: same host, port 8089,
-/// path /mcp. Falls back to a localhost default if the engine URL has no host.
-/// For the production domain (chat.nubi.chat), uses mcp.nubi.chat instead.
+/// The nubi MCP server that goes with an engine URL: the hosted engines'
+/// own subdomain, else the same host on port 8089 at /mcp (the standard
+/// self-hosted nubi-mcp deployment). Localhost when the URL has no host.
 fn default_mcp_url(engine_url: &str) -> String {
     let (scheme, rest) = engine_url.split_once("://").unwrap_or(("http", engine_url));
     let authority = rest.split('/').next().unwrap_or(rest);
     let host = authority.split(':').next().unwrap_or(authority);
     let host = if host.is_empty() { "localhost" } else { host };
 
-    // Production uses dedicated subdomains instead of port-based routing
-    if host == "chat.nubi.chat" {
-        return format!("{}://mcp.nubi.chat/mcp", scheme);
+    if let Some((_, mcp)) = HOSTED_MCP.iter().find(|(engine, _)| *engine == host) {
+        return format!("{scheme}://{mcp}/mcp");
     }
-
-    format!("{}://{}:8089/mcp", scheme, host)
+    format!("{scheme}://{host}:8089/mcp")
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
 
-    let nubi = NubiClient::connect(&args.url, &args.token).await?;
+    let Some(token) = args.token.filter(|t| !t.trim().is_empty()) else {
+        eprintln!(
+            "nubi-agent: no token.\n\n\
+             Pass --token nubi_... or set NUBI_TOKEN. The token names the agent and its space;\n\
+             get one in the nubi app: Agents > New agent (it is shown once).\n\n\
+             Run 'nubi-agent --help' for everything else."
+        );
+        std::process::exit(2);
+    };
+
+    // Cheap, and before the engine: a missing CLI is the most common
+    // first-run problem, and it should not hide behind a connection retry.
+    let bin = args.harness.harness().binary();
+    if let Err(e) = tokio::process::Command::new(bin)
+        .arg("--version")
+        .output()
+        .await
+    {
+        // `output` fails only when the process cannot be started; a CLI
+        // that runs and exits non-zero is present, and the first turn
+        // reports what it prints.
+        if e.kind() == std::io::ErrorKind::NotFound {
+            anyhow::bail!(
+                "'{}' not found on PATH. Install it first:\n  {}\nor pick another CLI with --harness.",
+                bin,
+                args.harness.harness().install_hint()
+            );
+        }
+        anyhow::bail!("Cannot run '{}': {}", bin, e);
+    }
+
+    let nubi = NubiClient::connect(&args.url, &token).await?;
 
     let agent_id = nubi.agent_id().to_string();
     let mcp_url = Some(args.mcp_url.unwrap_or_else(|| default_mcp_url(&args.url)));
 
-    let default_gateway = args.harness == HarnessKind::Claude && args.llm_base_url.is_none();
-    let llm_provider = args.llm_provider.clone().unwrap_or_else(|| {
-        if default_gateway {
-            "kiro".to_string()
-        } else {
-            infer_provider(args.llm_base_url.as_deref(), args.harness)
-        }
-    });
-    let (llm_base_url, model, fallback_model, effort) = match args.harness {
-        HarnessKind::Claude => (
-            Some(
-                args.llm_base_url
-                    .unwrap_or_else(|| "http://localhost:5000".to_string()),
-            ),
-            Some(args.model.unwrap_or_else(|| "claude-opus-4-5".to_string())),
-            Some(
-                args.fallback_model
-                    .unwrap_or_else(|| "claude-sonnet-4-6".to_string()),
-            ),
-            Some(args.effort.unwrap_or_else(|| "high".to_string())),
-        ),
-        _ => (
-            args.llm_base_url,
-            args.model,
-            args.fallback_model,
-            args.effort,
-        ),
+    let llm_provider = args
+        .llm_provider
+        .clone()
+        .unwrap_or_else(|| infer_provider(args.llm_base_url.as_deref(), args.harness));
+    // Claude Code gets an effort level by default; everything else about the
+    // model is the CLI's own unless set, so a logged-in CLI just works.
+    let effort = match args.harness {
+        HarnessKind::Claude => Some(args.effort.unwrap_or_else(|| "high".to_string())),
+        _ => args.effort,
     };
 
     let config = AgentConfig {
@@ -173,11 +232,11 @@ async fn main() -> anyhow::Result<()> {
         rate_limit_ms: args.rate_limit_ms,
         mcp_url,
         heartbeat_interval_secs: args.heartbeat_secs,
-        llm_base_url,
+        llm_base_url: args.llm_base_url,
         llm_provider,
         llm_api_key: args.llm_key,
-        llm_model: model,
-        llm_fallback_model: fallback_model,
+        llm_model: args.model,
+        llm_fallback_model: args.fallback_model,
         llm_effort: effort,
         compact_at_pct: (args.compact_at_pct > 0).then_some(args.compact_at_pct.min(100)),
         turn_timeout_secs: args.turn_timeout_secs,
@@ -234,7 +293,8 @@ fn infer_provider(base_url: Option<&str>, harness: HarnessKind) -> String {
 #[cfg(test)]
 mod tests {
     use super::HarnessKind;
-    use super::{default_mcp_url, infer_provider};
+    use super::{default_mcp_url, infer_provider, Args, HOSTED_ENGINE};
+    use clap::{CommandFactory, Parser};
 
     #[test]
     fn provider_is_read_off_the_base_url() {
@@ -269,10 +329,48 @@ mod tests {
             default_mcp_url("http://localhost:9099/"),
             "http://localhost:8089/mcp"
         );
-        // Production domain uses dedicated subdomain
+        // Hosted engines keep nubi-mcp on its own subdomain.
         assert_eq!(
-            default_mcp_url("https://chat.nubi.chat"),
+            default_mcp_url("https://api.nubi.chat"),
             "https://mcp.nubi.chat/mcp"
         );
+        assert_eq!(
+            default_mcp_url("https://chat.poimen.io/"),
+            "https://mcp.poimen.io/mcp"
+        );
+        assert_eq!(default_mcp_url(HOSTED_ENGINE), "https://mcp.nubi.chat/mcp");
+    }
+
+    /// The minimal invocation: a token, and every other default is one a
+    /// newcomer can live with (hosted engine, the CLI's own model and
+    /// login, no gateway).
+    #[test]
+    fn a_token_is_enough() {
+        let args = Args::try_parse_from(["nubi-agent", "--token", "nubi_x"]).unwrap();
+        assert_eq!(args.token.as_deref(), Some("nubi_x"));
+        assert_eq!(args.url, HOSTED_ENGINE);
+        assert_eq!(args.harness, HarnessKind::Claude);
+        assert!(args.llm_base_url.is_none());
+        assert!(args.llm_key.is_none());
+        assert!(args.model.is_none());
+        assert!(args.fallback_model.is_none());
+        assert_eq!(args.rooms, "*");
+    }
+
+    /// The help text tells a newcomer the two things they need and never
+    /// mentions one deployment's internals.
+    #[test]
+    fn help_explains_itself() {
+        let help = Args::command().render_long_help().to_string();
+        assert!(help.contains("Quick start:"), "{help}");
+        assert!(help.contains("Agents > New agent"), "{help}");
+        assert!(help.contains("https://api.nubi.chat"), "{help}");
+        for heading in ["Connect:", "Agent:", "Model:", "Tuning:", "Skills:"] {
+            assert!(help.contains(heading), "missing {heading}:\n{help}");
+        }
+        for leak in ["gateway on :5000", "kg-", "kiro"] {
+            assert!(!help.contains(leak), "help leaks {leak:?}:\n{help}");
+        }
+        Args::command().debug_assert();
     }
 }

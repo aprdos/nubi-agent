@@ -35,6 +35,19 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const CONNECT_BACKOFF_START: Duration = Duration::from_secs(1);
 const CONNECT_BACKOFF_MAX: Duration = Duration::from_secs(60);
 
+/// The start of an error body, for a message: the engine's own error JSON is
+/// short, and anything longer is not worth echoing into a log.
+fn short(body: &str) -> String {
+    const MAX: usize = 300;
+    let mut chars = body.chars();
+    let out: String = chars.by_ref().take(MAX).collect();
+    if chars.next().is_some() {
+        format!("{out}...")
+    } else {
+        out
+    }
+}
+
 /// Every request here is short — the SSE stream runs on its own
 /// eventsource-client, so a whole-request timeout is safe.
 fn http_client() -> Client {
@@ -185,6 +198,7 @@ impl NubiClient {
         let base_url = base_url.trim_end_matches('/');
         let client = http_client();
         let mut backoff = CONNECT_BACKOFF_START;
+        let mut attempts = 0u32;
 
         let resp = loop {
             match client
@@ -195,12 +209,23 @@ impl NubiClient {
             {
                 Ok(resp) => break resp,
                 Err(e) => {
+                    attempts += 1;
                     eprintln!(
                         "[nubi-agent] Cannot reach nubi at {}: {}, retrying in {}s",
                         base_url,
                         e,
                         backoff.as_secs()
                     );
+                    // Once: a wrong URL looks exactly like an engine that is
+                    // down, and only the person at the keyboard can tell.
+                    if attempts == 1 {
+                        eprintln!(
+                            "[nubi-agent] Is that the right engine? --url / NUBI_URL should be the engine \
+                             itself (hosted: https://api.nubi.chat); it answers GET \
+                             {}/healthz. Retrying until it does.",
+                            base_url
+                        );
+                    }
                     tokio::time::sleep(backoff).await;
                     backoff = (backoff * 2).min(CONNECT_BACKOFF_MAX);
                 }
@@ -209,7 +234,19 @@ impl NubiClient {
 
         if !resp.status().is_success() {
             let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
+            let body = short(&resp.text().await.unwrap_or_default());
+            if status == reqwest::StatusCode::UNAUTHORIZED
+                || status == reqwest::StatusCode::FORBIDDEN
+            {
+                anyhow::bail!(
+                    "Rejected by nubi at {}: {} {}\n\
+                     The token is wrong, revoked, or for another engine. Check --token / \
+                     NUBI_TOKEN; a new one comes from the nubi app: Agents > New agent.",
+                    base_url,
+                    status,
+                    body
+                );
+            }
             anyhow::bail!("Rejected by nubi at {}: {} {}", base_url, status, body);
         }
 

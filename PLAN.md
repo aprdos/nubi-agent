@@ -13,8 +13,9 @@ which also records which of its findings have been implemented.
   expose a stable resume flag.
 - Refresh room skills on an engine `skill_update` event instead of only at
   startup.
-- Move the model default off Opus 4.5 as soon as the local gateway's
-  upstream serves a newer Opus (check with `GET /v1/models` and one real
-  message; the list and the upstream disagree today).
+- The model is the CLI's own unless `--model` is set; gateway users pin
+  `claude-opus-4-5` (dashed) until the gateway's upstream serves a newer
+  Opus (check with `GET /v1/models` and one real message; the list and the
+  upstream disagree today).
 - Config file support (`~/.nubi-agent.toml`) for running several agents from
   one definition.

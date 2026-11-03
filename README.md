@@ -1,63 +1,76 @@
 # nubi-agent
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![Rust](https://img.shields.io/badge/rust-1.80%2B-orange.svg)](https://www.rust-lang.org/)
+Put a coding agent (Claude Code, Codex, Gemini CLI, ...) in your
+[nubi](https://github.com/aprdos/nubi) rooms. Mention it or DM it, and it
+answers: reads the room, uses nubi tools, remembers between messages.
 
-> Run autonomous AI agents powered by Claude Code, Codex, Gemini CLI and friends in your nubi chat rooms.
+## Quick start
 
-**nubi-agent** connects coding-agent CLIs to [nubi](https://github.com/aprdos/nubi), letting you deploy AI agents that respond to messages, use tools, and collaborate with humans in real-time.
+You need [Rust](https://rustup.rs/) and [Claude Code](https://docs.claude.com/en/docs/claude-code)
+installed and logged in (`claude` works in your terminal).
+
+**1. Install**
+
+```bash
+cargo install --locked --git https://github.com/aprdos/nubi-agent
+```
+
+**2. Get a token.** In the nubi app go to *Agents → New agent*, name it, and
+copy the token it shows (once). The token carries the agent's name and its
+space, so there is nothing else to configure.
+
+**3. Run**
+
+```bash
+nubi-agent --token nubi_...
+```
+
+```
+[nubi-agent] Workspace at "~/.nubi-agents/helper"
+[nubi-agent] Connected as 'helper' in space 'acme', listening for mentions...
+[nubi-agent] Mention @helper in a room it is in, or DM it, and it answers there.
+```
+
+**4. Say hi.** Open a DM with the agent in the app, or write `@helper hello`
+in a room it is in. The typing indicator comes on, and it replies.
+
+That is the whole setup. The same thing as a service, with the token in the
+environment, is [`examples/quickstart.sh`](examples/quickstart.sh).
+
+### If it does not work
+
+| You see | It means |
+|---|---|
+| `no token` | Pass `--token` or set `NUBI_TOKEN`. |
+| `'claude' not found on PATH` | Install the CLI (the message says how), or pick another with `--harness`. |
+| `Cannot reach nubi at ...` | `--url` / `NUBI_URL` must be the engine. The hosted one is `https://api.nubi.chat` (the default); a self-hosted engine is usually `http://host:9099`. A nubi engine answers `GET <url>/healthz`. |
+| `Rejected by nubi ... 401` | The token is wrong, revoked, or for another engine. Make a new one in the app. |
+| Connected, but no reply | The agent only answers DMs and messages that mention it, in rooms it is a member of. Invite it to the room first. |
+| Replies say the turn failed | The CLI could not reach its model. Run `claude -p hi` in a terminal: whatever is wrong there is wrong here. |
 
 ---
 
-## Features
+## What you just ran
 
-- **Autonomous responses** — Agents respond to @mentions and DMs automatically
-- **Tool use via MCP** — Connect to nubi's MCP server for cross-room messaging, search, threads and more
-- **Continuity** — With Claude Code, each room keeps a resumable conversation, so follow-ups remember what the agent did
-- **Context-aware** — Prompts carry message indexes, ages, who was mentioned and who was asked to answer, plus the anchor message of a thread
-- **Routed replies** — The model says who a reply is for (`mentions`, `expect_reply`) instead of the harness guessing
-- **Recovers from failures** — Timeouts, one retry, a fallback model, and a one-line note to the room when a turn still fails
-- **Rate limiting** — Prevents spam with per-room cooldowns
-- **Skills and mandates** — Skills from files and skill rooms, loaded on demand; engine-resolved mandates enforced and hash-stamped
+- **Engine:** `https://api.nubi.chat` unless you pass `--url`. Staging is
+  `https://chat.poimen.io`; a self-hosted engine is wherever you run it.
+- **Space and identity:** from the token. There is no `--space` or
+  `--agent` flag.
+- **Which messages:** DMs, and messages in any room the agent is in that
+  mention it (`--rooms` narrows that to one room).
+- **The model:** Claude Code's own login and default model. `--model`,
+  `--llm-base-url` and `--llm-key` change that, see [Model](#model).
+- **Tools:** the CLI gets the nubi MCP server (`nubi_send`, search,
+  threads, ...) for the hosted engine automatically. Elsewhere it is derived
+  as `<engine host>:8089/mcp`; pass `--mcp-url` if yours differs.
+- **Memory:** everything the agent keeps lives in `~/.nubi-agents/<agent>/`,
+  see [Memory, sessions and skills](#memory-sessions-and-skills).
 
----
-
-## Quick Start
-
-### Prerequisites
-
-- [Rust](https://rustup.rs/) 1.80+
-- One supported agent CLI installed (see [Harnesses](#harnesses)); Claude Code is the default
-- A nubi space with an agent token
-
-### Install
-
-```bash
-cargo install --git https://github.com/aprdos/nubi-agent
-```
-
-### Run
-
-```bash
-nubi-agent \
-  --url http://your-server:9099 \
-  --token nubi_xxx
-```
-
-Or with environment variables:
-
-```bash
-export NUBI_URL=http://your-server:9099
-export NUBI_TOKEN=nubi_xxx
-
-nubi-agent
-```
-
-The agent's identity comes from the token.
+Run `nubi-agent --help` for every flag; they are grouped by what they are for.
 
 ---
 
-## How It Works
+## How it works
 
 ```mermaid
 sequenceDiagram
@@ -84,40 +97,59 @@ sequenceDiagram
     A->>N: POST reply (or nothing when post is false)
 ```
 
-**Flow:**
 1. nubi-agent listens to nubi's SSE stream for @mentions and DMs
 2. Messages that arrive within half a second of each other are answered in one turn
 3. The prompt carries the room's recent history (with indexes, ages and mention metadata), the thread's anchor message, and the agent's own last few turns in that room
 4. The harness CLI runs in the agent's workspace, connected to nubi-mcp through a per-run MCP config
 5. The reply is posted with the routing the model chose, or not posted when the model already answered through tools
 
+Failures are handled: a turn has a timeout and one retry, Claude Code gets a
+fallback model, and when a turn still fails the room gets a one-line note
+instead of silence.
+
 ---
 
-## Configuration
+## Options
 
 | Option | Env | Default | Description |
 |--------|-----|---------|-------------|
-| `--url` | `NUBI_URL` | `https://chat.nubi.chat` | Nubi server URL |
-| `--token` | `NUBI_TOKEN` | *required* | API token (the agent identity comes from it) |
-| `--rooms` | — | `*` | Room filter (`*` = all) |
-| `--system-prompt` | — | — | Custom persona/instructions, appended to the built-in prompt |
-| `--mcp-url` | `NUBI_MCP_URL` | engine host, port 8089, `/mcp` | MCP server for tools |
+| `--token` | `NUBI_TOKEN` | *required* | The agent's token; names the agent and its space |
+| `--url` | `NUBI_URL` | `https://api.nubi.chat` | The engine |
+| `--rooms` | — | `*` | One room id, or `*` for every room the agent is in |
+| `--mcp-url` | `NUBI_MCP_URL` | hosted: the engine's MCP server; else engine host, port 8089, `/mcp` | MCP server for nubi tools |
+| `--harness` | `NUBI_HARNESS` | `claude` | Which agent CLI answers, see [Harnesses](#harnesses) |
+| `--system-prompt` | — | — | Persona or standing instructions, appended to the built-in prompt |
+| `--skip-permissions` | — | `false` | Auto-approve every tool call the CLI makes (files, shell). Without it the agent can still talk and use nubi tools |
+| `--model` | `NUBI_LLM_MODEL` | the CLI's own | Model passed to the CLI |
+| `--fallback-model` | `NUBI_LLM_FALLBACK_MODEL` | — | Model the CLI falls back to when the primary is overloaded (Claude Code) |
+| `--effort` | `NUBI_LLM_EFFORT` | `high` for claude | Reasoning effort: `low`, `medium`, `high`, `xhigh`, `max` |
+| `--llm-base-url` | `NUBI_LLM_BASE_URL` | — | LLM API the CLI talks to (`ANTHROPIC_BASE_URL` for Claude Code) |
+| `--llm-key` | `NUBI_LLM_KEY` | — | API key for that LLM API |
+| `--llm-provider` | `NUBI_LLM_PROVIDER` | read off the base URL | Who serves the model, recorded with each reply's token usage |
 | `--context-size` | — | `30` | Most recent messages as context (the newest also win a ~24k character budget) |
 | `--rate-limit-ms` | — | `5000` | Cooldown per room |
 | `--heartbeat-secs` | — | `5` | Typing-indicator refresh interval while a turn runs (0 = set once) |
-| `--harness` | `NUBI_HARNESS` | `claude` | Which agent CLI to run, see below |
-| `--skip-permissions` | — | `false` | Auto-approve every tool call |
-| `--model` | `NUBI_LLM_MODEL` | `claude-opus-4-5` for claude, else the CLI's own | Model passed to the CLI |
-| `--fallback-model` | `NUBI_LLM_FALLBACK_MODEL` | `claude-sonnet-4-6` for claude | Model the CLI falls back to when the primary is overloaded (Claude Code) |
-| `--effort` | `NUBI_LLM_EFFORT` | `high` for claude | Reasoning effort: `low`, `medium`, `high`, `xhigh`, `max` (Claude Code) |
 | `--compact-at-pct` | `NUBI_COMPACT_AT_PCT` | `60` | Compact the CLI's conversation at this share of the context window (Claude Code; 0 = CLI default) |
 | `--turn-timeout-secs` | `NUBI_TURN_TIMEOUT_SECS` | `900` | Kill a run that takes longer and tell the room |
-| `--llm-base-url` | `NUBI_LLM_BASE_URL` | `http://localhost:5000` for claude, else unset | LLM backend override |
-| `--llm-key` | `NUBI_LLM_KEY` | — | API key for that backend |
 | `--mandate-strict` | `NUBI_MANDATE_STRICT` | `false` | Answer nothing until the agent's mandate has been fetched |
 | `--no-local-skills` | `NUBI_NO_LOCAL_SKILLS` | `false` | Skip `~/.nubi/skills` and per-agent skill files |
 
-The model default is the newest Opus the local gateway's upstream serves. Use dashed ids with Claude Code (`claude-opus-4-5`): the gateway accepts dotted ids too, but Claude Code hangs on them until `--turn-timeout-secs` kills the run. Pass `--model` to use a different backend's naming.
+### Model
+
+By default the CLI uses whatever it is logged in to, with its own default
+model. Three flags change that:
+
+- `--model` picks a model by the CLI's naming (`claude-sonnet-4-6`,
+  `gpt-5-codex`, ...).
+- `--llm-base-url` and `--llm-key` send the CLI through another API: a
+  gateway, a proxy, Bedrock-style endpoints. For Claude Code they become
+  `ANTHROPIC_BASE_URL` and `ANTHROPIC_API_KEY`. With a gateway, use dashed
+  model ids (`claude-opus-4-5`, not `claude-opus-4.5`): Claude Code hangs on
+  the dotted form until `--turn-timeout-secs` kills the run.
+- `--llm-provider` names who actually serves the model (`anthropic`,
+  `bedrock`, `vertex`, `kiro`, ...) when the base URL does not say. It is
+  recorded with each reply's token usage so nubi-app can price it; it does
+  not change what is called.
 
 ---
 
@@ -140,7 +172,7 @@ MCP server is wired in per run; nothing in your own global CLI config is touched
 | `copilot` | `copilot -p` | `AGENTS.md` | leads the prompt | no | `COPILOT_PROVIDER_BASE_URL` / `COPILOT_PROVIDER_API_KEY` |
 
 Notes:
-- Claude Code runs with `--output-format json` and a reply schema, so the
+- Claude Code runs with a JSON output format and a reply schema, so the
   harness learns whether a run failed, how many model turns it took, what it
   cost, and who the reply is for. Other CLIs return plain text, which is
   posted as-is with nobody mentioned.
@@ -180,6 +212,38 @@ Everything an agent keeps lives in its workspace, `~/.nubi-agents/<agent>/`:
   skills with a one-line index in the system prompt. Mandated skills are
   inlined in full, since they always apply.
 
+How skill sets, mandates and the hash fit together across the engine, this
+agent and the desktop app is in [docs/mandates.md](docs/mandates.md).
+
+---
+
+## More examples
+
+**Code reviewer bot:**
+
+```bash
+nubi-agent \
+  --token nubi_xxx \
+  --system-prompt "You are a senior engineer. Review code for bugs, security issues, and style." \
+  --effort xhigh \
+  --skip-permissions
+```
+
+**Same agent on Codex:**
+
+```bash
+nubi-agent --token nubi_xxx --harness codex --model gpt-5-codex
+```
+
+**Self-hosted engine, through an LLM gateway:**
+
+```bash
+nubi-agent \
+  --url http://localhost:9099 \
+  --token nubi_xxx \
+  --llm-base-url http://localhost:5000 --llm-key kg-... --model claude-opus-4-5
+```
+
 ---
 
 ## Evaluating changes
@@ -201,39 +265,13 @@ transcripts. `cli_cost_usd` is the CLI's own estimate at its list prices,
 whatever actually served the model.
 
 Each posted reply also carries its tokens per model as `metadata.usage`,
-with the provider that served them (`--llm-provider`: `anthropic`, `kiro`,
-`bedrock`, ...). The engine adds them up per agent and day; nubi-app prices
-them from its own table, and shows a subscription provider such as Kiro as
-tokens only.
+with the provider that served them (`--llm-provider`). The engine adds them
+up per agent and day; nubi-app prices them from its own table, and shows a
+subscription provider such as Kiro as tokens only.
 
----
-
-## Examples
-
-**Code reviewer bot:**
-
-```bash
-nubi-agent \
-  --token nubi_xxx \
-  --system-prompt "You are a senior engineer. Review code for bugs, security issues, and style." \
-  --effort xhigh \
-  --skip-permissions
-```
-
-**Research assistant with MCP tools:**
-
-```bash
-nubi-agent \
-  --token nubi_xxx \
-  --mcp-url http://localhost:8089/mcp \
-  --system-prompt "You help find information and summarize documents."
-```
-
-**Same agent on Codex:**
-
-```bash
-nubi-agent --token nubi_xxx --harness codex --model gpt-5-codex
-```
+`tests/quickstart.rs` runs the quick start for real in CI: the built binary,
+started by `examples/quickstart.sh`, against a small in-test engine and a
+fake `claude`, and checks that a DM gets a reply.
 
 ---
 
@@ -252,8 +290,9 @@ nubi-agent/
 │   ├── nubi.rs      # Nubi API client
 │   ├── buffer.rs    # Message context buffer
 │   └── types.rs     # SSE data types
-├── examples/        # harness_smoke, eval
-└── docs/            # agent-audit.md, eval cases
+├── examples/        # quickstart.sh, harness_smoke, eval
+├── tests/           # quickstart: the README command, end to end
+└── docs/            # mandates, agent-audit, eval cases
 ```
 
 ---
@@ -267,4 +306,4 @@ nubi-agent/
 
 ## License
 
-MIT © 2024
+MIT

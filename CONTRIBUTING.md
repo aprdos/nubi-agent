@@ -6,14 +6,14 @@ Thanks for your interest in contributing. This document covers the standards and
 
 ### Prerequisites
 
-- Rust 1.70+ (install via [rustup](https://rustup.rs/))
+- Rust 1.80+ (install via [rustup](https://rustup.rs/))
 - Git
 
 ### Development Setup
 
 ```bash
 # Clone the repository
-git clone https://github.com/your-org/nubi-agent.git
+git clone https://github.com/aprdos/nubi-agent.git
 cd nubi-agent
 
 # Build the project
