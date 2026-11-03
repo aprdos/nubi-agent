@@ -141,7 +141,10 @@ fn fake_claude(dir: &std::path::Path) {
         "#!/bin/sh\nfor a in \"$@\"; do [ \"$a\" = --version ] && { echo '0.0.0 (fake)'; exit 0; }; done\n",
     );
     for line in lines {
-        script.push_str(&format!("echo '{}'\n", line));
+        // Single-quoted for the shell, so a quote inside the JSON must close,
+        // escape and reopen the quoting.
+        let escaped = line.to_string().replace('\'', "'\\''");
+        script.push_str(&format!("echo '{}'\n", escaped));
     }
     let path = dir.join("claude");
     std::fs::write(&path, script).unwrap();
@@ -249,7 +252,7 @@ fn the_quick_start_asks_for_a_token() {
 #[test]
 fn the_binary_explains_a_missing_token() {
     let out = Command::new(env!("CARGO_BIN_EXE_nubi-agent"))
-        .env_remove("NUBI_TOKEN")
+        .env_clear()
         .output()
         .unwrap();
     assert_eq!(out.status.code(), Some(2));
