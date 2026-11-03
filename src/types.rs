@@ -47,7 +47,7 @@ pub struct Part {
 }
 
 /// Outbound message for POST
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct SendMessage {
     pub message_id: String,
     pub parts: Vec<SendPart>,
@@ -57,7 +57,7 @@ pub struct SendMessage {
     pub metadata: Option<Value>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct SendPart {
     pub kind: &'static str,
     pub text: String,

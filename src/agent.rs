@@ -1,7 +1,7 @@
 use eventsource_client::Client;
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -13,10 +13,10 @@ use tokio::time::interval;
 use crate::buffer::{BufferedMessage, RoomBuffer};
 use crate::harness::{age, now_ms, write_private, CliRuntime, HarnessKind, McpServer};
 use crate::mandate::{FetchError, Fetched, Mandate, MandateLoader};
-use crate::nubi::{usage_metadata, NubiClient, Outgoing};
+use crate::nubi::{usage_metadata, NubiClient, Outgoing, Refused};
 use crate::runtime::{AgentRuntime, RunOutput, Session, ThreadAnchor, Trigger, TurnInput};
 use crate::skills::{CompositeSkillLoader, RoomSkillLoader, Skill, SkillLoader};
-use crate::types::{MandateUpdate, SseData};
+use crate::types::{MandateUpdate, SendMessage, SseData};
 
 /// How long a room's incoming burst is allowed to settle before we answer.
 /// Everything that arrived by then is answered in one turn.
@@ -182,6 +182,20 @@ impl Drop for InFlightEntry<'_> {
     }
 }
 
+/// Append one line to a room's journal.
+fn append_journal(path: &Path, line: &str) {
+    use std::io::Write;
+    let entry = format!("{}\t{}\n", now_ms(), short(line, 300));
+    let written = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .and_then(|mut f| f.write_all(entry.as_bytes()));
+    if let Err(e) = written {
+        eprintln!("[nubi-agent] Cannot write journal {:?}: {}", path, e);
+    }
+}
+
 /// The room a family is named after: a thread's parent, else the room itself.
 fn family_of(room_id: &str) -> String {
     parse_thread_room(room_id)
@@ -196,12 +210,84 @@ struct Dispatch {
     active: HashSet<String>,
 }
 
-/// Read positions: highest index delivered per room, and what the server has acked.
+/// Read positions: highest index delivered per room, what the server has
+/// acked, and the mentions not yet answered. A room's offset is committed
+/// only up to just before its first unanswered mention, so a restart
+/// redelivers what the agent had queued or was still working on instead of
+/// dropping it.
 #[derive(Default)]
 struct Offsets {
     seen: HashMap<String, u64>,
     committed: HashMap<String, u64>,
+    unanswered: HashMap<String, BTreeSet<u64>>,
 }
+
+impl Offsets {
+    /// What can be committed for a room now.
+    fn committable(&self, room_id: &str) -> u64 {
+        let seen = self.seen.get(room_id).copied().unwrap_or(0);
+        match self.unanswered.get(room_id).and_then(|u| u.first()) {
+            Some(&first) => seen.min(first.saturating_sub(1)),
+            None => seen,
+        }
+    }
+}
+
+/// Mentions being answered. Dropping this marks them answered, however the
+/// turn ended; a reply that could not be posted yet carries it along until
+/// it is.
+struct Answering {
+    offsets: Arc<Mutex<Offsets>>,
+    room_id: String,
+    indexes: Vec<u64>,
+}
+
+impl Answering {
+    /// Leave the mentions unanswered: the turn will be tried again.
+    fn keep(mut self) {
+        self.indexes.clear();
+    }
+}
+
+impl Drop for Answering {
+    fn drop(&mut self) {
+        // Never panic in drop: a poisoned map just keeps the offset back.
+        if let Ok(mut offsets) = self.offsets.lock() {
+            if let Some(unanswered) = offsets.unanswered.get_mut(&self.room_id) {
+                for i in &self.indexes {
+                    unanswered.remove(i);
+                }
+                if unanswered.is_empty() {
+                    offsets.unanswered.remove(&self.room_id);
+                }
+            }
+        }
+    }
+}
+
+/// How a turn ended, for the room's worker.
+enum TurnEnd {
+    Answered,
+    /// Refused by the mandate check before it ran: its messages are still
+    /// unanswered and go back in the queue.
+    Refused,
+}
+
+/// How long a room waits before trying a refused turn again.
+#[cfg(not(test))]
+const REFUSED_RETRY: Duration = Duration::from_secs(30);
+#[cfg(test)]
+const REFUSED_RETRY: Duration = Duration::from_millis(20);
+
+/// When a reply that could not be posted is tried again, after the turn.
+#[cfg(not(test))]
+const LATE_DELIVERY: [Duration; 3] = [
+    Duration::from_secs(30),
+    Duration::from_secs(120),
+    Duration::from_secs(600),
+];
+#[cfg(test)]
+const LATE_DELIVERY: [Duration; 3] = [Duration::from_millis(20); 3];
 
 /// The harness conversation a room is being served in.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -239,7 +325,7 @@ struct Shared {
     runtime: Box<dyn AgentRuntime>,
     buffer: Mutex<RoomBuffer>,
     dispatch: Mutex<Dispatch>,
-    offsets: Mutex<Offsets>,
+    offsets: Arc<Mutex<Offsets>>,
     /// Whether a room had never acked an offset when we first saw it. Decided
     /// once and never revised, so the flusher's own commits can't flip it.
     cold: Mutex<HashMap<String, bool>>,
@@ -359,7 +445,7 @@ impl Agent {
             runtime,
             buffer: Mutex::new(buffer),
             dispatch: Mutex::new(Dispatch::default()),
-            offsets: Mutex::new(Offsets::default()),
+            offsets: Arc::new(Mutex::new(Offsets::default())),
             cold: Mutex::new(HashMap::new()),
             primed: Mutex::new(HashSet::new()),
             // Fair: permits go out in the order they were asked for.
@@ -571,9 +657,9 @@ async fn flush_offsets(shared: Arc<Shared>) {
             let offsets = shared.offsets.lock().unwrap();
             offsets
                 .seen
-                .iter()
-                .filter(|(room, idx)| offsets.committed.get(*room).copied().unwrap_or(0) < **idx)
-                .map(|(room, idx)| (room.clone(), *idx))
+                .keys()
+                .map(|room| (room.clone(), offsets.committable(room)))
+                .filter(|(room, idx)| offsets.committed.get(room).copied().unwrap_or(0) < *idx)
                 .collect()
         };
 
@@ -930,7 +1016,11 @@ impl Shared {
         let entry = sse_data.entry;
 
         // Every delivered entry advances the read position, answered or not.
-        self.note_offset(&room_id, entry.global_index);
+        // One we already had is a redelivery (a reconnect resumes from the
+        // committed offset, which trails what we have seen): handled once.
+        if !self.note_offset(&room_id, entry.global_index) {
+            return Ok(());
+        }
 
         if entry.is_message() {
             self.buffer.lock().unwrap().push(&room_id, &entry);
@@ -960,6 +1050,13 @@ impl Shared {
             return Ok(());
         }
 
+        self.offsets
+            .lock()
+            .unwrap()
+            .unanswered
+            .entry(room_id.clone())
+            .or_default()
+            .insert(entry.global_index);
         self.enqueue(
             &room_id,
             Trigger {
@@ -974,11 +1071,19 @@ impl Shared {
         Ok(())
     }
 
-    fn note_offset(&self, room_id: &str, index: u64) {
+    /// Record a delivered entry. False when the room already got it.
+    fn note_offset(&self, room_id: &str, index: u64) -> bool {
         let mut offsets = self.offsets.lock().unwrap();
-        let seen = offsets.seen.entry(room_id.to_string()).or_insert(0);
-        if index > *seen {
-            *seen = index;
+        match offsets.seen.get_mut(room_id) {
+            Some(seen) if index <= *seen => false,
+            Some(seen) => {
+                *seen = index;
+                true
+            }
+            None => {
+                offsets.seen.insert(room_id.to_string(), index);
+                true
+            }
         }
     }
 
@@ -1315,19 +1420,49 @@ impl Shared {
     }
 
     fn journal_append(&self, room_id: &str, line: &str) {
-        let Some(path) = self.journal_path(room_id) else {
-            return;
-        };
-        use std::io::Write;
-        let entry = format!("{}\t{}\n", now_ms(), short(line, 300));
-        let written = fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)
-            .and_then(|mut f| f.write_all(entry.as_bytes()));
-        if let Err(e) = written {
-            eprintln!("[nubi-agent] Cannot write journal {:?}: {}", path, e);
+        if let Some(path) = self.journal_path(room_id) {
+            append_journal(&path, line);
         }
+    }
+
+    /// Keep trying to post a reply the turn could not, so a long run's answer
+    /// is not lost to an engine blip. Its mentions stay unanswered (and their
+    /// offset uncommitted) until it lands or is given up on.
+    fn deliver_later(&self, room_id: &str, msg: SendMessage, answering: Answering) {
+        let nubi = self.nubi.clone();
+        let room_id = room_id.to_string();
+        let journal = self.journal_path(&room_id);
+        tokio::spawn(async move {
+            let _answering = answering;
+            let mut last_err = String::new();
+            for delay in LATE_DELIVERY {
+                tokio::time::sleep(delay).await;
+                match nubi.send(&room_id, &msg).await {
+                    Ok(()) => {
+                        eprintln!("[nubi-agent] Delivered the late reply to {}", room_id);
+                        if let Some(path) = &journal {
+                            append_journal(path, "the reply above was posted late");
+                        }
+                        return;
+                    }
+                    Err(e) if e.downcast_ref::<Refused>().is_some() => {
+                        last_err = e.to_string();
+                        break;
+                    }
+                    Err(e) => last_err = e.to_string(),
+                }
+            }
+            eprintln!(
+                "[nubi-agent] Gave up posting the reply to {}: {}",
+                room_id, last_err
+            );
+            if let Some(path) = &journal {
+                append_journal(
+                    path,
+                    &format!("the reply above was never posted: {last_err}"),
+                );
+            }
+        });
     }
 
     /// The session to run this room's turn in, when the runtime keeps them:
@@ -1438,7 +1573,7 @@ impl Shared {
 
             // Taken before the pending messages are: whatever arrives while
             // the family is busy is answered in this one turn.
-            let _family = self.enter_family(&room_id).await;
+            let family = self.enter_family(&room_id).await;
 
             let triggers = {
                 let mut dispatch = self.dispatch.lock().unwrap();
@@ -1451,17 +1586,37 @@ impl Shared {
                 }
             };
 
-            if let Err(e) = self.reply(&room_id, &triggers).await {
-                eprintln!("[nubi-agent] Error in {}: {}", room_id, e);
+            match self.reply(&room_id, &triggers).await {
+                Ok(TurnEnd::Answered) => {}
+                Ok(TurnEnd::Refused) => {
+                    // Back at the front, ahead of anything newer, and tried
+                    // again once the mandate may be back. The family is
+                    // free meanwhile.
+                    {
+                        let mut dispatch = self.dispatch.lock().unwrap();
+                        let pending = dispatch.pending.entry(room_id.clone()).or_default();
+                        let newer = std::mem::take(pending);
+                        *pending = triggers;
+                        pending.extend(newer);
+                    }
+                    drop(family);
+                    tokio::time::sleep(REFUSED_RETRY).await;
+                }
+                Err(e) => eprintln!("[nubi-agent] Error in {}: {}", room_id, e),
             }
         }
     }
 
     /// One turn: run the harness for every pending message in the room, post
     /// what it says, and tell the room when that could not be done.
-    async fn reply(&self, room_id: &str, triggers: &[Trigger]) -> anyhow::Result<()> {
+    async fn reply(&self, room_id: &str, triggers: &[Trigger]) -> anyhow::Result<TurnEnd> {
         let Some(newest) = triggers.last() else {
-            return Ok(());
+            return Ok(TurnEnd::Answered);
+        };
+        let answering = Answering {
+            offsets: Arc::clone(&self.offsets),
+            room_id: room_id.to_string(),
+            indexes: triggers.iter().map(|t| t.index).collect(),
         };
         let _permit = match self.replies.try_acquire() {
             Ok(permit) => permit,
@@ -1472,9 +1627,13 @@ impl Shared {
         };
 
         if let Err(reason) = self.check_mandate().await {
-            eprintln!("[nubi-agent] Refusing to answer in {}: {}", room_id, reason);
+            eprintln!(
+                "[nubi-agent] Refusing to answer in {} for now: {}",
+                room_id, reason
+            );
             let _ = self.nubi.set_typing(room_id, false).await;
-            return Ok(());
+            answering.keep();
+            return Ok(TurnEnd::Refused);
         }
         let _in_flight = self.start_in_flight(room_id, triggers);
 
@@ -1640,7 +1799,7 @@ impl Shared {
                     None,
                     session_kind,
                 );
-                return Ok(());
+                return Ok(TurnEnd::Answered);
             }
         };
 
@@ -1676,27 +1835,33 @@ impl Shared {
                         String::new()
                     }
                 );
-                let posted = self
-                    .nubi
-                    .post(
-                        room_id,
-                        Outgoing {
-                            text: &text,
-                            mentions: &mentions,
-                            expect_reply: expect_reply.as_deref(),
-                            mandate_hash: out.mandate_hash.as_deref(),
-                            usage: usage_metadata(
-                                &self.config.llm_provider,
-                                &per_model_usage(&out, self.config.llm_model.as_deref()),
-                            ),
-                        },
-                    )
-                    .await;
+                let msg = NubiClient::message(Outgoing {
+                    text: &text,
+                    mentions: &mentions,
+                    expect_reply: expect_reply.as_deref(),
+                    mandate_hash: out.mandate_hash.as_deref(),
+                    usage: usage_metadata(
+                        &self.config.llm_provider,
+                        &per_model_usage(&out, self.config.llm_model.as_deref()),
+                    ),
+                });
+                let posted = self.nubi.send(room_id, &msg).await;
                 // The room took a turn whether or not the post landed, so
                 // the cooldown applies either way.
                 self.buffer.lock().unwrap().mark_responded(room_id);
-                posted?;
-                format!("replied: {}", short(&text, 160))
+                match posted {
+                    Ok(()) => format!("replied: {}", short(&text, 160)),
+                    // Refused for good: sending it again would not help.
+                    Err(e) if e.downcast_ref::<Refused>().is_some() => return Err(e),
+                    Err(e) => {
+                        eprintln!(
+                            "[nubi-agent] Could not post to {} ({}); trying again later",
+                            room_id, e
+                        );
+                        self.deliver_later(room_id, msg, answering);
+                        format!("reply not posted yet: {}", short(&text, 160))
+                    }
+                }
             }
         };
         if outcome == Outcome::Tools {
@@ -1722,7 +1887,7 @@ impl Shared {
             session_kind,
         );
 
-        Ok(())
+        Ok(TurnEnd::Answered)
     }
 
     /// One structured line per turn, for grepping and for evals.
@@ -2364,6 +2529,168 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         panic!("only {} runs", fake.runs.load(Ordering::SeqCst));
+    }
+
+    /// An SSE `entry` event, as the engine streams it.
+    fn sse(room: &str, index: u64, text: &str) -> String {
+        serde_json::json!({
+            "room_id": room,
+            "entry": {
+                "global_index": index,
+                "sender": "aprido",
+                "timestamp_ms": now_ms(),
+                "payload": {"type": "message", "parts": [{"kind": "text", "text": text}]}
+            }
+        })
+        .to_string()
+    }
+
+    /// Wait until the engine holds `n` posted messages.
+    async fn posts_reach(engine: &MockEngine, n: usize) {
+        for _ in 0..400 {
+            if engine.state().posts.len() >= n {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("only {} posts", engine.state().posts.len());
+    }
+
+    fn committable(agent: &Agent, room: &str) -> u64 {
+        agent.shared.offsets.lock().unwrap().committable(room)
+    }
+
+    #[tokio::test]
+    async fn a_redelivered_message_is_answered_once() {
+        let engine = MockEngine::start(MockState::default()).await;
+        let (agent, fake) = agent(&engine, AgentConfig::default()).await;
+        let dm = "dm.aprido.support-bot";
+
+        agent.shared.ingest(&sse(dm, 7, "halo")).await.unwrap();
+        posts_reach(&engine, 1).await;
+        // A reconnect resumes from the committed offset and sends it again.
+        agent.shared.ingest(&sse(dm, 6, "earlier")).await.unwrap();
+        agent.shared.ingest(&sse(dm, 7, "halo")).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(800)).await;
+
+        assert_eq!(fake.runs.load(Ordering::SeqCst), 1);
+        assert_eq!(engine.state().posts.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn the_offset_stops_before_a_mention_still_being_answered() {
+        let engine = MockEngine::start(MockState::default()).await;
+        let (agent, fake) = agent(&engine, AgentConfig::default()).await;
+        fake.block_runs.store(true, Ordering::SeqCst);
+
+        let shared = &agent.shared;
+        shared.ingest(&sse("general", 2, "morning")).await.unwrap();
+        shared
+            .ingest(&sse("general", 3, "@support-bot can you check the deploy?"))
+            .await
+            .unwrap();
+        shared.ingest(&sse("general", 4, "thanks")).await.unwrap();
+        // Queued or running: a restart now must redeliver #3.
+        assert_eq!(committable(&agent, "general"), 2);
+
+        fake.block_runs.store(false, Ordering::SeqCst);
+        posts_reach(&engine, 1).await;
+        for _ in 0..100 {
+            if committable(&agent, "general") == 4 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(committable(&agent, "general"), 4);
+    }
+
+    #[tokio::test]
+    async fn a_reply_the_engine_could_not_take_is_posted_later() {
+        let engine = MockEngine::start(MockState {
+            // The turn's own three attempts, then the first late one.
+            post_failures: vec![503, 503, 503, 502],
+            ..Default::default()
+        })
+        .await;
+        let (agent, _fake) = agent(&engine, AgentConfig::default()).await;
+        let dm = "dm.aprido.support-bot";
+
+        agent.shared.ingest(&sse(dm, 9, "refunds?")).await.unwrap();
+        posts_reach(&engine, 1).await;
+
+        let ids: Vec<String> = engine
+            .state()
+            .post_attempts
+            .iter()
+            .map(|(_, id)| id.clone())
+            .collect();
+        assert_eq!(ids.len(), 5, "{ids:?}");
+        assert!(
+            ids.iter().all(|id| *id == ids[0]),
+            "one message, one id: {ids:?}"
+        );
+
+        for _ in 0..100 {
+            if committable(&agent, dm) == 9 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(committable(&agent, dm), 9);
+        let journal = agent.shared.journal_tail(dm).join("\n");
+        assert!(journal.contains("reply not posted yet"), "{journal}");
+        assert!(journal.contains("posted late"), "{journal}");
+    }
+
+    #[tokio::test]
+    async fn a_turn_refused_for_want_of_a_mandate_waits_and_is_answered_later() {
+        let engine = MockEngine::start(MockState {
+            mandate: Some(resolve_body(&fixture())),
+            mandate_fail: Some(503),
+            ..Default::default()
+        })
+        .await;
+        let config = AgentConfig {
+            mandate_strict: true,
+            ..Default::default()
+        };
+        let (agent, fake) = agent_with(&engine, config, Vec::new(), false).await;
+        let dm = "dm.aprido.support-bot";
+
+        agent.shared.ingest(&sse(dm, 5, "refunds?")).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(800)).await;
+        // Refused, not dropped: unanswered, so a restart would redeliver it.
+        assert_eq!(fake.runs.load(Ordering::SeqCst), 0);
+        assert_eq!(committable(&agent, dm), 4);
+
+        engine.state().mandate_fail = None;
+        posts_reach(&engine, 1).await;
+        for _ in 0..100 {
+            if committable(&agent, dm) == 5 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(committable(&agent, dm), 5);
+        assert_eq!(fake.runs.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn a_reply_the_engine_refuses_is_not_retried() {
+        let engine = MockEngine::start(MockState {
+            post_failures: vec![400],
+            ..Default::default()
+        })
+        .await;
+        let (agent, fake) = agent(&engine, AgentConfig::default()).await;
+        let dm = "dm.aprido.support-bot";
+
+        agent.shared.ingest(&sse(dm, 9, "refunds?")).await.unwrap();
+        runs_reach(&fake, 1).await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        assert_eq!(engine.state().post_attempts.len(), 1);
+        assert_eq!(committable(&agent, dm), 9);
     }
 
     #[tokio::test]

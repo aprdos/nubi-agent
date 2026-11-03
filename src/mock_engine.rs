@@ -37,6 +37,15 @@ pub struct MockState {
     pub posts: Vec<(String, Value)>,
     /// Every typing update: (room, typing), in order.
     pub typing: Vec<(String, bool)>,
+    /// Statuses to answer the next posts with, in order, before accepting
+    /// one. A 429 comes with `Retry-After: 0`.
+    pub post_failures: Vec<u16>,
+    /// Every post attempt: (room, message_id), refused ones included.
+    pub post_attempts: Vec<(String, String)>,
+    /// Statuses to answer the next `GET /v1/me` with, before answering it.
+    pub me_failures: Vec<u16>,
+    /// Committed offsets per room, kept monotonic as the engine does.
+    pub offsets: HashMap<String, u64>,
 }
 
 pub struct MockEngine {
@@ -62,6 +71,7 @@ impl MockEngine {
             )
             .route("/v1/spaces/{space}/rooms/{room}/typing", post(typing))
             .route("/v1/spaces/{space}/rooms/{room}/offset", post(offset))
+            .route("/v1/me", get(me))
             .with_state(Arc::clone(&state));
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -145,9 +155,25 @@ async fn post_message(
     State(s): Shared,
     Path((_space, room)): Path<(String, String)>,
     Json(body): Json<Value>,
-) -> impl IntoResponse {
-    s.lock().unwrap().posts.push((room, body));
-    (StatusCode::CREATED, Json(json!({"global_index": 1})))
+) -> Response {
+    let mut s = s.lock().unwrap();
+    let id = body["message_id"].as_str().unwrap_or_default().to_string();
+    s.post_attempts.push((room.clone(), id));
+    if !s.post_failures.is_empty() {
+        let status = StatusCode::from_u16(s.post_failures.remove(0)).unwrap();
+        return (status, [("retry-after", "0")], "nope").into_response();
+    }
+    s.posts.push((room, body));
+    (StatusCode::CREATED, Json(json!({"global_index": 1}))).into_response()
+}
+
+async fn me(State(s): Shared) -> Response {
+    let mut s = s.lock().unwrap();
+    if !s.me_failures.is_empty() {
+        let status = StatusCode::from_u16(s.me_failures.remove(0)).unwrap();
+        return (status, [("retry-after", "0")], "busy").into_response();
+    }
+    Json(json!({"space_id": "s1", "agent_id": "support-bot"})).into_response()
 }
 
 async fn typing(
@@ -164,6 +190,14 @@ async fn history() -> Json<Value> {
     Json(json!({"entries": []}))
 }
 
-async fn offset() -> Json<Value> {
-    Json(json!({"committed": 0}))
+async fn offset(
+    State(s): Shared,
+    Path((_space, room)): Path<(String, String)>,
+    Json(body): Json<Value>,
+) -> Json<Value> {
+    let index = body["index"].as_u64().unwrap_or(0);
+    let mut s = s.lock().unwrap();
+    let committed = s.offsets.entry(room).or_insert(0);
+    *committed = (*committed).max(index);
+    Json(json!({"committed": *committed}))
 }
