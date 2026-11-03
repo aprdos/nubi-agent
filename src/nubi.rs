@@ -39,11 +39,13 @@ const CONNECT_BACKOFF_MAX: Duration = Duration::from_secs(60);
 /// short, and anything longer is not worth echoing into a log.
 fn short(body: &str) -> String {
     const MAX: usize = 300;
-    let mut out: String = body.chars().take(MAX).collect();
-    if body.chars().count() > MAX {
-        out.push_str("...");
+    let mut chars = body.chars();
+    let out: String = chars.by_ref().take(MAX).collect();
+    if chars.next().is_some() {
+        format!("{out}...")
+    } else {
+        out
     }
-    out
 }
 
 /// Every request here is short — the SSE stream runs on its own
