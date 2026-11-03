@@ -2359,10 +2359,9 @@ mod tests {
 
     #[tokio::test]
     async fn the_cli_starts_from_an_empty_env() {
-        // HOME is always set where tests run and is not passed on under a
-        // name the script can see as anything else; NUBI_HARNESS_TEST_UNSET
-        // is never set. What matters is that nothing outside the allowlist
-        // reaches the child, which `env` would show.
+        // Reads the real environment without changing it (set_var would
+        // race the other tests): whatever the test process has, the child
+        // sees only allowlisted names. Script has no prefixes of its own.
         let rt = CliRuntime::with_harness(Box::new(Script("env | cut -d= -f1 | sort")), "bot");
         let out = rt.run("hi", None).await.unwrap();
         for name in out.text.lines() {
