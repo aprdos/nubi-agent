@@ -242,6 +242,13 @@ struct Answering {
     indexes: Vec<u64>,
 }
 
+impl Answering {
+    /// Leave the mentions unanswered: the turn will be tried again.
+    fn keep(mut self) {
+        self.indexes.clear();
+    }
+}
+
 impl Drop for Answering {
     fn drop(&mut self) {
         // Never panic in drop: a poisoned map just keeps the offset back.
@@ -257,6 +264,20 @@ impl Drop for Answering {
         }
     }
 }
+
+/// How a turn ended, for the room's worker.
+enum TurnEnd {
+    Answered,
+    /// Refused by the mandate check before it ran: its messages are still
+    /// unanswered and go back in the queue.
+    Refused,
+}
+
+/// How long a room waits before trying a refused turn again.
+#[cfg(not(test))]
+const REFUSED_RETRY: Duration = Duration::from_secs(30);
+#[cfg(test)]
+const REFUSED_RETRY: Duration = Duration::from_millis(20);
 
 /// When a reply that could not be posted is tried again, after the turn.
 #[cfg(not(test))]
@@ -1552,7 +1573,7 @@ impl Shared {
 
             // Taken before the pending messages are: whatever arrives while
             // the family is busy is answered in this one turn.
-            let _family = self.enter_family(&room_id).await;
+            let family = self.enter_family(&room_id).await;
 
             let triggers = {
                 let mut dispatch = self.dispatch.lock().unwrap();
@@ -1565,17 +1586,32 @@ impl Shared {
                 }
             };
 
-            if let Err(e) = self.reply(&room_id, &triggers).await {
-                eprintln!("[nubi-agent] Error in {}: {}", room_id, e);
+            match self.reply(&room_id, &triggers).await {
+                Ok(TurnEnd::Answered) => {}
+                Ok(TurnEnd::Refused) => {
+                    // Back at the front, ahead of anything newer, and tried
+                    // again once the mandate may be back. The family is
+                    // free meanwhile.
+                    {
+                        let mut dispatch = self.dispatch.lock().unwrap();
+                        let pending = dispatch.pending.entry(room_id.clone()).or_default();
+                        let newer = std::mem::take(pending);
+                        *pending = triggers;
+                        pending.extend(newer);
+                    }
+                    drop(family);
+                    tokio::time::sleep(REFUSED_RETRY).await;
+                }
+                Err(e) => eprintln!("[nubi-agent] Error in {}: {}", room_id, e),
             }
         }
     }
 
     /// One turn: run the harness for every pending message in the room, post
     /// what it says, and tell the room when that could not be done.
-    async fn reply(&self, room_id: &str, triggers: &[Trigger]) -> anyhow::Result<()> {
+    async fn reply(&self, room_id: &str, triggers: &[Trigger]) -> anyhow::Result<TurnEnd> {
         let Some(newest) = triggers.last() else {
-            return Ok(());
+            return Ok(TurnEnd::Answered);
         };
         let answering = Answering {
             offsets: Arc::clone(&self.offsets),
@@ -1591,9 +1627,13 @@ impl Shared {
         };
 
         if let Err(reason) = self.check_mandate().await {
-            eprintln!("[nubi-agent] Refusing to answer in {}: {}", room_id, reason);
+            eprintln!(
+                "[nubi-agent] Refusing to answer in {} for now: {}",
+                room_id, reason
+            );
             let _ = self.nubi.set_typing(room_id, false).await;
-            return Ok(());
+            answering.keep();
+            return Ok(TurnEnd::Refused);
         }
         let _in_flight = self.start_in_flight(room_id, triggers);
 
@@ -1759,7 +1799,7 @@ impl Shared {
                     None,
                     session_kind,
                 );
-                return Ok(());
+                return Ok(TurnEnd::Answered);
             }
         };
 
@@ -1847,7 +1887,7 @@ impl Shared {
             session_kind,
         );
 
-        Ok(())
+        Ok(TurnEnd::Answered)
     }
 
     /// One structured line per turn, for grepping and for evals.
@@ -2600,6 +2640,39 @@ mod tests {
         let journal = agent.shared.journal_tail(dm).join("\n");
         assert!(journal.contains("reply not posted yet"), "{journal}");
         assert!(journal.contains("posted late"), "{journal}");
+    }
+
+    #[tokio::test]
+    async fn a_turn_refused_for_want_of_a_mandate_waits_and_is_answered_later() {
+        let engine = MockEngine::start(MockState {
+            mandate: Some(resolve_body(&fixture())),
+            mandate_fail: Some(503),
+            ..Default::default()
+        })
+        .await;
+        let config = AgentConfig {
+            mandate_strict: true,
+            ..Default::default()
+        };
+        let (agent, fake) = agent_with(&engine, config, Vec::new(), false).await;
+        let dm = "dm.aprido.support-bot";
+
+        agent.shared.ingest(&sse(dm, 5, "refunds?")).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(800)).await;
+        // Refused, not dropped: unanswered, so a restart would redeliver it.
+        assert_eq!(fake.runs.load(Ordering::SeqCst), 0);
+        assert_eq!(committable(&agent, dm), 4);
+
+        engine.state().mandate_fail = None;
+        posts_reach(&engine, 1).await;
+        for _ in 0..100 {
+            if committable(&agent, dm) == 5 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(committable(&agent, dm), 5);
+        assert_eq!(fake.runs.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
