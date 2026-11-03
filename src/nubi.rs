@@ -185,6 +185,7 @@ impl NubiClient {
         let base_url = base_url.trim_end_matches('/');
         let client = http_client();
         let mut backoff = CONNECT_BACKOFF_START;
+        let mut attempts = 0u32;
 
         let resp = loop {
             match client
@@ -195,12 +196,23 @@ impl NubiClient {
             {
                 Ok(resp) => break resp,
                 Err(e) => {
+                    attempts += 1;
                     eprintln!(
                         "[nubi-agent] Cannot reach nubi at {}: {}, retrying in {}s",
                         base_url,
                         e,
                         backoff.as_secs()
                     );
+                    // Once: a wrong URL looks exactly like an engine that is
+                    // down, and only the person at the keyboard can tell.
+                    if attempts == 1 {
+                        eprintln!(
+                            "[nubi-agent] Is that the right engine? --url / NUBI_URL should be the engine \
+                             itself (hosted: https://api.nubi.chat); it answers GET \
+                             {}/healthz. Retrying until it does.",
+                            base_url
+                        );
+                    }
                     tokio::time::sleep(backoff).await;
                     backoff = (backoff * 2).min(CONNECT_BACKOFF_MAX);
                 }
@@ -210,6 +222,18 @@ impl NubiClient {
         if !resp.status().is_success() {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
+            if status == reqwest::StatusCode::UNAUTHORIZED
+                || status == reqwest::StatusCode::FORBIDDEN
+            {
+                anyhow::bail!(
+                    "Rejected by nubi at {}: {} {}\n\
+                     The token is wrong, revoked, or for another engine. Check --token / \
+                     NUBI_TOKEN; a new one comes from the nubi app: Agents > New agent.",
+                    base_url,
+                    status,
+                    body
+                );
+            }
             anyhow::bail!("Rejected by nubi at {}: {} {}", base_url, status, body);
         }
 

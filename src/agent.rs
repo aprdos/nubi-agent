@@ -422,6 +422,10 @@ impl Agent {
             self.shared.config.agent_id,
             self.shared.nubi.space()
         );
+        eprintln!(
+            "[nubi-agent] Mention @{} in a room it is in, or DM it, and it answers there.",
+            self.shared.config.agent_id
+        );
 
         let flusher = tokio::spawn(flush_offsets(Arc::clone(&self.shared)));
 
