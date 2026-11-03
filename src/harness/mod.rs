@@ -332,19 +332,22 @@ const BASE_ENV: &[&str] = &[
 const BASE_ENV_PREFIXES: &[&str] = &["LC_", "XDG_"];
 
 /// The part of nubi-agent's own environment a harness CLI may see.
-fn inherited_env(harness: &dyn Harness, pass_env: &[String]) -> Vec<(OsString, OsString)> {
+fn inherited_env(
+    vars: impl Iterator<Item = (OsString, OsString)>,
+    harness: &dyn Harness,
+    pass_env: &[String],
+) -> Vec<(OsString, OsString)> {
     let prefixes = harness.env_prefixes();
-    std::env::vars_os()
-        .filter(|(k, _)| {
-            let Some(k) = k.to_str() else { return false };
-            BASE_ENV.contains(&k)
-                || pass_env.iter().any(|p| p == k)
-                || BASE_ENV_PREFIXES
-                    .iter()
-                    .chain(prefixes.iter())
-                    .any(|p| k.starts_with(p))
-        })
-        .collect()
+    vars.filter(|(k, _)| {
+        let Some(k) = k.to_str() else { return false };
+        BASE_ENV.contains(&k)
+            || pass_env.iter().any(|p| p == k)
+            || BASE_ENV_PREFIXES
+                .iter()
+                .chain(prefixes.iter())
+                .any(|p| k.starts_with(p))
+    })
+    .collect()
 }
 
 /// A run's process group, killed whole when this is dropped or told to.
@@ -1056,6 +1059,7 @@ impl AgentRuntime for CliRuntime {
         cmd.args(&inv.args)
             .env_clear()
             .envs(inherited_env(
+                std::env::vars_os(),
                 self.harness.as_ref(),
                 &self.settings.pass_env,
             ))
@@ -2306,21 +2310,70 @@ mod tests {
             .parse()
             .unwrap();
         let _ = std::fs::remove_file(&pid_file);
-        // SAFETY: signal 0 only checks that the process exists.
-        let alive = unsafe { libc::kill(pid, 0) } == 0;
-        assert!(!alive, "background sleep {pid} outlived the run");
+        // Killed but not yet reaped still counts as gone: the sleep's parent
+        // has exited, so a zombie lingers until init gets to it (on Linux CI,
+        // kill(pid, 0) still succeeds on one).
+        let gone = || {
+            let out = std::process::Command::new("ps")
+                .args(["-o", "stat=", "-p", &pid.to_string()])
+                .output()
+                .unwrap();
+            let stat = String::from_utf8_lossy(&out.stdout);
+            stat.trim().is_empty() || stat.trim_start().starts_with('Z')
+        };
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while !gone() && std::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(gone(), "background sleep {pid} outlived the run");
+    }
+
+    #[test]
+    fn the_cli_sees_only_the_env_it_needs() {
+        let vars = [
+            ("PATH", "/bin"),
+            ("LC_ALL", "C"),
+            ("NUBI_TOKEN", "nubi_secret"),
+            ("NUBI_LLM_KEY", "sk-secret"),
+            ("AWS_SECRET_ACCESS_KEY", "aws"),
+            ("OPENAI_API_KEY", "openai"),
+            ("ANTHROPIC_API_KEY", "anthropic"),
+            ("SSH_AUTH_SOCK", "/tmp/agent"),
+        ]
+        .map(|(k, v)| (OsString::from(k), OsString::from(v)));
+        let kept = inherited_env(
+            vars.into_iter(),
+            &claude::Claude,
+            &["SSH_AUTH_SOCK".to_string()],
+        );
+        let mut names: Vec<String> = kept
+            .iter()
+            .map(|(k, _)| k.to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        assert_eq!(
+            names,
+            ["ANTHROPIC_API_KEY", "LC_ALL", "PATH", "SSH_AUTH_SOCK"]
+        );
     }
 
     #[tokio::test]
-    async fn the_cli_sees_only_the_env_it_needs() {
-        std::env::set_var("NUBI_AUDIT_TEST_SECRET", "leaked");
-        std::env::set_var("NUBI_AUDIT_TEST_PASSED", "passed");
-        let script = "echo \"${NUBI_AUDIT_TEST_SECRET:-hidden} \
-                      ${NUBI_AUDIT_TEST_PASSED:-hidden} ${PATH:+path}\"";
-        let rt = CliRuntime::with_harness(Box::new(Script(script)), "bot")
-            .with_pass_env(vec!["NUBI_AUDIT_TEST_PASSED".to_string()]);
+    async fn the_cli_starts_from_an_empty_env() {
+        // HOME is always set where tests run and is not passed on under a
+        // name the script can see as anything else; NUBI_HARNESS_TEST_UNSET
+        // is never set. What matters is that nothing outside the allowlist
+        // reaches the child, which `env` would show.
+        let rt = CliRuntime::with_harness(Box::new(Script("env | cut -d= -f1 | sort")), "bot");
         let out = rt.run("hi", None).await.unwrap();
-        assert_eq!(out.text, "hidden passed path");
+        for name in out.text.lines() {
+            assert!(
+                BASE_ENV.contains(&name)
+                    || BASE_ENV_PREFIXES.iter().any(|p| name.starts_with(p))
+                    // set by sh itself
+                    || ["PWD", "SHLVL", "_", "OLDPWD"].contains(&name),
+                "{name} leaked into the CLI's env"
+            );
+        }
     }
 
     /// A shell script that streams like Claude, watched like Claude.
