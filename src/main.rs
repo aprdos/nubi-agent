@@ -156,6 +156,18 @@ struct Args {
     )]
     turn_timeout_secs: u64,
 
+    /// How many turns may run at once across all rooms. 1 answers messages
+    /// strictly in arrival order, each turn seeing everything the agent did
+    /// before it; more answers faster, but a turn may not know what another
+    /// one running beside it is doing
+    #[arg(
+        long,
+        env = "NUBI_MAX_PARALLEL_TURNS",
+        default_value = "1",
+        help_heading = "Tuning"
+    )]
+    max_parallel_turns: usize,
+
     /// Answer nothing until the agent's mandate (the skill sets bound to it
     /// in the engine) has been fetched, and refuse a turn while it cannot
     /// be. Off by default: an engine without mandates simply means none
@@ -252,6 +264,7 @@ async fn main() -> anyhow::Result<()> {
         llm_effort: effort,
         compact_at_pct: (args.compact_at_pct > 0).then_some(args.compact_at_pct.min(100)),
         turn_timeout_secs: args.turn_timeout_secs,
+        max_parallel_turns: args.max_parallel_turns,
         harness: args.harness,
         mandate_strict: args.mandate_strict,
         no_local_skills: args.no_local_skills,

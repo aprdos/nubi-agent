@@ -142,6 +142,8 @@ nubi-agent --url http://localhost:9099 --token nubi_xxx \
 | `--heartbeat-secs` | — | `5` | Typing-indicator refresh interval while a turn runs (0 = set once) |
 | `--compact-at-pct` | `NUBI_COMPACT_AT_PCT` | `60` | Compact the CLI's conversation at this share of the context window (Claude Code; 0 = CLI default) |
 | `--turn-timeout-secs` | `NUBI_TURN_TIMEOUT_SECS` | `900` | Kill a run that takes longer and tell the room |
+| `--max-parallel-turns` | `NUBI_MAX_PARALLEL_TURNS` | `1` | Turns running at once across rooms; 1 answers in arrival order |
+| `--pass-env` | `NUBI_PASS_ENV` | — | Extra env vars (comma-separated names) the CLI may see |
 | `--mandate-strict` | `NUBI_MANDATE_STRICT` | `false` | Answer nothing until the agent's mandate has been fetched |
 | `--no-local-skills` | `NUBI_NO_LOCAL_SKILLS` | `false` | Skip `~/.nubi/skills` and per-agent skill files |
 
@@ -243,7 +245,14 @@ sequenceDiagram
 
 1. **Listen.** nubi-agent follows nubi's SSE stream for mentions and DMs.
 2. **Batch.** Messages that arrive within half a second of each other are answered in one turn.
+   Turns run one at a time, first come first served, so each one sees
+   everything the agent did before it; a waiting room shows the agent typing.
+   With `--max-parallel-turns` above 1, unrelated rooms run side by side, but
+   a room and its threads still take turns.
 3. **Context.** The prompt carries the room's recent history, the thread's anchor message, and the agent's own last few turns there.
+   A thread also gets what its room said since, and every turn sees what the
+   agent is doing and just did in its other rooms, so it can pick up work
+   already started elsewhere instead of starting it again.
 4. **Run.** The CLI runs in the agent's workspace, connected to nubi-mcp through a per-run MCP config.
 5. **Reply.** The answer is posted with the routing the model chose, or not at all when the model already answered through tools.
 

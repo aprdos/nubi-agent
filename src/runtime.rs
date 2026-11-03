@@ -38,8 +38,14 @@ pub struct TurnInput {
     /// resumed this holds only what arrived since the agent's last turn.
     pub context: Vec<BufferedMessage>,
     pub thread: Option<ThreadAnchor>,
+    /// For a thread: what was said in the room it was opened from since the
+    /// thread's last turn (or since it opened), oldest first.
+    pub parent_context: Vec<BufferedMessage>,
     /// The agent's own recent turns in this room, as one line each.
     pub journal: Vec<String>,
+    /// The agent's other conversations, one line each: turns running right
+    /// now in other rooms, then recent turns there, related rooms first.
+    pub elsewhere: Vec<String>,
     /// The harness session for this room is being continued, so the model
     /// already saw everything up to the agent's last turn.
     pub resumed: bool,

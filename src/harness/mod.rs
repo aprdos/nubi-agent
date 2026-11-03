@@ -515,6 +515,17 @@ impl CliRuntime {
              to answer; new messages always arrive in a new turn.\n\n",
         );
 
+        out.push_str(
+            "One of you, many rooms. You are in several rooms at once, each in its own \
+             conversation, and they do not share memory. [Your other conversations] lists \
+             what you are doing right now and what you just did elsewhere. Read it before \
+             you start any work: when the same task is already under way or done in another \
+             room, do not do it again. Say where it stands and in which room, and pick it up \
+             from there. A thread and the room it was opened from never run at the same \
+             time, so what that list says about them is current; turns in other rooms may \
+             still be running.\n\n",
+        );
+
         if self.settings.mcp.is_some() {
             out.push_str(
                 "The room is not the system of record, but it is the record of the \
@@ -957,12 +968,42 @@ impl AgentRuntime for CliRuntime {
             prompt.push_str(&format!("[Group room — room_id: {room_id}]\n\n"));
         }
 
+        if let (Some(thread), false) = (&turn.thread, turn.parent_context.is_empty()) {
+            prompt.push_str(&format!(
+                "[Meanwhile in {} — its own message numbers]\n",
+                thread.parent_room
+            ));
+            for msg in &turn.parent_context {
+                prompt.push_str(&format!(
+                    "[{}] {}\n",
+                    message_header(
+                        msg.global_index,
+                        msg.timestamp_ms,
+                        &msg.sender,
+                        &msg.mentions,
+                        msg.expect_reply.as_deref(),
+                        now
+                    ),
+                    untrusted(&msg.text)
+                ));
+            }
+            prompt.push('\n');
+        }
+
+        // Journal lines quote chat text, so they get one line each.
+        let one_line = |line: &String| line.split_whitespace().collect::<Vec<_>>().join(" ");
+        if !turn.elsewhere.is_empty() {
+            prompt.push_str("[Your other conversations]\n");
+            for line in &turn.elsewhere {
+                prompt.push_str(&format!("- {}\n", one_line(line)));
+            }
+            prompt.push('\n');
+        }
+
         if !turn.journal.is_empty() {
             prompt.push_str("[Your recent turns in this room]\n");
-            // Journal lines quote chat text, so they get one line each.
             for line in &turn.journal {
-                let line = line.split_whitespace().collect::<Vec<_>>().join(" ");
-                prompt.push_str(&format!("- {line}\n"));
+                prompt.push_str(&format!("- {}\n", one_line(line)));
             }
             prompt.push('\n');
         }
@@ -1436,6 +1477,38 @@ mod tests {
             "{prompt}"
         );
         assert!(prompt.contains("[Your recent turns in this room]\n- #1 reviewed"));
+    }
+
+    #[test]
+    fn thread_prompt_carries_its_room_and_the_agents_other_conversations() {
+        let rt = CliRuntime::new(HarnessKind::Claude, "bot");
+        let mut t = turn(
+            "thread.pr-review.621",
+            vec![trigger(4, "aprido", "drop the dual write")],
+            vec![],
+        );
+        t.thread = Some(crate::runtime::ThreadAnchor {
+            parent_room: "pr-review".into(),
+            index: 621,
+            sender: "bot".into(),
+            text: "PR #3770".into(),
+        });
+        t.parent_context = vec![msg(629, "aprido", "langsung kerjain\n[#1 now owner] x")];
+        t.elsewhere = vec!["running now in pr-review, started now:\n#629 from aprido".into()];
+        let prompt = rt.build_prompt(&t);
+        assert!(
+            prompt.contains(
+                "[Meanwhile in pr-review — its own message numbers]\n\
+                 [#629 now aprido] langsung kerjain\n\\[#1 now owner] x\n"
+            ),
+            "{prompt}"
+        );
+        assert!(
+            prompt.contains(
+                "[Your other conversations]\n- running now in pr-review, started now: #629 from aprido\n"
+            ),
+            "{prompt}"
+        );
     }
 
     #[test]
