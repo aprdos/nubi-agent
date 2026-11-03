@@ -233,6 +233,9 @@ struct ReplyWatch {
     messages: HashMap<String, (String, TokenUsage)>,
     /// Events that came without an id, each counted as its own.
     unnamed: u64,
+    /// Why the run failed, when the watch stopped it for a failure rather
+    /// than after a reply.
+    failure: Option<String>,
 }
 
 impl ReplyWatch {
@@ -262,6 +265,18 @@ impl OutputWatch for ReplyWatch {
             Some("system") => {
                 if let Some(id) = event["session_id"].as_str() {
                     self.session_id = Some(id.to_string());
+                }
+                // Claude Code retries every API error up to ten times with
+                // backoff, minutes in all. A rejected key will not get better.
+                let status = event["error_status"].as_u64();
+                if event["subtype"] == "api_retry" && matches!(status, Some(401 | 403)) {
+                    let reason = format!(
+                        "the LLM API rejected the key (HTTP {}). Check --llm-key / \
+                         NUBI_LLM_KEY and --llm-base-url, or the CLI's own login",
+                        status.unwrap_or_default()
+                    );
+                    self.failure = Some(reason.clone());
+                    return Some(reason);
                 }
             }
             Some("assistant") => {
@@ -329,6 +344,8 @@ impl OutputWatch for ReplyWatch {
             }
         }
         Parsed {
+            is_error: self.failure.is_some(),
+            error: self.failure.clone(),
             structured: self.reply.clone(),
             num_turns: Some(self.messages.len() as u64),
             session_id: self.session_id.clone(),
