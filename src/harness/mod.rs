@@ -2414,6 +2414,17 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_failed_run_without_its_reply_file_reports_what_it_printed() {
+        let path = std::env::temp_dir().join(format!("nubi-nofile-{}", uuid::Uuid::new_v4()));
+        let script =
+            "echo 'unexpected status 401 Unauthorized: Invalid or inactive API key'; exit 1";
+        let rt = CliRuntime::with_harness(Box::new(FileScript(script, path)), "bot");
+        let err = rt.run("hi", None).await.unwrap_err().to_string();
+        assert!(err.contains("401 Unauthorized"), "{err}");
+        assert!(!err.contains("No such file"), "{err}");
+    }
+
+    #[tokio::test]
     async fn a_clean_exit_without_its_reply_file_says_so() {
         let path = std::env::temp_dir().join(format!("nubi-nofile-{}", uuid::Uuid::new_v4()));
         let rt = CliRuntime::with_harness(Box::new(FileScript("true", path)), "bot");
