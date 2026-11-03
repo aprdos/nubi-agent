@@ -26,6 +26,40 @@ struct Me {
 
 const POST_ATTEMPTS: u32 = 3;
 
+/// The longest a `Retry-After` from the engine is honoured for in one wait.
+const RETRY_AFTER_MAX: Duration = Duration::from_secs(30);
+
+/// A post the engine refused for good (a 4xx other than 429): sending the
+/// same message again would be refused again.
+#[derive(Debug)]
+pub struct Refused(pub String);
+
+impl std::fmt::Display for Refused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for Refused {}
+
+/// Worth trying again: the engine is down, overloaded or rate-limiting.
+fn retryable(status: reqwest::StatusCode) -> bool {
+    status.is_server_error() || status == reqwest::StatusCode::TOO_MANY_REQUESTS
+}
+
+/// How long the engine asked us to wait, when it did (seconds form only).
+fn retry_after(resp: &reqwest::Response) -> Option<Duration> {
+    let secs: u64 = resp
+        .headers()
+        .get(reqwest::header::RETRY_AFTER)?
+        .to_str()
+        .ok()?
+        .trim()
+        .parse()
+        .ok()?;
+    Some(Duration::from_secs(secs).min(RETRY_AFTER_MAX))
+}
+
 /// Without these a single unroutable DNS answer hangs a request forever: the
 /// OS retries the SYN for ~75s, reqwest starts over, and the agent never gets
 /// an error it can act on.
@@ -207,6 +241,18 @@ impl NubiClient {
                 .send()
                 .await
             {
+                // A deploy or an overloaded engine answers 502/503/429 for a
+                // while; that is a reason to wait, not to exit.
+                Ok(resp) if retryable(resp.status()) => {
+                    eprintln!(
+                        "[nubi-agent] nubi at {} answered {}, retrying in {}s",
+                        base_url,
+                        resp.status(),
+                        backoff.as_secs()
+                    );
+                    tokio::time::sleep(retry_after(&resp).unwrap_or(backoff)).await;
+                    backoff = (backoff * 2).min(CONNECT_BACKOFF_MAX);
+                }
                 Ok(resp) => break resp,
                 Err(e) => {
                     attempts += 1;
@@ -266,12 +312,16 @@ impl NubiClient {
         &self.base_url
     }
 
-    /// Post a message to a room.
-    ///
-    /// Retried on transport and 5xx failures. The message_id is generated once
-    /// up front so a retry is deduplicated server-side instead of double-posting.
+    /// Post a message to a room. See [`NubiClient::send`].
     pub async fn post(&self, room_id: &str, out: Outgoing<'_>) -> anyhow::Result<()> {
-        let msg = SendMessage {
+        self.send(room_id, &Self::message(out)).await
+    }
+
+    /// The message [`NubiClient::post`] sends, with its id fixed up front so
+    /// every later send of it is deduplicated server-side instead of
+    /// double-posting.
+    pub fn message(out: Outgoing<'_>) -> SendMessage {
+        SendMessage {
             message_id: Uuid::new_v4().to_string(),
             parts: vec![SendPart {
                 kind: "text",
@@ -279,20 +329,25 @@ impl NubiClient {
             }],
             mentions: out.mentions.to_vec(),
             metadata: Some(post_metadata(out.expect_reply, out.mandate_hash, out.usage)),
-        };
+        }
+    }
 
+    /// Send a built message. Retried on transport failures, 5xx and 429
+    /// (after `Retry-After` when given); any other refusal is a [`Refused`].
+    pub async fn send(&self, room_id: &str, msg: &SendMessage) -> anyhow::Result<()> {
         let url = format!(
             "{}/v1/spaces/{}/rooms/{}/messages",
             self.base_url, self.space, room_id
         );
 
         let mut last_err = String::new();
+        let mut wait: Option<Duration> = None;
         for attempt in 1..=POST_ATTEMPTS {
             match self
                 .client
                 .post(&url)
                 .header("Authorization", format!("Bearer {}", self.token))
-                .json(&msg)
+                .json(msg)
                 .send()
                 .await
             {
@@ -301,17 +356,22 @@ impl NubiClient {
                     if status.is_success() {
                         return Ok(());
                     }
-                    let body = resp.text().await.unwrap_or_default();
+                    wait = retry_after(&resp);
+                    let body = short(&resp.text().await.unwrap_or_default());
                     last_err = format!("{} - {}", status, body);
-                    if !status.is_server_error() {
-                        break;
+                    if !retryable(status) {
+                        return Err(
+                            Refused(format!("Post to {} refused: {}", room_id, last_err)).into(),
+                        );
                     }
                 }
                 Err(e) => last_err = e.to_string(),
             }
 
             if attempt < POST_ATTEMPTS {
-                let backoff = Duration::from_millis(500 * (1 << (attempt - 1)));
+                let backoff = wait
+                    .take()
+                    .unwrap_or(Duration::from_millis(500 * (1 << (attempt - 1))));
                 eprintln!(
                     "[nubi-agent] Post to {} failed ({}), retrying in {}ms",
                     room_id,
@@ -552,5 +612,71 @@ mod tests {
             client.stream_url("*"),
             "http://localhost:9099/v1/spaces/space1/stream"
         );
+    }
+
+    fn outgoing(text: &str) -> Outgoing<'_> {
+        Outgoing {
+            text,
+            mentions: &[],
+            expect_reply: None,
+            mandate_hash: None,
+            usage: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn connect_waits_out_an_engine_that_is_deploying() {
+        use crate::mock_engine::{MockEngine, MockState};
+        let engine = MockEngine::start(MockState {
+            me_failures: vec![502, 503, 429],
+            ..Default::default()
+        })
+        .await;
+        let client = NubiClient::connect(&engine.url, "tok").await.unwrap();
+        assert_eq!(client.agent_id(), "support-bot");
+        assert!(engine.state().me_failures.is_empty());
+    }
+
+    #[tokio::test]
+    async fn connect_still_stops_on_a_bad_token() {
+        use crate::mock_engine::{MockEngine, MockState};
+        let engine = MockEngine::start(MockState {
+            me_failures: vec![401],
+            ..Default::default()
+        })
+        .await;
+        let err = NubiClient::connect(&engine.url, "tok").await.err().unwrap();
+        assert!(err.to_string().contains("token"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn a_rate_limited_post_is_retried_under_one_id() {
+        use crate::mock_engine::{MockEngine, MockState};
+        let engine = MockEngine::start(MockState {
+            post_failures: vec![429, 503],
+            ..Default::default()
+        })
+        .await;
+        let client = NubiClient::new(&engine.url, "tok", "s1", "bot");
+        client.post("general", outgoing("hi")).await.unwrap();
+        let state = engine.state();
+        assert_eq!(state.posts.len(), 1);
+        let ids: Vec<&String> = state.post_attempts.iter().map(|(_, id)| id).collect();
+        assert_eq!(ids.len(), 3);
+        assert!(ids.iter().all(|id| *id == ids[0]), "{ids:?}");
+    }
+
+    #[tokio::test]
+    async fn a_refused_post_is_not_retried() {
+        use crate::mock_engine::{MockEngine, MockState};
+        let engine = MockEngine::start(MockState {
+            post_failures: vec![400],
+            ..Default::default()
+        })
+        .await;
+        let client = NubiClient::new(&engine.url, "tok", "s1", "bot");
+        let err = client.post("general", outgoing("hi")).await.unwrap_err();
+        assert!(err.downcast_ref::<Refused>().is_some(), "{err}");
+        assert_eq!(engine.state().post_attempts.len(), 1);
     }
 }
