@@ -35,6 +35,8 @@ pub struct MockState {
     pub prompt_requests: Vec<String>,
     /// Every posted message: (room, body).
     pub posts: Vec<(String, Value)>,
+    /// Every typing update: (room, typing), in order.
+    pub typing: Vec<(String, bool)>,
 }
 
 pub struct MockEngine {
@@ -58,7 +60,7 @@ impl MockEngine {
                 "/v1/spaces/{space}/rooms/{room}/messages",
                 post(post_message).get(history),
             )
-            .route("/v1/spaces/{space}/rooms/{room}/typing", post(ok))
+            .route("/v1/spaces/{space}/rooms/{room}/typing", post(typing))
             .route("/v1/spaces/{space}/rooms/{room}/offset", post(offset))
             .with_state(Arc::clone(&state));
 
@@ -148,14 +150,20 @@ async fn post_message(
     (StatusCode::CREATED, Json(json!({"global_index": 1})))
 }
 
+async fn typing(
+    State(s): Shared,
+    Path((_space, room)): Path<(String, String)>,
+    Json(body): Json<Value>,
+) -> StatusCode {
+    let on = body["typing"].as_bool().unwrap_or(false);
+    s.lock().unwrap().typing.push((room, on));
+    StatusCode::OK
+}
+
 async fn history() -> Json<Value> {
     Json(json!({"entries": []}))
 }
 
 async fn offset() -> Json<Value> {
     Json(json!({"committed": 0}))
-}
-
-async fn ok() -> StatusCode {
-    StatusCode::OK
 }

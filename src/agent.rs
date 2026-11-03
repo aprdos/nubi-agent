@@ -7,10 +7,10 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use tokio::sync::Semaphore;
+use tokio::sync::{OwnedRwLockReadGuard, OwnedRwLockWriteGuard, RwLock as TurnLock, Semaphore};
 use tokio::time::interval;
 
-use crate::buffer::RoomBuffer;
+use crate::buffer::{BufferedMessage, RoomBuffer};
 use crate::harness::{age, now_ms, write_private, CliRuntime, HarnessKind, McpServer};
 use crate::mandate::{FetchError, Fetched, Mandate, MandateLoader};
 use crate::nubi::{usage_metadata, NubiClient, Outgoing};
@@ -25,9 +25,6 @@ const COALESCE_WINDOW_MS: u64 = 500;
 /// How often pending read offsets are pushed to the server.
 const OFFSET_FLUSH_SECS: u64 = 2;
 
-/// Ceiling on simultaneously running harness processes across all rooms.
-const MAX_CONCURRENT_REPLIES: usize = 4;
-
 /// Harness runs one turn may take before giving up: the first, one retry
 /// after a failure, and possibly a fresh start when a resume failed.
 const MAX_RUNS_PER_TURN: u32 = 3;
@@ -39,6 +36,17 @@ const SESSION_MAX_IDLE: Duration = Duration::from_secs(6 * 3600);
 
 /// How many of the agent's own recent turns in a room go into the prompt.
 const JOURNAL_LINES: usize = 5;
+
+/// How many lines [Your other conversations] holds, running turns included.
+const ELSEWHERE_LINES: usize = 8;
+
+/// How far back recent turns in other rooms count: the thread/parent family
+/// a day, unrelated rooms an hour.
+const ELSEWHERE_RELATED_MS: u64 = 24 * 3600 * 1000;
+const ELSEWHERE_OTHER_MS: u64 = 3600 * 1000;
+
+/// How many of the parent room's newest messages a thread turn carries.
+const PARENT_CONTEXT_MESSAGES: usize = 8;
 
 /// Startup attempts at fetching the mandate before carrying on without one
 /// (unless `mandate_strict`, which keeps trying).
@@ -82,6 +90,9 @@ pub struct AgentConfig {
     pub llm_effort: Option<String>,
     pub compact_at_pct: Option<u8>,
     pub turn_timeout_secs: u64,
+    /// Turns that may run at once across all rooms. With 1 they run one
+    /// after another in arrival order.
+    pub max_parallel_turns: usize,
     pub harness: HarnessKind,
     /// Do not serve any room until the mandate has been fetched, and refuse a
     /// turn while it cannot be.
@@ -111,6 +122,7 @@ impl Default for AgentConfig {
             llm_effort: None,
             compact_at_pct: None,
             turn_timeout_secs: crate::harness::DEFAULT_TURN_TIMEOUT.as_secs(),
+            max_parallel_turns: 1,
             harness: HarnessKind::default(),
             mandate_strict: false,
             no_local_skills: false,
@@ -135,6 +147,46 @@ struct MandateStatus {
     /// 404 after serving one, or 200 with a body that is not a mandate. The
     /// last good mandate stays injected; `--mandate-strict` refuses turns.
     unverified: bool,
+}
+
+/// Held for the whole of a room's turn. A thread and the room it was opened
+/// from share one lock: a thread holds it shared, so sibling threads (often
+/// different PRs) still run side by side, and the parent room holds it
+/// exclusively. So a parent and its threads never run at once, and neither
+/// starts the same work the other is already doing.
+enum FamilyTurn {
+    Thread { _guard: OwnedRwLockReadGuard<()> },
+    Room { _guard: OwnedRwLockWriteGuard<()> },
+}
+
+/// A turn that is running right now, for the other rooms' prompts.
+#[derive(Debug, Clone)]
+struct InFlight {
+    started_ms: u64,
+    /// `#629 from aprido (langsung kerjain ya…)`
+    what: String,
+}
+
+/// Takes a turn off the in-flight board when it ends, however it ends.
+struct InFlightEntry<'a> {
+    shared: &'a Shared,
+    room_id: String,
+}
+
+impl Drop for InFlightEntry<'_> {
+    fn drop(&mut self) {
+        // Never panic in drop: a poisoned map just keeps a stale line.
+        if let Ok(mut in_flight) = self.shared.in_flight.lock() {
+            in_flight.remove(&self.room_id);
+        }
+    }
+}
+
+/// The room a family is named after: a thread's parent, else the room itself.
+fn family_of(room_id: &str) -> String {
+    parse_thread_room(room_id)
+        .map(|(parent, _)| parent)
+        .unwrap_or_else(|| room_id.to_string())
 }
 
 /// Which rooms have pending messages and which already have a worker running.
@@ -209,6 +261,10 @@ struct Shared {
     mandate_status: Mutex<MandateStatus>,
     /// Serialises mandate refreshes so concurrent turns don't interleave.
     mandate_refresh: tokio::sync::Mutex<()>,
+    /// One turn lock per family (a room and its threads), by the room's id.
+    families: Mutex<HashMap<String, Arc<TurnLock<()>>>>,
+    /// Turns running right now, by room.
+    in_flight: Mutex<HashMap<String, InFlight>>,
 }
 
 /// The main agent that listens to nubi and responds via a harness CLI
@@ -282,6 +338,7 @@ impl Agent {
         workspace: Option<PathBuf>,
         mandate: Option<MandateLoader>,
     ) -> Self {
+        let parallel_turns = config.max_parallel_turns.max(1);
         let buffer = RoomBuffer::new()
             .with_context_size(config.context_size)
             .with_rate_limit_ms(config.rate_limit_ms);
@@ -305,7 +362,8 @@ impl Agent {
             offsets: Mutex::new(Offsets::default()),
             cold: Mutex::new(HashMap::new()),
             primed: Mutex::new(HashSet::new()),
-            replies: Semaphore::new(MAX_CONCURRENT_REPLIES),
+            // Fair: permits go out in the order they were asked for.
+            replies: Semaphore::new(parallel_turns),
             start_time_ms,
             workspace,
             sessions: Mutex::new(sessions),
@@ -314,6 +372,8 @@ impl Agent {
             mandate,
             mandate_status: Mutex::new(MandateStatus::default()),
             mandate_refresh: tokio::sync::Mutex::new(()),
+            families: Mutex::new(HashMap::new()),
+            in_flight: Mutex::new(HashMap::new()),
         };
         if let Err(e) = shared.apply_mandate() {
             eprintln!("[nubi-agent] Cannot inject skills: {}", e);
@@ -1000,10 +1060,22 @@ impl Shared {
         let Some(path) = self.journal_path(room_id) else {
             return Vec::new();
         };
+        let now = now_ms();
+        Self::journal_entries(&path)
+            .into_iter()
+            .map(|(ms, rest)| match ms {
+                0 => rest,
+                ms => format!("{} {}", age(ms, now), rest),
+            })
+            .collect()
+    }
+
+    /// The last few entries of one journal file, oldest first, with the time
+    /// each was written (0 when the line has none).
+    fn journal_entries(path: &Path) -> Vec<(u64, String)> {
         let Ok(text) = fs::read_to_string(path) else {
             return Vec::new();
         };
-        let now = now_ms();
         let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
         lines
             .iter()
@@ -1011,13 +1083,235 @@ impl Shared {
             .take(JOURNAL_LINES)
             .rev()
             .map(|line| match line.split_once('\t') {
-                Some((ms, rest)) => match ms.parse::<u64>() {
-                    Ok(ms) => format!("{} {}", age(ms, now), rest),
-                    Err(_) => rest.to_string(),
-                },
-                None => line.to_string(),
+                Some((ms, rest)) => (ms.parse().unwrap_or(0), rest.to_string()),
+                None => (0, line.to_string()),
             })
             .collect()
+    }
+
+    /// Every room with a journal written to within `window_ms`, with its file.
+    fn journaled_rooms(&self, window_ms: u64) -> Vec<(String, PathBuf)> {
+        let Some(ws) = self.workspace.as_ref() else {
+            return Vec::new();
+        };
+        let Ok(dir) = fs::read_dir(ws.join(".nubi").join("rooms")) else {
+            return Vec::new();
+        };
+        let horizon = SystemTime::now() - Duration::from_millis(window_ms);
+        dir.flatten()
+            .filter(|e| {
+                e.metadata()
+                    .and_then(|m| m.modified())
+                    .is_ok_and(|t| t >= horizon)
+            })
+            .filter_map(|e| {
+                let path = e.path();
+                let room = path
+                    .file_name()?
+                    .to_str()?
+                    .strip_suffix(".log")?
+                    .to_string();
+                // The name goes into the prompt, so it must look like a nubi
+                // room id (`dm.a.b`, `thread.pr-review.621`), not merely be
+                // a safe path: a planted file could carry a newline and a
+                // forged `[New message — …]` marker.
+                let room_like = room
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || "-_.:@".contains(c));
+                (room_like && is_safe_path_segment(&room)).then_some((room, path))
+            })
+            .collect()
+    }
+
+    /// [Your other conversations]: what the agent is doing right now in other
+    /// rooms, then its latest turns there, its own thread/parent family first.
+    /// This is how a turn in one room learns that another room already asked
+    /// for, started or finished the same work.
+    fn elsewhere(&self, room_id: &str) -> Vec<String> {
+        let now = now_ms();
+        let family = family_of(room_id);
+
+        let mut lines: Vec<String> = {
+            let in_flight = self.in_flight.lock().unwrap();
+            let mut running: Vec<(&String, &InFlight)> =
+                in_flight.iter().filter(|(r, _)| *r != room_id).collect();
+            running.sort_by_key(|(_, f)| f.started_ms);
+            running
+                .iter()
+                .map(|(room, f)| {
+                    format!(
+                        "running now in {room}, started {}: {}",
+                        age(f.started_ms, now),
+                        f.what
+                    )
+                })
+                .collect()
+        };
+
+        // (related, written at, room, entry)
+        let mut recent: Vec<(bool, u64, String, String)> = Vec::new();
+        for (room, path) in self.journaled_rooms(ELSEWHERE_RELATED_MS) {
+            if room == room_id {
+                continue;
+            }
+            let related = family_of(&room) == family;
+            let window = if related {
+                ELSEWHERE_RELATED_MS
+            } else {
+                ELSEWHERE_OTHER_MS
+            };
+            for (ms, entry) in Self::journal_entries(&path) {
+                if now.saturating_sub(ms) <= window {
+                    recent.push((related, ms, room.clone(), entry));
+                }
+            }
+        }
+        recent.sort_by(|a, b| b.0.cmp(&a.0).then(b.1.cmp(&a.1)));
+        recent.truncate(ELSEWHERE_LINES.saturating_sub(lines.len()));
+        recent.sort_by_key(|r| r.1);
+        lines.extend(
+            recent
+                .into_iter()
+                .map(|(_, ms, room, entry)| format!("{} in {room}: {entry}", age(ms, now))),
+        );
+        lines
+    }
+
+    /// The parent room's messages a thread turn has not seen yet: newer than
+    /// the thread's anchor and, when its session is continued, than its last
+    /// turn. Newest win.
+    async fn parent_context(
+        &self,
+        room_id: &str,
+        thread: &ThreadAnchor,
+        resumed: bool,
+    ) -> Vec<BufferedMessage> {
+        self.prime_buffer(&thread.parent_room).await;
+        let since = if resumed {
+            self.sessions
+                .lock()
+                .unwrap()
+                .get(room_id)
+                .map(|r| r.last_used_ms)
+                .unwrap_or(0)
+        } else {
+            0
+        };
+        let mut msgs: Vec<BufferedMessage> = self
+            .buffer
+            .lock()
+            .unwrap()
+            // Not context(): that drops the newest message as the trigger.
+            .context_excluding(&thread.parent_room, &[])
+            .into_iter()
+            .filter(|m| m.global_index > thread.index && m.timestamp_ms > since)
+            .collect();
+        let skip = msgs.len().saturating_sub(PARENT_CONTEXT_MESSAGES);
+        msgs.drain(..skip);
+        msgs
+    }
+
+    /// Wait until this room may run a turn: alone in its family when it is a
+    /// room, alongside its sibling threads when it is a thread.
+    async fn enter_family(&self, room_id: &str) -> FamilyTurn {
+        let family = family_of(room_id);
+        let lock = Arc::clone(
+            self.families
+                .lock()
+                .unwrap()
+                .entry(family.clone())
+                .or_default(),
+        );
+        let busy = || {
+            eprintln!(
+                "[nubi-agent] {} waits: a turn in {} or one of its threads is running",
+                room_id, family
+            )
+        };
+        if parse_thread_room(room_id).is_some() {
+            let guard = match Arc::clone(&lock).try_read_owned() {
+                Ok(g) => g,
+                Err(_) => {
+                    busy();
+                    self.typing_while(room_id, lock.read_owned()).await
+                }
+            };
+            FamilyTurn::Thread { _guard: guard }
+        } else {
+            let guard = match Arc::clone(&lock).try_write_owned() {
+                Ok(g) => g,
+                Err(_) => {
+                    busy();
+                    self.typing_while(room_id, lock.write_owned()).await
+                }
+            };
+            FamilyTurn::Room { _guard: guard }
+        }
+    }
+
+    /// Wait on `fut` with the room's typing indicator on, so the people there
+    /// see their message was taken while the agent finishes another turn.
+    /// Left on at the end: the turn that follows keeps it up and clears it.
+    async fn typing_while<T>(&self, room_id: &str, fut: impl std::future::Future<Output = T>) -> T {
+        if let Err(e) = self.nubi.set_typing(room_id, true).await {
+            eprintln!("[nubi-agent] Failed to set typing: {}", e);
+        }
+        let refresh_secs = self.config.heartbeat_interval_secs;
+        if refresh_secs == 0 {
+            return fut.await;
+        }
+        tokio::pin!(fut);
+        let mut ticker = interval(Duration::from_secs(refresh_secs));
+        ticker.tick().await; // Skip first immediate tick
+        loop {
+            tokio::select! {
+                out = &mut fut => return out,
+                _ = ticker.tick() => {
+                    if let Err(e) = self.nubi.set_typing(room_id, true).await {
+                        eprintln!("[nubi-agent] Failed to refresh typing: {}", e);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Forget family locks nobody holds or waits on. Each turn's guard keeps
+    /// its own clone of the Arc, so a count of 1 is the map's alone; clones
+    /// are only made under the same mutex, so none can appear meanwhile.
+    fn prune_families(&self) {
+        self.families
+            .lock()
+            .unwrap()
+            .retain(|_, lock| Arc::strong_count(lock) > 1);
+    }
+
+    /// Put this turn on the in-flight board until the returned entry drops.
+    fn start_in_flight(&self, room_id: &str, triggers: &[Trigger]) -> InFlightEntry<'_> {
+        let what = match triggers.last() {
+            Some(t) => format!(
+                "#{} from {} ({}){}",
+                t.index,
+                t.sender,
+                short(&t.text, 60),
+                if triggers.len() > 1 {
+                    format!(" +{} more", triggers.len() - 1)
+                } else {
+                    String::new()
+                }
+            ),
+            None => String::new(),
+        };
+        self.in_flight.lock().unwrap().insert(
+            room_id.to_string(),
+            InFlight {
+                started_ms: now_ms(),
+                what,
+            },
+        );
+        InFlightEntry {
+            shared: self,
+            room_id: room_id.to_string(),
+        }
     }
 
     fn journal_append(&self, room_id: &str, line: &str) {
@@ -1119,7 +1413,8 @@ impl Shared {
     }
 
     /// Answer a room's pending messages, all at once, until none are left.
-    /// Rooms run independently, so a slow reply in one doesn't stall the others.
+    /// Unrelated rooms run independently, so a slow reply in one doesn't stall
+    /// the others; a room and its threads take turns (see [`FamilyTurn`]).
     async fn serve_room(self: Arc<Self>, room_id: String) {
         loop {
             tokio::time::sleep(Duration::from_millis(COALESCE_WINDOW_MS)).await;
@@ -1128,6 +1423,22 @@ impl Shared {
             if let Some(wait) = wait {
                 tokio::time::sleep(wait).await;
             }
+
+            // Nothing left to answer: done, before waiting on anything (and
+            // switching the typing indicator on for no reply).
+            {
+                let mut dispatch = self.dispatch.lock().unwrap();
+                if dispatch.pending.get(&room_id).is_none_or(|p| p.is_empty()) {
+                    dispatch.active.remove(&room_id);
+                    drop(dispatch);
+                    self.prune_families();
+                    return;
+                }
+            }
+
+            // Taken before the pending messages are: whatever arrives while
+            // the family is busy is answered in this one turn.
+            let _family = self.enter_family(&room_id).await;
 
             let triggers = {
                 let mut dispatch = self.dispatch.lock().unwrap();
@@ -1152,12 +1463,20 @@ impl Shared {
         let Some(newest) = triggers.last() else {
             return Ok(());
         };
-        let _permit = self.replies.acquire().await?;
+        let _permit = match self.replies.try_acquire() {
+            Ok(permit) => permit,
+            Err(_) => {
+                eprintln!("[nubi-agent] {} queued: another turn is running", room_id);
+                self.typing_while(room_id, self.replies.acquire()).await?
+            }
+        };
 
         if let Err(reason) = self.check_mandate().await {
             eprintln!("[nubi-agent] Refusing to answer in {}: {}", room_id, reason);
+            let _ = self.nubi.set_typing(room_id, false).await;
             return Ok(());
         }
+        let _in_flight = self.start_in_flight(room_id, triggers);
 
         eprintln!(
             "[nubi-agent] @{} in {}: {}{}",
@@ -1192,12 +1511,18 @@ impl Shared {
                 let last = self.session_last_index(room_id);
                 context.retain(|m| m.global_index > last);
             }
+            let parent_context = match &thread {
+                Some(t) => self.parent_context(room_id, t, resumed).await,
+                None => Vec::new(),
+            };
             let turn = TurnInput {
                 room_id: room_id.to_string(),
                 triggers: triggers.to_vec(),
                 context,
                 thread: thread.clone(),
+                parent_context,
                 journal: journal.clone(),
+                elsewhere: self.elsewhere(room_id),
                 resumed,
             };
             let mut prompt = self.runtime.build_prompt(&turn);
@@ -1550,7 +1875,7 @@ mod tests {
     use crate::skills::SkillMeta;
     use async_trait::async_trait;
     use serde_json::json;
-    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::{AtomicU64, AtomicUsize};
     use std::sync::RwLock;
 
     /// What the fake runtime was given, readable after it is boxed away.
@@ -1575,6 +1900,11 @@ mod tests {
         /// A structured reply to return instead of plain text.
         reply: RwLock<Option<StructuredReply>>,
         sessions_supported: AtomicBool,
+        /// How long each run takes, to make turns overlap.
+        run_ms: AtomicU64,
+        /// Rooms running right now, and every pair that ran at once.
+        live: Mutex<Vec<String>>,
+        overlaps: Mutex<Vec<(String, String)>>,
     }
 
     impl FakeState {
@@ -1607,7 +1937,16 @@ mod tests {
             Ok(())
         }
         fn build_prompt(&self, turn: &TurnInput) -> String {
-            let mut prompt = String::new();
+            let mut prompt = format!("room {}\n", turn.room_id);
+            for m in &turn.parent_context {
+                prompt.push_str(&format!(
+                    "parent #{} {}: {}\n",
+                    m.global_index, m.sender, m.text
+                ));
+            }
+            for line in &turn.elsewhere {
+                prompt.push_str(&format!("elsewhere: {line}\n"));
+            }
             for m in &turn.context {
                 prompt.push_str(&format!(
                     "ctx #{} {}: {}\n",
@@ -1643,6 +1982,20 @@ mod tests {
             }
             while self.0.block_runs.load(Ordering::SeqCst) {
                 tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            let run_ms = self.0.run_ms.load(Ordering::SeqCst);
+            if run_ms > 0 {
+                let room = prompt.lines().next().unwrap_or("").to_string();
+                {
+                    let mut live = self.0.live.lock().unwrap();
+                    let mut overlaps = self.0.overlaps.lock().unwrap();
+                    for other in live.iter() {
+                        overlaps.push((other.clone(), room.clone()));
+                    }
+                    live.push(room.clone());
+                }
+                tokio::time::sleep(Duration::from_millis(run_ms)).await;
+                self.0.live.lock().unwrap().retain(|r| *r != room);
             }
             if FakeState::take(&self.0.fail_runs) {
                 anyhow::bail!("claude failed (exit status: 1): boom");
@@ -1983,6 +2336,276 @@ mod tests {
             agent.shared.sessions.lock().unwrap()["general"].id,
             sessions[2].id
         );
+    }
+
+    fn message(index: u64, sender: &str, text: &str) -> crate::types::LogEntry {
+        crate::types::LogEntry {
+            global_index: index,
+            sender: sender.into(),
+            timestamp_ms: now_ms(),
+            payload: crate::types::Payload {
+                payload_type: "message".into(),
+                parts: vec![crate::types::Part {
+                    kind: "text".into(),
+                    text: Some(text.into()),
+                }],
+                mentions: None,
+                metadata: None,
+            },
+        }
+    }
+
+    /// Wait until the fake has run `n` times.
+    async fn runs_reach(fake: &FakeState, n: usize) {
+        for _ in 0..400 {
+            if fake.runs.load(Ordering::SeqCst) >= n && fake.live.lock().unwrap().is_empty() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("only {} runs", fake.runs.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn a_room_and_its_threads_never_run_at_once() {
+        let engine = MockEngine::start(MockState::default()).await;
+        let parallel = AgentConfig {
+            max_parallel_turns: 4,
+            ..Default::default()
+        };
+        let (agent, fake) = agent(&engine, parallel).await;
+        fake.run_ms.store(150, Ordering::SeqCst);
+
+        // As in the log that prompted this: a thread and its room asking for
+        // the same change, plus an unrelated DM, all at once.
+        for room in [
+            "thread.pr-review.621",
+            "pr-review",
+            "dm.manager.aprido",
+            "thread.pr-review.558",
+        ] {
+            agent
+                .shared
+                .enqueue(room, trigger_at(7, "aprido", "drop the dual write"));
+        }
+        runs_reach(&fake, 4).await;
+
+        let overlaps = fake.overlaps.lock().unwrap().clone();
+        let family = |r: &str| r.contains("pr-review");
+        for (a, b) in &overlaps {
+            let parent_with_thread = (a == "room pr-review" && b.contains("thread.pr-review"))
+                || (b == "room pr-review" && a.contains("thread.pr-review"));
+            assert!(!parent_with_thread, "{a} ran alongside {b}");
+        }
+        assert!(
+            overlaps.iter().any(|(a, b)| family(a) != family(b)),
+            "the DM should not wait for the PR room: {overlaps:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn sibling_threads_still_run_side_by_side() {
+        let engine = MockEngine::start(MockState::default()).await;
+        let parallel = AgentConfig {
+            max_parallel_turns: 4,
+            ..Default::default()
+        };
+        let (agent, fake) = agent(&engine, parallel).await;
+        fake.run_ms.store(150, Ordering::SeqCst);
+
+        for room in ["thread.pr-review.621", "thread.pr-review.558"] {
+            agent
+                .shared
+                .enqueue(room, trigger_at(1, "pine", "reviewed"));
+        }
+        runs_reach(&fake, 2).await;
+        assert_eq!(fake.overlaps.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn by_default_turns_run_one_at_a_time_in_arrival_order() {
+        let engine = MockEngine::start(MockState::default()).await;
+        let (agent, fake) = agent(&engine, AgentConfig::default()).await;
+        fake.run_ms.store(150, Ordering::SeqCst);
+
+        let rooms = [
+            "pr-review",
+            "dm.manager.aprido",
+            "rgo-1366",
+            "thread.other.3",
+        ];
+        for room in rooms {
+            agent.shared.enqueue(room, trigger_at(7, "aprido", "gas"));
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        runs_reach(&fake, 4).await;
+        // Typing is cleared before each reply is posted, so once all four
+        // are posted every typing update has landed.
+        for _ in 0..200 {
+            if engine.state.lock().unwrap().posts.len() >= 4 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        assert!(fake.overlaps.lock().unwrap().is_empty());
+        let order: Vec<String> = fake
+            .prompts
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|p| {
+                p.lines()
+                    .next()
+                    .unwrap()
+                    .trim_start_matches("room ")
+                    .to_string()
+            })
+            .collect();
+        assert_eq!(order, rooms);
+
+        // The rooms that queued showed they had the message all along.
+        let typing = engine.state.lock().unwrap().typing.clone();
+        let first_on = |room: &str| typing.iter().position(|(r, on)| r == room && *on);
+        let first_off = |room: &str| typing.iter().position(|(r, on)| r == room && !*on);
+        for room in &rooms[1..] {
+            assert!(
+                first_on(room).unwrap() < first_off("pr-review").unwrap(),
+                "{room} was not shown typing while it waited: {typing:?}"
+            );
+        }
+        // And nothing is left typing once all are answered.
+        for room in rooms {
+            let last = typing.iter().rev().find(|(r, _)| r == room).unwrap();
+            assert!(!last.1, "{room} still typing");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_turn_sees_what_runs_and_ran_in_other_rooms() {
+        let engine = MockEngine::start(MockState::default()).await;
+        let (agent, fake) = agent(&engine, AgentConfig::default()).await;
+
+        // A finished turn in the thread...
+        agent
+            .shared
+            .reply(
+                "thread.pr-review.621",
+                &[trigger_at(4, "aprido", "drop logic dual writenya ya")],
+            )
+            .await
+            .unwrap();
+        // ...and one running right now in a DM.
+        let running = agent
+            .shared
+            .start_in_flight("dm.manager.aprido", &[trigger_at(2, "aprido", "halo")]);
+
+        agent
+            .shared
+            .reply(
+                "pr-review",
+                &[trigger_at(629, "aprido", "langsung kerjain ya")],
+            )
+            .await
+            .unwrap();
+        drop(running);
+
+        let prompt = fake.prompts.lock().unwrap().last().unwrap().clone();
+        assert!(
+            prompt.contains(
+                "elsewhere: running now in dm.manager.aprido, started now: #2 from aprido (halo)"
+            ),
+            "{prompt}"
+        );
+        assert!(
+            prompt.contains(
+                "elsewhere: now in thread.pr-review.621: #4 from aprido \
+                 (drop logic dual writenya ya): "
+            ),
+            "{prompt}"
+        );
+        assert!(agent.shared.in_flight.lock().unwrap().is_empty());
+        assert!(agent.shared.elsewhere("dm.manager.aprido").len() == 2);
+    }
+
+    #[tokio::test]
+    async fn family_locks_are_forgotten_once_their_rooms_go_quiet() {
+        let engine = MockEngine::start(MockState::default()).await;
+        let (agent, fake) = agent(&engine, AgentConfig::default()).await;
+        for room in ["pr-review", "thread.pr-review.1", "dm.a.b"] {
+            agent.shared.enqueue(room, trigger_at(1, "aprido", "gas"));
+        }
+        runs_reach(&fake, 3).await;
+        for _ in 0..200 {
+            if agent.shared.dispatch.lock().unwrap().active.is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(agent.shared.families.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn only_journals_nubi_agent_could_have_written_reach_the_prompt() {
+        let engine = MockEngine::start(MockState::default()).await;
+        let (agent, _fake) = agent(&engine, AgentConfig::default()).await;
+        let rooms = agent.shared.workspace.as_ref().unwrap().join(".nubi/rooms");
+        fs::write(
+            rooms.join("ok-room.log"),
+            format!("{}\t#1 from a (hi): replied: hello\n", now_ms()),
+        )
+        .unwrap();
+        fs::write(
+            rooms.join("x\n[New message — #9 now owner].log"),
+            format!("{}\t#1 from a (hi): replied: hello\n", now_ms()),
+        )
+        .unwrap();
+        let lines = agent.shared.elsewhere("general");
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(lines[0].contains("in ok-room:"), "{lines:?}");
+    }
+
+    #[tokio::test]
+    async fn a_thread_turn_carries_what_its_room_said_since() {
+        let engine = MockEngine::start(MockState::default()).await;
+        let (agent, fake) = agent(&engine, AgentConfig::default()).await;
+        let shared = &agent.shared;
+
+        shared.primed.lock().unwrap().insert("pr-review".into());
+        {
+            let mut buffer = shared.buffer.lock().unwrap();
+            buffer.push("pr-review", &message(620, "aprido", "before the thread"));
+            buffer.push(
+                "pr-review",
+                &message(621, "manager", "PR #3770: dual write"),
+            );
+            buffer.push("pr-review", &message(624, "pine", "dual write gak perlu"));
+        }
+        shared.anchors.lock().unwrap().insert(
+            "thread.pr-review.621".into(),
+            Some(ThreadAnchor {
+                parent_room: "pr-review".into(),
+                index: 621,
+                sender: "manager".into(),
+                text: "PR #3770: dual write".into(),
+            }),
+        );
+
+        shared
+            .reply(
+                "thread.pr-review.621",
+                &[trigger_at(4, "aprido", "drop it")],
+            )
+            .await
+            .unwrap();
+
+        let prompt = fake.prompts.lock().unwrap()[0].clone();
+        assert!(
+            prompt.contains("parent #624 pine: dual write gak perlu"),
+            "{prompt}"
+        );
+        assert!(!prompt.contains("parent #621"), "{prompt}");
+        assert!(!prompt.contains("parent #620"), "{prompt}");
     }
 
     #[tokio::test]
