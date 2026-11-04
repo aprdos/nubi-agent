@@ -84,6 +84,16 @@ fn short(body: &str) -> String {
 
 /// Every request here is short — the SSE stream runs on its own
 /// eventsource-client, so a whole-request timeout is safe.
+/// An upload id that is safe as one URL path segment: ASCII letters,
+/// digits, `_` and `-` only.
+fn is_upload_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 64
+        && id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+}
+
 fn http_client() -> Client {
     Client::builder()
         .connect_timeout(CONNECT_TIMEOUT)
@@ -495,6 +505,80 @@ impl NubiClient {
             .find(|e| e.global_index == index))
     }
 
+    /// Download an attachment to `dest`, refusing anything over `max_bytes`.
+    ///
+    /// `/content` redirects to a short-lived object storage URL; reqwest
+    /// follows it and drops the Authorization header on the way, so the
+    /// token never leaves for the storage host. The file is written next to
+    /// `dest` under a name of its own and renamed into place, so a partial
+    /// download never sits at the path the prompt names and two downloads
+    /// of the same file cannot write into each other.
+    pub async fn download_upload(
+        &self,
+        room_id: &str,
+        upload_id: &str,
+        dest: &std::path::Path,
+        max_bytes: u64,
+    ) -> anyhow::Result<()> {
+        // Ids come from message JSON. The engine only issues `up_` + hex,
+        // but a value that could change the request path is never sent.
+        if !is_upload_id(upload_id) {
+            anyhow::bail!(
+                "Refusing to fetch malformed upload id {:?}",
+                short(upload_id)
+            );
+        }
+        // Room ids come from the stream; same rule, so neither segment can
+        // change the request path
+        if !crate::agent::is_room_id(room_id) {
+            anyhow::bail!(
+                "Refusing to fetch from malformed room id {:?}",
+                short(room_id)
+            );
+        }
+        let mut resp = self
+            .client
+            .get(format!(
+                "{}/v1/spaces/{}/rooms/{}/uploads/{}/content",
+                self.base_url, self.space, room_id, upload_id
+            ))
+            .header("Authorization", format!("Bearer {}", self.token))
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = short(&resp.text().await.unwrap_or_default());
+            anyhow::bail!("Failed to download {}: {} - {}", upload_id, status, body);
+        }
+        if resp.content_length().is_some_and(|n| n > max_bytes) {
+            anyhow::bail!("{} is larger than {} bytes", upload_id, max_bytes);
+        }
+
+        let mut bytes = Vec::new();
+        while let Some(chunk) = resp.chunk().await? {
+            bytes.extend_from_slice(&chunk);
+            if bytes.len() as u64 > max_bytes {
+                anyhow::bail!("{} is larger than {} bytes", upload_id, max_bytes);
+            }
+        }
+
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let tmp = dest.with_extension(format!("{}-{n}.part", std::process::id()));
+        if let Err(e) = tokio::fs::write(&tmp, &bytes).await {
+            let _ = tokio::fs::remove_file(&tmp).await;
+            return Err(e.into());
+        }
+        // Rename is atomic; a concurrent download of the same file just
+        // replaces it with identical bytes
+        if let Err(e) = tokio::fs::rename(&tmp, dest).await {
+            let _ = tokio::fs::remove_file(&tmp).await;
+            return Err(e.into());
+        }
+        Ok(())
+    }
+
     /// Set typing status in a room
     pub async fn set_typing(&self, room_id: &str, typing: bool) -> anyhow::Result<()> {
         let resp = self
@@ -622,6 +706,120 @@ mod tests {
             mandate_hash: None,
             usage: None,
         }
+    }
+
+    #[tokio::test]
+    async fn an_attachment_downloads_through_the_redirect_without_the_token() {
+        use crate::mock_engine::{MockEngine, MockState};
+        let engine = MockEngine::start(MockState {
+            uploads: [("up_1".to_string(), b"\x89PNG data".to_vec())].into(),
+            ..Default::default()
+        })
+        .await;
+        let client = NubiClient::new(&engine.url, "secret-token", "s1", "bot");
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("up_1.png");
+
+        client
+            .download_upload("general", "up_1", &dest, 1024)
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read(&dest).unwrap(), b"\x89PNG data");
+        // Storage is another host: the bearer token stays behind
+        assert_eq!(engine.state().storage_auth, vec![None]);
+        // No temporary file is left behind
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_malformed_upload_id_is_never_requested() {
+        use crate::mock_engine::{MockEngine, MockState};
+        let engine = MockEngine::start(MockState::default()).await;
+        let client = NubiClient::new(&engine.url, "tok", "s1", "bot");
+        let dir = tempfile::tempdir().unwrap();
+        for id in [
+            "up1/../../../v1/me",
+            "up?x=1",
+            "up#frag",
+            "up%2F..",
+            "",
+            "..",
+            "up 1",
+        ] {
+            let err = client
+                .download_upload("general", id, &dir.path().join("x.png"), 1024)
+                .await
+                .unwrap_err();
+            assert!(err.to_string().contains("malformed"), "{id}: {err}");
+        }
+        for room in [
+            "../../admin",
+            "general/../me",
+            "room?x=1",
+            "room#x",
+            "a%2F",
+            "..",
+            "",
+        ] {
+            let err = client
+                .download_upload(room, "up_1", &dir.path().join("x.png"), 1024)
+                .await
+                .unwrap_err();
+            assert!(err.to_string().contains("malformed room"), "{room}: {err}");
+        }
+        // Nothing reached storage
+        assert!(engine.state().storage_auth.is_empty());
+        assert!(is_upload_id("up_0123abcdef"));
+        for room in ["general", "dm.alice.bot", "thread.pr-review.621"] {
+            assert!(crate::agent::is_room_id(room), "{room}");
+        }
+    }
+
+    #[tokio::test]
+    async fn concurrent_downloads_of_one_file_do_not_collide() {
+        use crate::mock_engine::{MockEngine, MockState};
+        let body = vec![7u8; 64 * 1024];
+        let engine = MockEngine::start(MockState {
+            uploads: [("up_1".to_string(), body.clone())].into(),
+            ..Default::default()
+        })
+        .await;
+        let client = NubiClient::new(&engine.url, "tok", "s1", "bot");
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("up_1.png");
+
+        let runs = (0..8).map(|_| client.download_upload("general", "up_1", &dest, 1 << 20));
+        for result in futures::future::join_all(runs).await {
+            result.unwrap();
+        }
+        assert_eq!(std::fs::read(&dest).unwrap(), body);
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    #[tokio::test]
+    async fn an_oversized_or_missing_attachment_is_refused() {
+        use crate::mock_engine::{MockEngine, MockState};
+        let engine = MockEngine::start(MockState {
+            uploads: [("big".to_string(), vec![0u8; 2048])].into(),
+            ..Default::default()
+        })
+        .await;
+        let client = NubiClient::new(&engine.url, "tok", "s1", "bot");
+        let dir = tempfile::tempdir().unwrap();
+
+        let dest = dir.path().join("big.png");
+        let err = client
+            .download_upload("general", "big", &dest, 1024)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("larger than"), "{err}");
+        assert!(!dest.exists());
+
+        let err = client
+            .download_upload("general", "nope", &dir.path().join("nope.png"), 1024)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("404"), "{err}");
     }
 
     #[tokio::test]

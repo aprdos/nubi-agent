@@ -11,12 +11,14 @@ use tokio::sync::{OwnedRwLockReadGuard, OwnedRwLockWriteGuard, RwLock as TurnLoc
 use tokio::time::interval;
 
 use crate::buffer::{BufferedMessage, RoomBuffer};
-use crate::harness::{age, now_ms, write_private, CliRuntime, HarnessKind, McpServer};
+use crate::harness::{age, now_ms, one_line, write_private, CliRuntime, HarnessKind, McpServer};
 use crate::mandate::{FetchError, Fetched, Mandate, MandateLoader};
 use crate::nubi::{usage_metadata, NubiClient, Outgoing, Refused};
-use crate::runtime::{AgentRuntime, RunOutput, Session, ThreadAnchor, Trigger, TurnInput};
+use crate::runtime::{
+    AgentRuntime, Attachment, RunOutput, Session, ThreadAnchor, Trigger, TurnInput,
+};
 use crate::skills::{CompositeSkillLoader, RoomSkillLoader, Skill, SkillLoader};
-use crate::types::{MandateUpdate, SendMessage, SseData};
+use crate::types::{FileRef, MandateUpdate, SendMessage, SseData};
 
 /// How long a room's incoming burst is allowed to settle before we answer.
 /// Everything that arrived by then is answered in one turn.
@@ -51,10 +53,25 @@ const PARENT_CONTEXT_MESSAGES: usize = 8;
 /// Startup attempts at fetching the mandate before carrying on without one
 /// (unless `mandate_strict`, which keeps trying).
 const MANDATE_INIT_ATTEMPTS: u32 = 3;
+
+/// Largest attachment the agent downloads; matches the server's upload cap.
+const MAX_ATTACHMENT_BYTES: u64 = 10 * 1024 * 1024;
+
+/// How long a downloaded attachment stays in the workspace.
+const ATTACHMENT_TTL: Duration = Duration::from_secs(7 * 24 * 3600);
 const MANDATE_BACKOFF_START: Duration = Duration::from_secs(1);
 const MANDATE_BACKOFF_MAX: Duration = Duration::from_secs(60);
 
 /// Check if a string is safe to use as a path segment (no traversal)
+/// Looks like a nubi room id (`general`, `dm.a.b`, `thread.pr-review.621`):
+/// ASCII letters, digits and `-_.:@`, and safe as a path segment. Room ids
+/// go into URL paths, file names and the prompt, so anything else is refused.
+pub(crate) fn is_room_id(s: &str) -> bool {
+    s.chars()
+        .all(|c| c.is_ascii_alphanumeric() || "-_.:@".contains(c))
+        && is_safe_path_segment(s)
+}
+
 pub(crate) fn is_safe_path_segment(s: &str) -> bool {
     !s.is_empty()
         && !s.contains('/')
@@ -705,6 +722,50 @@ fn adhoc_skills(skills: &[Skill], mandate: Option<&Mandate>, allow_local: bool) 
         .collect()
 }
 
+fn attachments_dir(workspace: &Path) -> PathBuf {
+    workspace.join(".nubi").join("attachments")
+}
+
+/// Where a file is saved: its upload id (restricted to safe characters, so
+/// it can never leave the directory) plus an extension from its type.
+fn attachment_path(dir: &Path, file: &FileRef) -> PathBuf {
+    let id: String = file
+        .upload_id
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-')
+        .collect();
+    let ext = match file.mime_type.as_str() {
+        "image/png" => "png",
+        "image/jpeg" => "jpg",
+        "image/gif" => "gif",
+        "image/webp" => "webp",
+        _ => "bin",
+    };
+    dir.join(format!(
+        "{}.{}",
+        if id.is_empty() { "file" } else { &id },
+        ext
+    ))
+}
+
+/// Delete saved attachments older than `ttl`. Best effort.
+fn prune_attachments(dir: &Path, ttl: Duration) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let old = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.elapsed().ok())
+            .is_some_and(|age| age > ttl);
+        if old {
+            let _ = fs::remove_file(entry.path());
+        }
+    }
+}
+
 fn sessions_path(workspace: &Path) -> PathBuf {
     workspace.join(".nubi").join("sessions.json")
 }
@@ -1050,6 +1111,9 @@ impl Shared {
             return Ok(());
         }
 
+        // Fetched before the message is queued, so the turn can open them
+        let attachments = self.fetch_attachments(&room_id, &entry.files()).await;
+
         self.offsets
             .lock()
             .unwrap()
@@ -1065,10 +1129,62 @@ impl Shared {
                 index: entry.global_index,
                 expect_reply: entry.expect_reply_list(),
                 timestamp_ms: entry.timestamp_ms,
+                attachments,
             },
         );
 
         Ok(())
+    }
+
+    /// Save a message's files under the workspace so the harness can open
+    /// them with its own file tools. A file that cannot be fetched is still
+    /// listed, without a path, so the model knows it was there.
+    async fn fetch_attachments(&self, room_id: &str, files: &[FileRef]) -> Vec<Attachment> {
+        if files.is_empty() {
+            return Vec::new();
+        }
+        let dir = self.workspace.as_ref().map(|ws| attachments_dir(ws));
+        if let Some(dir) = &dir {
+            if let Err(e) = fs::create_dir_all(dir) {
+                eprintln!("[nubi-agent] Cannot create {:?}: {}", dir, e);
+            }
+            prune_attachments(dir, ATTACHMENT_TTL);
+        }
+
+        let mut out = Vec::with_capacity(files.len());
+        for file in files {
+            let path = match &dir {
+                Some(dir) => {
+                    let path = attachment_path(dir, file);
+                    // Already fetched for an earlier turn on the same message
+                    if path.exists() {
+                        Some(path)
+                    } else {
+                        match self
+                            .nubi
+                            .download_upload(room_id, &file.upload_id, &path, MAX_ATTACHMENT_BYTES)
+                            .await
+                        {
+                            Ok(()) => Some(path),
+                            Err(e) => {
+                                eprintln!(
+                                    "[nubi-agent] Could not fetch {} in {}: {}",
+                                    file.upload_id, room_id, e
+                                );
+                                None
+                            }
+                        }
+                    }
+                }
+                None => None,
+            };
+            out.push(Attachment {
+                name: file.name.clone(),
+                mime_type: file.mime_type.clone(),
+                path,
+            });
+        }
+        out
     }
 
     /// Record a delivered entry. False when the room already got it.
@@ -1124,12 +1240,22 @@ impl Shared {
         }
         let (parent, index) = parse_thread_room(room_id)?;
         let anchor = match self.nubi.message_at(&parent, index).await {
-            Ok(Some(entry)) => Some(ThreadAnchor {
-                parent_room: parent,
-                index,
-                sender: entry.sender.clone(),
-                text: entry.text(),
-            }),
+            Ok(Some(entry)) => {
+                // An image-only anchor still says what it was
+                let mut text = entry.text();
+                for file in entry.files() {
+                    if !text.is_empty() {
+                        text.push('\n');
+                    }
+                    text.push_str(&format!("(image: {})", one_line(&file.name)));
+                }
+                Some(ThreadAnchor {
+                    parent_room: parent,
+                    index,
+                    sender: entry.sender.clone(),
+                    text,
+                })
+            }
             Ok(None) => None,
             Err(e) => {
                 eprintln!(
@@ -1220,10 +1346,7 @@ impl Shared {
                 // room id (`dm.a.b`, `thread.pr-review.621`), not merely be
                 // a safe path: a planted file could carry a newline and a
                 // forged `[New message — …]` marker.
-                let room_like = room
-                    .chars()
-                    .all(|c| c.is_ascii_alphanumeric() || "-_.:@".contains(c));
-                (room_like && is_safe_path_segment(&room)).then_some((room, path))
+                is_room_id(&room).then_some((room, path))
             })
             .collect()
     }
@@ -2120,6 +2243,14 @@ mod tests {
             }
             for t in &turn.triggers {
                 prompt.push_str(&format!("new #{} {}: {}\n", t.index, t.sender, t.text));
+                for a in &t.attachments {
+                    let path = a.path.as_ref().map(|p| p.display().to_string());
+                    prompt.push_str(&format!(
+                        "attachment {}: {}\n",
+                        a.name,
+                        path.unwrap_or("-".into())
+                    ));
+                }
             }
             if turn.resumed {
                 prompt.push_str("(resumed)\n");
@@ -2312,6 +2443,7 @@ mod tests {
             index,
             expect_reply: None,
             timestamp_ms: now_ms(),
+            attachments: vec![],
         }
     }
 
@@ -2513,6 +2645,7 @@ mod tests {
                 parts: vec![crate::types::Part {
                     kind: "text".into(),
                     text: Some(text.into()),
+                    file: None,
                 }],
                 mentions: None,
                 metadata: None,
@@ -2558,6 +2691,48 @@ mod tests {
 
     fn committable(agent: &Agent, room: &str) -> u64 {
         agent.shared.offsets.lock().unwrap().committable(room)
+    }
+
+    #[tokio::test]
+    async fn an_image_only_message_is_answered_with_the_image_saved() {
+        let engine = MockEngine::start(MockState {
+            uploads: [("up_cat".to_string(), b"\x89PNG cat".to_vec())].into(),
+            ..Default::default()
+        })
+        .await;
+        let (agent, fake) = agent(&engine, AgentConfig::default()).await;
+        let dm = "dm.aprido.support-bot";
+        let event = serde_json::json!({
+            "room_id": dm,
+            "entry": {
+                "global_index": 7,
+                "sender": "aprido",
+                "timestamp_ms": now_ms(),
+                "payload": {"type": "message", "parts": [
+                    {"kind": "file", "file": {"upload_id": "up_cat", "name": "cat.png", "mime_type": "image/png", "size": 9}},
+                    {"kind": "file", "file": {"upload_id": "up_gone", "name": "gone.png", "mime_type": "image/png", "size": 9}}
+                ]}
+            }
+        })
+        .to_string();
+
+        agent.shared.ingest(&event).await.unwrap();
+        posts_reach(&engine, 1).await;
+
+        let saved = agent
+            .shared
+            .workspace
+            .as_ref()
+            .unwrap()
+            .join(".nubi/attachments/up_cat.png");
+        assert_eq!(fs::read(&saved).unwrap(), b"\x89PNG cat");
+        let prompt = fake.prompts.lock().unwrap()[0].clone();
+        assert!(
+            prompt.contains(&format!("attachment cat.png: {}\n", saved.display())),
+            "{prompt}"
+        );
+        // A file that could not be fetched is still mentioned
+        assert!(prompt.contains("attachment gone.png: -\n"), "{prompt}");
     }
 
     #[tokio::test]
@@ -2956,6 +3131,7 @@ mod tests {
                             parts: vec![crate::types::Part {
                                 kind: "text".into(),
                                 text: Some(text.into()),
+                                file: None,
                             }],
                             mentions: None,
                             metadata: None,
@@ -3457,5 +3633,52 @@ mod tests {
         let adhoc = state.adhoc.read().unwrap().clone();
         assert!(!adhoc.contains("deploys"));
         assert!(adhoc.contains("FAQ"));
+    }
+
+    #[test]
+    fn attachment_paths_stay_in_their_directory() {
+        let dir = Path::new("/ws/.nubi/attachments");
+        let file = |id: &str, mime: &str| FileRef {
+            upload_id: id.into(),
+            name: "x".into(),
+            mime_type: mime.into(),
+            size: 1,
+        };
+        assert_eq!(
+            attachment_path(dir, &file("up_abc123", "image/png")),
+            dir.join("up_abc123.png")
+        );
+        assert_eq!(
+            attachment_path(dir, &file("up_1", "image/jpeg")),
+            dir.join("up_1.jpg")
+        );
+        assert_eq!(
+            attachment_path(dir, &file("../../etc/hosts", "image/webp")),
+            dir.join("etchosts.webp")
+        );
+        assert_eq!(
+            attachment_path(dir, &file("/..", "text/html")),
+            dir.join("file.bin")
+        );
+    }
+
+    #[test]
+    fn old_attachments_are_pruned() {
+        let dir = tempfile::tempdir().unwrap();
+        let old = dir.path().join("old.png");
+        let new = dir.path().join("new.png");
+        fs::write(&old, b"x").unwrap();
+        fs::write(&new, b"x").unwrap();
+        let week_ago = SystemTime::now() - Duration::from_secs(8 * 24 * 3600);
+        fs::File::options()
+            .write(true)
+            .open(&old)
+            .unwrap()
+            .set_modified(week_ago)
+            .unwrap();
+
+        prune_attachments(dir.path(), ATTACHMENT_TTL);
+        assert!(!old.exists());
+        assert!(new.exists());
     }
 }

@@ -46,6 +46,13 @@ pub struct MockState {
     pub me_failures: Vec<u16>,
     /// Committed offsets per room, kept monotonic as the engine does.
     pub offsets: HashMap<String, u64>,
+    /// Attachment bytes by upload id. `/content` redirects to a storage
+    /// route on a different host name, as the engine redirects to S3.
+    pub uploads: HashMap<String, Vec<u8>>,
+    /// The Authorization header each storage request arrived with.
+    pub storage_auth: Vec<Option<String>>,
+    /// Where `/content` redirects to; set by `start`.
+    pub storage_base: String,
 }
 
 pub struct MockEngine {
@@ -72,10 +79,16 @@ impl MockEngine {
             .route("/v1/spaces/{space}/rooms/{room}/typing", post(typing))
             .route("/v1/spaces/{space}/rooms/{room}/offset", post(offset))
             .route("/v1/me", get(me))
+            .route(
+                "/v1/spaces/{space}/rooms/{room}/uploads/{upload}/content",
+                get(upload_content),
+            )
+            .route("/storage/{upload}", get(storage))
             .with_state(Arc::clone(&state));
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
+        state.lock().unwrap().storage_base = format!("http://localhost:{}", addr.port());
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
 
         Self {
@@ -184,6 +197,38 @@ async fn typing(
     let on = body["typing"].as_bool().unwrap_or(false);
     s.lock().unwrap().typing.push((room, on));
     StatusCode::OK
+}
+
+async fn upload_content(
+    State(s): Shared,
+    Path((_space, _room, upload)): Path<(String, String, String)>,
+) -> Response {
+    let s = s.lock().unwrap();
+    if !s.uploads.contains_key(&upload) {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": "upload not found"})),
+        )
+            .into_response();
+    }
+    (
+        StatusCode::TEMPORARY_REDIRECT,
+        [("location", format!("{}/storage/{upload}", s.storage_base))],
+    )
+        .into_response()
+}
+
+async fn storage(State(s): Shared, Path(upload): Path<String>, headers: HeaderMap) -> Response {
+    let mut s = s.lock().unwrap();
+    let auth = headers
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .map(String::from);
+    s.storage_auth.push(auth);
+    match s.uploads.get(&upload) {
+        Some(bytes) => ([("content-type", "image/png")], bytes.clone()).into_response(),
+        None => StatusCode::NOT_FOUND.into_response(),
+    }
 }
 
 async fn history() -> Json<Value> {

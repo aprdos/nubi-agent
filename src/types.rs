@@ -44,6 +44,22 @@ pub struct Payload {
 pub struct Part {
     pub kind: String,
     pub text: Option<String>,
+    /// Set on `kind: "file"` parts.
+    #[serde(default)]
+    pub file: Option<FileRef>,
+}
+
+/// An uploaded attachment a message carries. The server fills name, type
+/// and size from the upload record.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct FileRef {
+    pub upload_id: String,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub mime_type: String,
+    #[serde(default)]
+    pub size: u64,
 }
 
 /// Outbound message for POST
@@ -72,6 +88,16 @@ impl LogEntry {
             .filter_map(|p| p.text.as_deref())
             .collect::<Vec<_>>()
             .join("")
+    }
+
+    /// The files this entry carries, in order.
+    pub fn files(&self) -> Vec<FileRef> {
+        self.payload
+            .parts
+            .iter()
+            .filter(|p| p.kind == "file")
+            .filter_map(|p| p.file.clone())
+            .collect()
     }
 
     /// Check if this entry mentions a specific agent (or @here for all)
@@ -189,11 +215,36 @@ mod tests {
                 parts: vec![Part {
                     kind: "text".to_string(),
                     text: Some(text.to_string()),
+                    file: None,
                 }],
                 mentions: mentions.map(|m| m.into_iter().map(String::from).collect()),
                 metadata: None,
             },
         }
+    }
+
+    #[test]
+    fn file_parts_are_read_and_text_ignores_them() {
+        let entry: LogEntry = serde_json::from_value(json!({
+            "global_index": 3,
+            "sender": "alice",
+            "timestamp_ms": 1,
+            "payload": {
+                "type": "message",
+                "parts": [
+                    {"kind": "file", "file": {"upload_id": "up_1", "name": "cat.png", "mime_type": "image/png", "size": 3}},
+                    {"kind": "text", "text": "look"},
+                    {"kind": "file", "file": {"upload_id": "up_2"}}
+                ]
+            }
+        }))
+        .unwrap();
+        assert_eq!(entry.text(), "look");
+        let files = entry.files();
+        assert_eq!(files.len(), 2);
+        assert_eq!(files[0].name, "cat.png");
+        assert_eq!(files[1].upload_id, "up_2");
+        assert_eq!(files[1].mime_type, "");
     }
 
     fn with_metadata(metadata: Value) -> LogEntry {
