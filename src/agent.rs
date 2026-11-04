@@ -11,7 +11,7 @@ use tokio::sync::{OwnedRwLockReadGuard, OwnedRwLockWriteGuard, RwLock as TurnLoc
 use tokio::time::interval;
 
 use crate::buffer::{BufferedMessage, RoomBuffer};
-use crate::harness::{age, now_ms, write_private, CliRuntime, HarnessKind, McpServer};
+use crate::harness::{age, now_ms, one_line, write_private, CliRuntime, HarnessKind, McpServer};
 use crate::mandate::{FetchError, Fetched, Mandate, MandateLoader};
 use crate::nubi::{usage_metadata, NubiClient, Outgoing, Refused};
 use crate::runtime::{
@@ -1238,7 +1238,7 @@ impl Shared {
                     if !text.is_empty() {
                         text.push('\n');
                     }
-                    text.push_str(&format!("(image: {})", file.name));
+                    text.push_str(&format!("(image: {})", one_line(&file.name)));
                 }
                 Some(ThreadAnchor {
                     parent_room: parent,

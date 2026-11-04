@@ -84,6 +84,16 @@ fn short(body: &str) -> String {
 
 /// Every request here is short — the SSE stream runs on its own
 /// eventsource-client, so a whole-request timeout is safe.
+/// An upload id that is safe as one URL path segment: ASCII letters,
+/// digits, `_` and `-` only.
+fn is_upload_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 64
+        && id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+}
+
 fn http_client() -> Client {
     Client::builder()
         .connect_timeout(CONNECT_TIMEOUT)
@@ -510,6 +520,14 @@ impl NubiClient {
         dest: &std::path::Path,
         max_bytes: u64,
     ) -> anyhow::Result<()> {
+        // Ids come from message JSON. The engine only issues `up_` + hex,
+        // but a value that could change the request path is never sent.
+        if !is_upload_id(upload_id) {
+            anyhow::bail!(
+                "Refusing to fetch malformed upload id {:?}",
+                short(upload_id)
+            );
+        }
         let mut resp = self
             .client
             .get(format!(
@@ -703,6 +721,32 @@ mod tests {
         assert_eq!(engine.state().storage_auth, vec![None]);
         // No temporary file is left behind
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_malformed_upload_id_is_never_requested() {
+        use crate::mock_engine::{MockEngine, MockState};
+        let engine = MockEngine::start(MockState::default()).await;
+        let client = NubiClient::new(&engine.url, "tok", "s1", "bot");
+        let dir = tempfile::tempdir().unwrap();
+        for id in [
+            "up1/../../../v1/me",
+            "up?x=1",
+            "up#frag",
+            "up%2F..",
+            "",
+            "..",
+            "up 1",
+        ] {
+            let err = client
+                .download_upload("general", id, &dir.path().join("x.png"), 1024)
+                .await
+                .unwrap_err();
+            assert!(err.to_string().contains("malformed"), "{id}: {err}");
+        }
+        // Nothing reached storage
+        assert!(engine.state().storage_auth.is_empty());
+        assert!(is_upload_id("up_0123abcdef"));
     }
 
     #[tokio::test]
