@@ -3647,8 +3647,8 @@ mod tests {
             dir.join("up_1.jpg")
         );
         assert_eq!(
-            attachment_path(dir, &file("../../etc/passwd", "image/webp")),
-            dir.join("etcpasswd.webp")
+            attachment_path(dir, &file("../../etc/hosts", "image/webp")),
+            dir.join("etchosts.webp")
         );
         assert_eq!(
             attachment_path(dir, &file("/..", "text/html")),

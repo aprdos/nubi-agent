@@ -500,8 +500,9 @@ impl NubiClient {
     /// `/content` redirects to a short-lived object storage URL; reqwest
     /// follows it and drops the Authorization header on the way, so the
     /// token never leaves for the storage host. The file is written next to
-    /// `dest` and renamed into place, so a partial download never sits at
-    /// the path the prompt names.
+    /// `dest` under a name of its own and renamed into place, so a partial
+    /// download never sits at the path the prompt names and two downloads
+    /// of the same file cannot write into each other.
     pub async fn download_upload(
         &self,
         room_id: &str,
@@ -536,9 +537,19 @@ impl NubiClient {
             }
         }
 
-        let tmp = dest.with_extension("part");
-        tokio::fs::write(&tmp, &bytes).await?;
-        tokio::fs::rename(&tmp, dest).await?;
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let tmp = dest.with_extension(format!("{}-{n}.part", std::process::id()));
+        if let Err(e) = tokio::fs::write(&tmp, &bytes).await {
+            let _ = tokio::fs::remove_file(&tmp).await;
+            return Err(e.into());
+        }
+        // Rename is atomic; a concurrent download of the same file just
+        // replaces it with identical bytes
+        if let Err(e) = tokio::fs::rename(&tmp, dest).await {
+            let _ = tokio::fs::remove_file(&tmp).await;
+            return Err(e.into());
+        }
         Ok(())
     }
 
@@ -690,7 +701,29 @@ mod tests {
         assert_eq!(std::fs::read(&dest).unwrap(), b"\x89PNG data");
         // Storage is another host: the bearer token stays behind
         assert_eq!(engine.state().storage_auth, vec![None]);
-        assert!(!dest.with_extension("part").exists());
+        // No temporary file is left behind
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    #[tokio::test]
+    async fn concurrent_downloads_of_one_file_do_not_collide() {
+        use crate::mock_engine::{MockEngine, MockState};
+        let body = vec![7u8; 64 * 1024];
+        let engine = MockEngine::start(MockState {
+            uploads: [("up_1".to_string(), body.clone())].into(),
+            ..Default::default()
+        })
+        .await;
+        let client = NubiClient::new(&engine.url, "tok", "s1", "bot");
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("up_1.png");
+
+        let runs = (0..8).map(|_| client.download_upload("general", "up_1", &dest, 1 << 20));
+        for result in futures::future::join_all(runs).await {
+            result.unwrap();
+        }
+        assert_eq!(std::fs::read(&dest).unwrap(), body);
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
     }
 
     #[tokio::test]
