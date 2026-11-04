@@ -63,6 +63,15 @@ const MANDATE_BACKOFF_START: Duration = Duration::from_secs(1);
 const MANDATE_BACKOFF_MAX: Duration = Duration::from_secs(60);
 
 /// Check if a string is safe to use as a path segment (no traversal)
+/// Looks like a nubi room id (`general`, `dm.a.b`, `thread.pr-review.621`):
+/// ASCII letters, digits and `-_.:@`, and safe as a path segment. Room ids
+/// go into URL paths, file names and the prompt, so anything else is refused.
+pub(crate) fn is_room_id(s: &str) -> bool {
+    s.chars()
+        .all(|c| c.is_ascii_alphanumeric() || "-_.:@".contains(c))
+        && is_safe_path_segment(s)
+}
+
 pub(crate) fn is_safe_path_segment(s: &str) -> bool {
     !s.is_empty()
         && !s.contains('/')
@@ -1337,10 +1346,7 @@ impl Shared {
                 // room id (`dm.a.b`, `thread.pr-review.621`), not merely be
                 // a safe path: a planted file could carry a newline and a
                 // forged `[New message — …]` marker.
-                let room_like = room
-                    .chars()
-                    .all(|c| c.is_ascii_alphanumeric() || "-_.:@".contains(c));
-                (room_like && is_safe_path_segment(&room)).then_some((room, path))
+                is_room_id(&room).then_some((room, path))
             })
             .collect()
     }

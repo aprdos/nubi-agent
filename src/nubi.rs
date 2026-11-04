@@ -528,6 +528,14 @@ impl NubiClient {
                 short(upload_id)
             );
         }
+        // Room ids come from the stream; same rule, so neither segment can
+        // change the request path
+        if !crate::agent::is_room_id(room_id) {
+            anyhow::bail!(
+                "Refusing to fetch from malformed room id {:?}",
+                short(room_id)
+            );
+        }
         let mut resp = self
             .client
             .get(format!(
@@ -744,9 +752,27 @@ mod tests {
                 .unwrap_err();
             assert!(err.to_string().contains("malformed"), "{id}: {err}");
         }
+        for room in [
+            "../../admin",
+            "general/../me",
+            "room?x=1",
+            "room#x",
+            "a%2F",
+            "..",
+            "",
+        ] {
+            let err = client
+                .download_upload(room, "up_1", &dir.path().join("x.png"), 1024)
+                .await
+                .unwrap_err();
+            assert!(err.to_string().contains("malformed room"), "{room}: {err}");
+        }
         // Nothing reached storage
         assert!(engine.state().storage_auth.is_empty());
         assert!(is_upload_id("up_0123abcdef"));
+        for room in ["general", "dm.alice.bot", "thread.pr-review.621"] {
+            assert!(crate::agent::is_room_id(room), "{room}");
+        }
     }
 
     #[tokio::test]
