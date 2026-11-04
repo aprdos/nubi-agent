@@ -17,6 +17,17 @@ pub struct Trigger {
     /// `metadata.expect_reply` as sent, when well-formed.
     pub expect_reply: Option<Vec<String>>,
     pub timestamp_ms: u64,
+    /// Files the message carries, downloaded where possible.
+    pub attachments: Vec<Attachment>,
+}
+
+/// A file on a message the agent is answering.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Attachment {
+    pub name: String,
+    pub mime_type: String,
+    /// Where it was saved in the workspace, or None if it could not be fetched.
+    pub path: Option<std::path::PathBuf>,
 }
 
 /// The message a thread room was opened on.

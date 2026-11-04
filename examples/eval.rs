@@ -98,6 +98,7 @@ async fn main() -> anyhow::Result<()> {
                 index: case.context.len() as u64 + 1,
                 expect_reply: None,
                 timestamp_ms: now,
+                attachments: vec![],
             }],
             context,
             ..Default::default()

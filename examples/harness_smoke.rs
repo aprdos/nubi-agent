@@ -67,6 +67,7 @@ async fn main() -> anyhow::Result<()> {
             index: 1,
             expect_reply: None,
             timestamp_ms: 0,
+            attachments: vec![],
         }],
         ..Default::default()
     };

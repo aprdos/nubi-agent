@@ -495,6 +495,53 @@ impl NubiClient {
             .find(|e| e.global_index == index))
     }
 
+    /// Download an attachment to `dest`, refusing anything over `max_bytes`.
+    ///
+    /// `/content` redirects to a short-lived object storage URL; reqwest
+    /// follows it and drops the Authorization header on the way, so the
+    /// token never leaves for the storage host. The file is written next to
+    /// `dest` and renamed into place, so a partial download never sits at
+    /// the path the prompt names.
+    pub async fn download_upload(
+        &self,
+        room_id: &str,
+        upload_id: &str,
+        dest: &std::path::Path,
+        max_bytes: u64,
+    ) -> anyhow::Result<()> {
+        let mut resp = self
+            .client
+            .get(format!(
+                "{}/v1/spaces/{}/rooms/{}/uploads/{}/content",
+                self.base_url, self.space, room_id, upload_id
+            ))
+            .header("Authorization", format!("Bearer {}", self.token))
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = short(&resp.text().await.unwrap_or_default());
+            anyhow::bail!("Failed to download {}: {} - {}", upload_id, status, body);
+        }
+        if resp.content_length().is_some_and(|n| n > max_bytes) {
+            anyhow::bail!("{} is larger than {} bytes", upload_id, max_bytes);
+        }
+
+        let mut bytes = Vec::new();
+        while let Some(chunk) = resp.chunk().await? {
+            bytes.extend_from_slice(&chunk);
+            if bytes.len() as u64 > max_bytes {
+                anyhow::bail!("{} is larger than {} bytes", upload_id, max_bytes);
+            }
+        }
+
+        let tmp = dest.with_extension("part");
+        tokio::fs::write(&tmp, &bytes).await?;
+        tokio::fs::rename(&tmp, dest).await?;
+        Ok(())
+    }
+
     /// Set typing status in a room
     pub async fn set_typing(&self, room_id: &str, typing: bool) -> anyhow::Result<()> {
         let resp = self
@@ -622,6 +669,54 @@ mod tests {
             mandate_hash: None,
             usage: None,
         }
+    }
+
+    #[tokio::test]
+    async fn an_attachment_downloads_through_the_redirect_without_the_token() {
+        use crate::mock_engine::{MockEngine, MockState};
+        let engine = MockEngine::start(MockState {
+            uploads: [("up_1".to_string(), b"\x89PNG data".to_vec())].into(),
+            ..Default::default()
+        })
+        .await;
+        let client = NubiClient::new(&engine.url, "secret-token", "s1", "bot");
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("up_1.png");
+
+        client
+            .download_upload("general", "up_1", &dest, 1024)
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read(&dest).unwrap(), b"\x89PNG data");
+        // Storage is another host: the bearer token stays behind
+        assert_eq!(engine.state().storage_auth, vec![None]);
+        assert!(!dest.with_extension("part").exists());
+    }
+
+    #[tokio::test]
+    async fn an_oversized_or_missing_attachment_is_refused() {
+        use crate::mock_engine::{MockEngine, MockState};
+        let engine = MockEngine::start(MockState {
+            uploads: [("big".to_string(), vec![0u8; 2048])].into(),
+            ..Default::default()
+        })
+        .await;
+        let client = NubiClient::new(&engine.url, "tok", "s1", "bot");
+        let dir = tempfile::tempdir().unwrap();
+
+        let dest = dir.path().join("big.png");
+        let err = client
+            .download_upload("general", "big", &dest, 1024)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("larger than"), "{err}");
+        assert!(!dest.exists());
+
+        let err = client
+            .download_upload("general", "nope", &dir.path().join("nope.png"), 1024)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("404"), "{err}");
     }
 
     #[tokio::test]
