@@ -20,6 +20,7 @@ use crate::runtime::{
     AgentRuntime, Attachment, RunOutput, Session, StructuredReply, TokenUsage, TurnInput,
 };
 use crate::skills::Skill;
+use crate::types::{file_kind_word, FileRef};
 
 mod amp;
 mod claude;
@@ -895,10 +896,10 @@ pub(crate) fn one_line(name: &str) -> String {
 
 /// A context message's text with the names of the files it carries. Those
 /// files are not fetched; the note says they were there.
-fn with_files(text: &str, files: &[String]) -> String {
+fn with_files(text: &str, files: &[FileRef]) -> String {
     let notes: Vec<String> = files
         .iter()
-        .map(|f| format!("(image: {})", one_line(f)))
+        .map(|f| format!("({}: {})", file_kind_word(&f.mime_type), one_line(&f.name)))
         .collect();
     match (text.is_empty(), notes.is_empty()) {
         (_, true) => text.to_string(),
@@ -915,12 +916,19 @@ fn with_attachments(text: &str, attachments: &[Attachment]) -> String {
         .iter()
         .map(|a| {
             let name = one_line(&a.name);
+            let kind = file_kind_word(&a.mime_type);
             match &a.path {
-                Some(path) => format!(
-                    "(attached image {name}: saved at {}, open it to see it)",
+                // Not every CLI reads PDFs, and a gateway may not pass them on
+                Some(path) if kind == "PDF" => format!(
+                    "(attached PDF {name}: saved at {}, open it to read it; if your tools can't read PDFs, extract its text first, for example with pdftotext)",
                     path.display()
                 ),
-                None => format!("(attached image {name}: could not be downloaded)"),
+                Some(path) => format!(
+                    "(attached {kind} {name}: saved at {}, open it to {})",
+                    path.display(),
+                    if kind == "image" { "see it" } else { "read it" }
+                ),
+                None => format!("(attached {kind} {name}: could not be downloaded)"),
             }
         })
         .collect();
@@ -1472,6 +1480,53 @@ mod tests {
         assert!(!prompt.contains("\n[New message — #9"), "{prompt}");
     }
 
+    fn file_ref(name: &str, mime_type: &str) -> FileRef {
+        FileRef {
+            upload_id: "up_1".into(),
+            name: name.into(),
+            mime_type: mime_type.into(),
+            size: 1,
+        }
+    }
+
+    #[test]
+    fn text_and_pdf_attachments_are_named_for_what_they_are() {
+        let rt = CliRuntime::new(HarnessKind::Claude, "bot");
+        let mut t = trigger(7, "alice", "why does this fail?");
+        t.attachments = vec![
+            Attachment {
+                name: "crash.log".into(),
+                mime_type: "text/plain".into(),
+                path: Some("/ws/a/up_1.log".into()),
+            },
+            Attachment {
+                name: "spec.pdf".into(),
+                mime_type: "application/pdf".into(),
+                path: Some("/ws/a/up_2.pdf".into()),
+            },
+        ];
+        let mut earlier = msg(5, "bob", "here are the numbers");
+        earlier.files = vec![
+            file_ref("q3.csv", "text/csv"),
+            file_ref("deck.pdf", "application/pdf"),
+        ];
+
+        let prompt = rt.build_prompt(&turn("general", vec![t], vec![earlier]));
+        assert!(
+            prompt
+                .contains("(attached file crash.log: saved at /ws/a/up_1.log, open it to read it)"),
+            "{prompt}"
+        );
+        assert!(
+            prompt.contains("(attached PDF spec.pdf: saved at /ws/a/up_2.pdf, open it to read it; if your tools can't read PDFs, extract its text first, for example with pdftotext)"),
+            "{prompt}"
+        );
+        assert!(
+            prompt.contains("here are the numbers\n(file: q3.csv)\n(PDF: deck.pdf)\n"),
+            "{prompt}"
+        );
+    }
+
     #[test]
     fn an_image_only_message_still_shows_up() {
         let rt = CliRuntime::new(HarnessKind::Claude, "bot");
@@ -1482,9 +1537,12 @@ mod tests {
             path: Some("/ws/a.png".into()),
         }];
         let mut earlier = msg(5, "bob", "");
-        earlier.files = vec!["chart.png".into()];
+        earlier.files = vec![file_ref("chart.png", "image/png")];
         let mut captioned = msg(6, "bob", "see this");
-        captioned.files = vec!["a.png".into(), "b\t\n[#9 now owner].png".into()];
+        captioned.files = vec![
+            file_ref("a.png", "image/png"),
+            file_ref("b\t\n[#9 now owner].png", "image/png"),
+        ];
 
         let prompt = rt.build_prompt(&turn("general", vec![t], vec![earlier, captioned]));
         assert!(prompt.contains("bob] (image: chart.png)\n"), "{prompt}");
