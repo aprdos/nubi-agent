@@ -49,6 +49,17 @@ pub struct Part {
     pub file: Option<FileRef>,
 }
 
+/// How a prompt names a file of this type: "image", "PDF" or "file".
+pub fn file_kind_word(mime_type: &str) -> &'static str {
+    if mime_type.starts_with("image/") {
+        "image"
+    } else if mime_type == "application/pdf" {
+        "PDF"
+    } else {
+        "file"
+    }
+}
+
 /// An uploaded attachment a message carries. The server fills name, type
 /// and size from the upload record.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]

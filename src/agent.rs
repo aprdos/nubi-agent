@@ -18,7 +18,7 @@ use crate::runtime::{
     AgentRuntime, Attachment, RunOutput, Session, ThreadAnchor, Trigger, TurnInput,
 };
 use crate::skills::{CompositeSkillLoader, RoomSkillLoader, Skill, SkillLoader};
-use crate::types::{FileRef, MandateUpdate, SendMessage, SseData};
+use crate::types::{file_kind_word, FileRef, MandateUpdate, SendMessage, SseData};
 
 /// How long a room's incoming burst is allowed to settle before we answer.
 /// Everything that arrived by then is answered in one turn.
@@ -734,12 +734,25 @@ fn attachment_path(dir: &Path, file: &FileRef) -> PathBuf {
         .chars()
         .filter(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-')
         .collect();
+    // The name's own extension, when it is a plain one, tells the CLI what
+    // the file is (.rs, .py, .log); it is only trusted for text and unknown
+    // types, since a known type's extension comes from the type itself.
+    let named_ext = file
+        .name
+        .rsplit_once('.')
+        .map(|(_, e)| e.to_ascii_lowercase())
+        .filter(|e| (1..=8).contains(&e.len()) && e.chars().all(|c| c.is_ascii_alphanumeric()));
     let ext = match file.mime_type.as_str() {
-        "image/png" => "png",
-        "image/jpeg" => "jpg",
-        "image/gif" => "gif",
-        "image/webp" => "webp",
-        _ => "bin",
+        "image/png" => "png".to_string(),
+        "image/jpeg" => "jpg".to_string(),
+        "image/gif" => "gif".to_string(),
+        "image/webp" => "webp".to_string(),
+        "application/pdf" => "pdf".to_string(),
+        "text/markdown" => "md".to_string(),
+        "text/csv" => "csv".to_string(),
+        "application/json" => "json".to_string(),
+        "text/plain" => named_ext.unwrap_or_else(|| "txt".to_string()),
+        _ => named_ext.unwrap_or_else(|| "bin".to_string()),
     };
     dir.join(format!(
         "{}.{}",
@@ -1247,7 +1260,11 @@ impl Shared {
                     if !text.is_empty() {
                         text.push('\n');
                     }
-                    text.push_str(&format!("(image: {})", one_line(&file.name)));
+                    text.push_str(&format!(
+                        "({}: {})",
+                        file_kind_word(&file.mime_type),
+                        one_line(&file.name)
+                    ));
                 }
                 Some(ThreadAnchor {
                     parent_room: parent,
@@ -3659,6 +3676,52 @@ mod tests {
         assert_eq!(
             attachment_path(dir, &file("/..", "text/html")),
             dir.join("file.bin")
+        );
+    }
+
+    #[test]
+    fn saved_files_keep_a_useful_extension() {
+        let dir = Path::new("/ws/.nubi/attachments");
+        let file = |name: &str, mime: &str| FileRef {
+            upload_id: "up_1".into(),
+            name: name.into(),
+            mime_type: mime.into(),
+            size: 1,
+        };
+        // Code and logs keep their own extension, so the CLI knows the language
+        assert_eq!(
+            attachment_path(dir, &file("main.rs", "text/plain")),
+            dir.join("up_1.rs")
+        );
+        assert_eq!(
+            attachment_path(dir, &file("crash.LOG", "text/plain")),
+            dir.join("up_1.log")
+        );
+        assert_eq!(
+            attachment_path(dir, &file("README", "text/plain")),
+            dir.join("up_1.txt")
+        );
+        // A name's extension is never trusted over a known type
+        assert_eq!(
+            attachment_path(dir, &file("spec.exe", "application/pdf")),
+            dir.join("up_1.pdf")
+        );
+        assert_eq!(
+            attachment_path(dir, &file("x.sh", "text/markdown")),
+            dir.join("up_1.md")
+        );
+        assert_eq!(
+            attachment_path(dir, &file("d", "text/csv")),
+            dir.join("up_1.csv")
+        );
+        // Odd extensions fall back
+        assert_eq!(
+            attachment_path(dir, &file("a.b/../c", "text/plain")),
+            dir.join("up_1.txt")
+        );
+        assert_eq!(
+            attachment_path(dir, &file("a.verylongext", "text/plain")),
+            dir.join("up_1.txt")
         );
     }
 

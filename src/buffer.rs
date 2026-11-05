@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::{Duration, Instant};
 
-use crate::types::LogEntry;
+use crate::types::{FileRef, LogEntry};
 
 const DEFAULT_BUFFER_SIZE: usize = 100;
 const DEFAULT_CONTEXT_SIZE: usize = 30;
@@ -20,7 +20,7 @@ pub struct BufferedMessage {
     pub expect_reply: Option<Vec<String>>,
     /// Names of the files it carries. Context only lists them; the files
     /// themselves are fetched for messages the agent answers.
-    pub files: Vec<String>,
+    pub files: Vec<FileRef>,
 }
 
 impl BufferedMessage {
@@ -46,7 +46,7 @@ impl BufferedMessage {
             timestamp_ms: entry.timestamp_ms,
             mentions: entry.mention_list(),
             expect_reply: entry.expect_reply_list(),
-            files: entry.files().into_iter().map(|f| f.name).collect(),
+            files: entry.files(),
         }
     }
 }
