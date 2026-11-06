@@ -88,6 +88,12 @@ struct Args {
     )]
     pass_env: Vec<String>,
 
+    /// In a room the agent has never read, answer mentions from this time
+    /// (Unix ms) on instead of only those after it started. For launchers
+    /// that start the agent because of a mention it must not skip.
+    #[arg(long, env = "NUBI_ANSWER_SINCE_MS", help_heading = "Agent")]
+    answer_since_ms: Option<u64>,
+
     /// Model for the CLI. Unset means the CLI's own default
     #[arg(long, env = "NUBI_LLM_MODEL", help_heading = "Model")]
     model: Option<String>,
@@ -252,6 +258,7 @@ async fn main() -> anyhow::Result<()> {
         system_prompt: args.system_prompt,
         skip_permissions: args.skip_permissions,
         pass_env: args.pass_env,
+        answer_since_ms: args.answer_since_ms,
         context_size: args.context_size,
         rate_limit_ms: args.rate_limit_ms,
         mcp_url,

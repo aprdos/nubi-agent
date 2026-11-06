@@ -93,6 +93,10 @@ pub struct AgentConfig {
     pub pass_env: Vec<String>,
     pub context_size: usize,
     pub rate_limit_ms: u64,
+    /// In a room never read before, answer mentions from this time (Unix ms)
+    /// on, not only those after this process started. Set by whoever starts
+    /// the agent for a mention it must not miss.
+    pub answer_since_ms: Option<u64>,
     pub mcp_url: Option<String>,
     /// How often the typing indicator is refreshed while a turn runs; 0
     /// sets it once and leaves it.
@@ -129,6 +133,7 @@ impl Default for AgentConfig {
             pass_env: Vec::new(),
             context_size: 30,
             rate_limit_ms: 5000,
+            answer_since_ms: None,
             mcp_url: None,
             heartbeat_interval_secs: 5,
             llm_base_url: None,
@@ -446,10 +451,11 @@ impl Agent {
             .with_context_size(config.context_size)
             .with_rate_limit_ms(config.rate_limit_ms);
 
-        let start_time_ms = SystemTime::now()
+        let now_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_millis() as u64;
+        let start_time_ms = config.answer_since_ms.map_or(now_ms, |s| s.min(now_ms));
 
         let sessions = workspace
             .as_ref()
@@ -2808,6 +2814,33 @@ mod tests {
         posts_reach(&engine, 1).await;
         assert_eq!(fake.runs.load(Ordering::SeqCst), 1);
         assert_eq!(engine.state().posts[0].0, "general");
+    }
+
+    #[tokio::test]
+    async fn a_mention_from_before_start_is_answered_when_asked_to() {
+        // A cold room (never read): normally anything older than the process
+        // is history. A launcher that started the agent for that mention says
+        // so with answer_since_ms.
+        let engine = MockEngine::start(MockState::default()).await;
+        let mention_ms = now_ms() - 30_000;
+        let config = AgentConfig {
+            answer_since_ms: Some(mention_ms),
+            ..AgentConfig::default()
+        };
+        let (agent, fake) = agent(&engine, config).await;
+        let data = serde_json::json!({
+            "room_id": "general",
+            "entry": {
+                "global_index": 1,
+                "sender": "aprido",
+                "timestamp_ms": mention_ms,
+                "payload": {"type": "message", "parts": [{"kind": "text", "text": "@support-bot hi"}]}
+            }
+        })
+        .to_string();
+        agent.shared.ingest(&data).await.unwrap();
+        posts_reach(&engine, 1).await;
+        assert_eq!(fake.runs.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
