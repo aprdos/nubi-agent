@@ -18,7 +18,7 @@ use crate::runtime::{
     AgentRuntime, Attachment, RunOutput, Session, ThreadAnchor, Trigger, TurnInput,
 };
 use crate::skills::{CompositeSkillLoader, RoomSkillLoader, Skill, SkillLoader};
-use crate::types::{file_kind_word, FileRef, MandateUpdate, SendMessage, SseData};
+use crate::types::{file_kind_word, FileRef, LogEntry, MandateUpdate, SendMessage, SseData};
 
 /// How long a room's incoming burst is allowed to settle before we answer.
 /// Everything that arrived by then is answered in one turn.
@@ -1082,12 +1082,23 @@ impl Shared {
         ))
     }
 
+    /// The room and entry in one `entry` event. The space stream (`--rooms *`)
+    /// sends `{room_id, entry}`; a room's own stream (`--rooms <room>`) sends
+    /// the bare entry, since the URL already names the room.
+    fn parse_entry(&self, data: &str) -> anyhow::Result<(String, LogEntry)> {
+        match serde_json::from_str::<SseData>(data) {
+            Ok(d) => Ok((d.room_id, d.entry)),
+            Err(_) if self.config.rooms != "*" => {
+                Ok((self.config.rooms.clone(), serde_json::from_str(data)?))
+            }
+            Err(e) => Err(e.into()),
+        }
+    }
+
     /// Handle one SSE entry: record its offset, buffer it for context, and
     /// queue it as a pending trigger for its room if it's addressed to us.
     async fn ingest(self: &Arc<Self>, data: &str) -> anyhow::Result<()> {
-        let sse_data: SseData = serde_json::from_str(data)?;
-        let room_id = sse_data.room_id;
-        let entry = sse_data.entry;
+        let (room_id, entry) = self.parse_entry(data)?;
 
         // Every delivered entry advances the read position, answered or not.
         // One we already had is a redelivery (a reconnect resumes from the
@@ -2767,6 +2778,43 @@ mod tests {
 
         assert_eq!(fake.runs.load(Ordering::SeqCst), 1);
         assert_eq!(engine.state().posts.len(), 1);
+    }
+
+    /// What a room's own stream sends: the bare entry, no `room_id`.
+    fn room_sse(index: u64, text: &str) -> String {
+        serde_json::json!({
+            "global_index": index,
+            "sender": "aprido",
+            "timestamp_ms": now_ms(),
+            "payload": {"type": "message", "parts": [{"kind": "text", "text": text}]}
+        })
+        .to_string()
+    }
+
+    #[tokio::test]
+    async fn a_single_room_agent_reads_its_room_stream() {
+        let engine = MockEngine::start(MockState::default()).await;
+        let config = AgentConfig {
+            rooms: "general".into(),
+            ..AgentConfig::default()
+        };
+        let (agent, fake) = agent(&engine, config).await;
+
+        agent
+            .shared
+            .ingest(&room_sse(5, "@support-bot can you check the deploy?"))
+            .await
+            .unwrap();
+        posts_reach(&engine, 1).await;
+        assert_eq!(fake.runs.load(Ordering::SeqCst), 1);
+        assert_eq!(engine.state().posts[0].0, "general");
+    }
+
+    #[tokio::test]
+    async fn the_space_stream_still_needs_a_room_id() {
+        let engine = MockEngine::start(MockState::default()).await;
+        let (agent, _fake) = agent(&engine, AgentConfig::default()).await;
+        assert!(agent.shared.ingest(&room_sse(5, "hello")).await.is_err());
     }
 
     #[tokio::test]
