@@ -970,6 +970,7 @@ dependencies = [
  "futures",
  "hex",
  "libc",
+ "nubi-agent-rules",
  "reqwest",
  "serde",
  "serde_json",
@@ -979,6 +980,13 @@ dependencies = [
  "tokio",
  "tokio-test",
  "uuid",
+]
+
+[[package]]
+name = "nubi-agent-rules"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
 ]
 
 [[package]]

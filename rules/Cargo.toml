@@ -1,0 +1,9 @@
+[package]
+name = "nubi-agent-rules"
+version = "0.1.0"
+edition = "2021"
+description = "When a nubi agent answers a message: the one copy of the rule, shared by nubi-agent and nubi-managed"
+license = "MIT"
+
+[dependencies]
+serde_json = "1"

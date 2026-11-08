@@ -1119,19 +1119,11 @@ impl Shared {
             return Ok(());
         }
 
-        if entry.sender == self.config.agent_id {
-            return Ok(());
-        }
-
-        // DMs always get a reply; group rooms need an explicit mention.
-        let is_dm = room_id.starts_with("dm.");
-        if !is_dm && !entry.mentions(&self.config.agent_id) {
-            return Ok(());
-        }
-
-        // Mentioned but not asked to answer: it is already in the buffer, so
-        // we read it as context on the next real trigger.
-        if !entry.expects_reply(&self.config.agent_id) {
+        // Not ours to answer (our own, a room message without a mention, or
+        // `expect_reply` names someone else): it is already in the buffer, so
+        // we read it as context on the next real trigger. nubi-managed starts
+        // sandboxes by the same rule (nubi_agent_rules).
+        if !entry.wants_reply(&self.config.agent_id, &room_id) {
             return Ok(());
         }
 

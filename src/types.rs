@@ -113,29 +113,26 @@ impl LogEntry {
 
     /// Check if this entry mentions a specific agent (or @here for all)
     pub fn mentions(&self, agent_id: &str) -> bool {
-        if let Some(mentions) = &self.payload.mentions {
-            if mentions.iter().any(|m| m == agent_id || m == "here") {
-                return true;
-            }
-        }
+        let none = Vec::new();
+        let list = self.payload.mentions.as_ref().unwrap_or(&none);
+        nubi_agent_rules::mentions(agent_id, list, &self.text())
+    }
+
+    /// Whether `agent_id` should answer this entry, posted in `room_id`: the
+    /// rule nubi-managed also uses to decide whether to start a sandbox.
+    pub fn wants_reply(&self, agent_id: &str, room_id: &str) -> bool {
+        let none = Vec::new();
         let text = self.text();
-        if text.contains("@here") {
-            return true;
-        }
-        // Check for exact @mention (not substring match)
-        let pattern = format!("@{}", agent_id);
-        if let Some(pos) = text.find(&pattern) {
-            let after = pos + pattern.len();
-            // Match only if followed by non-alphanumeric or end of string
-            if after >= text.len() {
-                return true;
-            }
-            let next_char = text[after..].chars().next().unwrap();
-            if !next_char.is_alphanumeric() && next_char != '-' && next_char != '_' {
-                return true;
-            }
-        }
-        false
+        nubi_agent_rules::wants_reply(
+            agent_id,
+            &nubi_agent_rules::Message {
+                room: room_id,
+                sender: &self.sender,
+                mentions: self.payload.mentions.as_ref().unwrap_or(&none),
+                text: &text,
+                metadata: self.payload.metadata.as_ref(),
+            },
+        )
     }
 
     /// Agents named in `mentions`, if any.
@@ -169,47 +166,14 @@ impl LogEntry {
         self.payload.payload_type == "message"
     }
 
-    /// Whether this agent is expected to answer.
-    ///
-    /// Fails open: anything missing or malformed means "go ahead". A wrong
-    /// `false` is a silent deadlock — the sender waits for an answer that
-    /// never comes and nothing logs why — while a wrong `true` is just noise.
-    /// Only a well-formed list that leaves us out keeps us quiet, plus the
-    /// explicit empty list, which means nobody should reply.
+    /// Whether this agent is expected to answer (`metadata.expect_reply`).
+    /// Fails open; see `nubi_agent_rules::expects_reply`.
     pub fn expects_reply(&self, agent_id: &str) -> bool {
-        let Some(value) = self
-            .payload
-            .metadata
-            .as_ref()
-            .and_then(|m| m.get("expect_reply"))
-        else {
-            return true;
-        };
-        let Some(arr) = value.as_array() else {
-            return true;
-        };
-        if arr.is_empty() {
-            return false;
-        }
-
-        let ids: Vec<&str> = arr
-            .iter()
-            .filter_map(|v| v.as_str())
-            .map(normalize_id)
-            .filter(|s| !s.is_empty())
-            .collect();
-        if ids.is_empty() {
-            return true;
-        }
-
-        let me = normalize_id(agent_id);
-        ids.iter().any(|id| id.eq_ignore_ascii_case(me))
+        nubi_agent_rules::expects_reply(agent_id, self.payload.metadata.as_ref())
     }
 }
 
-fn normalize_id(raw: &str) -> &str {
-    raw.trim().trim_start_matches('@').trim()
-}
+use nubi_agent_rules::normalize_id;
 
 #[cfg(test)]
 mod tests {
