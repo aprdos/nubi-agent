@@ -51,16 +51,15 @@ pub fn mentions(agent_id: &str, mentions: &[String], text: &str) -> bool {
     if text.contains("@here") {
         return true;
     }
-    // An exact @mention, not a prefix of a longer id
+    // An exact @mention, not a prefix of a longer id. Every occurrence:
+    // "@bot-x then @bot" names bot.
     let pattern = format!("@{agent_id}");
-    if let Some(pos) = text.find(&pattern) {
-        match text[pos + pattern.len()..].chars().next() {
-            None => return true,
-            Some(c) if !c.is_alphanumeric() && c != '-' && c != '_' => return true,
-            Some(_) => {}
-        }
-    }
-    false
+    text.match_indices(&pattern).any(
+        |(pos, _)| match text[pos + pattern.len()..].chars().next() {
+            None => true,
+            Some(c) => !c.is_alphanumeric() && c != '-' && c != '_',
+        },
+    )
 }
 
 /// Whether `agent_id` is expected to answer, by `metadata.expect_reply`.
@@ -210,6 +209,11 @@ mod tests {
         assert!(!mentions("bot", &[], "@bot_x go"));
         assert!(mentions("bot", &[], "@bot, go"));
         assert!(mentions("bot", &[], "go @bot"));
+        assert!(
+            mentions("bot", &[], "@bot-x and @bot"),
+            "a later exact one counts"
+        );
+        assert!(!mentions("bot", &[], "@bot-x and @botty"));
     }
 
     #[test]
