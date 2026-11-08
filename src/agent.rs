@@ -1101,28 +1101,6 @@ impl Shared {
         }
     }
 
-    /// `mentions` and `expect_reply` with @handles turned into agent ids.
-    async fn resolve_names(
-        &self,
-        mentions: Vec<String>,
-        expect_reply: Option<Vec<String>>,
-    ) -> (Vec<String>, Option<Vec<String>>) {
-        if mentions.is_empty() && expect_reply.as_ref().is_none_or(|e| e.is_empty()) {
-            return (mentions, expect_reply);
-        }
-        match self.nubi.handles().await {
-            Ok(h) if !h.is_empty() => (
-                crate::nubi::resolve_handles(&mentions, &h),
-                expect_reply.map(|e| crate::nubi::resolve_handles(&e, &h)),
-            ),
-            Ok(_) => (mentions, expect_reply),
-            Err(e) => {
-                eprintln!("[nubi-agent] Could not look up @handles, posting names as written: {e}");
-                (mentions, expect_reply)
-            }
-        }
-    }
-
     /// Handle one SSE entry: record its offset, buffer it for context, and
     /// queue it as a pending trigger for its room if it's addressed to us.
     async fn ingest(self: &Arc<Self>, data: &str) -> anyhow::Result<()> {
@@ -1989,14 +1967,6 @@ impl Shared {
             Outcome::Tools
         } else {
             Outcome::Posted
-        };
-        // The model may name agents by @handle; agents answer to their id
-        // (a managed agent `pine-u3cg` goes by @pine). Only for a message we
-        // post; if the lookup fails the names go out as written, as before.
-        let (mentions, expect_reply) = if matches!(outcome, Outcome::Posted) {
-            self.resolve_names(mentions, expect_reply).await
-        } else {
-            (mentions, expect_reply)
         };
 
         let summary = match outcome {
