@@ -19,6 +19,13 @@ struct PollResp {
 }
 
 #[derive(Deserialize)]
+struct DirectoryAgent {
+    agent_id: String,
+    #[serde(default)]
+    username: Option<String>,
+}
+
+#[derive(Deserialize)]
 struct Me {
     space_id: String,
     agent_id: String,
@@ -472,6 +479,24 @@ impl NubiClient {
         Ok(resp.json::<PollResp>().await?.entries)
     }
 
+    /// The space's @handles, handle -> agent id. A message names agents by
+    /// id; people and models often write the handle instead.
+    pub async fn handles(&self) -> anyhow::Result<BTreeMap<String, String>> {
+        let resp = self
+            .client
+            .get(format!("{}/v1/spaces/{}/agents", self.base_url, self.space))
+            .header("Authorization", format!("Bearer {}", self.token))
+            .send()
+            .await?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = short(&resp.text().await.unwrap_or_default());
+            anyhow::bail!("Failed to list agents: {} - {}", status, body);
+        }
+        let agents: Vec<DirectoryAgent> = resp.json().await?;
+        Ok(handle_map(agents))
+    }
+
     /// Fetch one message by its global index, if the room has it.
     pub async fn message_at(&self, room_id: &str, index: u64) -> anyhow::Result<Option<LogEntry>> {
         let resp = self
@@ -602,8 +627,80 @@ impl NubiClient {
     }
 }
 
+fn handle_map(agents: Vec<DirectoryAgent>) -> BTreeMap<String, String> {
+    let ids: std::collections::BTreeSet<String> =
+        agents.iter().map(|a| a.agent_id.clone()).collect();
+    agents
+        .into_iter()
+        .filter_map(|a| Some((a.username.filter(|u| !u.is_empty())?, a.agent_id)))
+        // An id always wins over a handle, as in the desktop
+        .filter(|(handle, _)| !ids.contains(handle))
+        .collect()
+}
+
+/// `mentions` / `expect_reply` with every known @handle replaced by its
+/// agent's id, which is what agents match on. Ids, `here` and names nobody
+/// has pass through. Duplicates collapse, order kept.
+pub fn resolve_handles(names: &[String], handles: &BTreeMap<String, String>) -> Vec<String> {
+    let mut out: Vec<String> = Vec::with_capacity(names.len());
+    for n in names {
+        let id = handles
+            .get(n.as_str())
+            .cloned()
+            .unwrap_or_else(|| n.clone());
+        if !out.contains(&id) {
+            out.push(id);
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
+
+    fn agents(list: &[(&str, Option<&str>)]) -> Vec<DirectoryAgent> {
+        list.iter()
+            .map(|(id, u)| DirectoryAgent {
+                agent_id: id.to_string(),
+                username: u.map(str::to_string),
+            })
+            .collect()
+    }
+
+    fn names(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn handles_become_ids() {
+        let h = handle_map(agents(&[
+            ("pine-u3cg", Some("pine")),
+            ("palm-ntjy", Some("palm")),
+            ("guava", None),
+        ]));
+        assert_eq!(
+            resolve_handles(&names(&["pine", "palm", "guava", "here", "nobody"]), &h),
+            names(&["pine-u3cg", "palm-ntjy", "guava", "here", "nobody"])
+        );
+        assert_eq!(
+            resolve_handles(&names(&["pine", "pine-u3cg"]), &h),
+            names(&["pine-u3cg"]),
+            "one agent named both ways is named once"
+        );
+    }
+
+    #[test]
+    fn an_id_wins_over_a_handle() {
+        // Never allowed by the engine, but if it happened `@guava` is guava
+        let h = handle_map(agents(&[
+            ("guava", None),
+            ("x-1", Some("guava")),
+            ("y", Some("")),
+        ]));
+        assert_eq!(resolve_handles(&names(&["guava"]), &h), names(&["guava"]));
+        assert!(!h.contains_key(""));
+    }
+
     use super::*;
 
     #[test]
