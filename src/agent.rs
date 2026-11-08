@@ -1985,14 +1985,18 @@ impl Shared {
             None => (true, out.text.clone(), Vec::new(), None),
         };
         let text = text.trim().to_string();
-        // The model may name agents by @handle; agents answer to their id
-        // (a managed agent `pine-u3cg` goes by @pine). If the lookup fails
-        // the names go out as written, as before.
-        let (mentions, expect_reply) = self.resolve_names(mentions, expect_reply).await;
         let outcome = if !post || text.is_empty() {
             Outcome::Tools
         } else {
             Outcome::Posted
+        };
+        // The model may name agents by @handle; agents answer to their id
+        // (a managed agent `pine-u3cg` goes by @pine). Only for a message we
+        // post; if the lookup fails the names go out as written, as before.
+        let (mentions, expect_reply) = if matches!(outcome, Outcome::Posted) {
+            self.resolve_names(mentions, expect_reply).await
+        } else {
+            (mentions, expect_reply)
         };
 
         let summary = match outcome {

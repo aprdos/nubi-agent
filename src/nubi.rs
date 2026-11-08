@@ -489,7 +489,9 @@ impl NubiClient {
             .send()
             .await?;
         if !resp.status().is_success() {
-            anyhow::bail!("Failed to list agents: {}", resp.status());
+            let status = resp.status();
+            let body = short(&resp.text().await.unwrap_or_default());
+            anyhow::bail!("Failed to list agents: {} - {}", status, body);
         }
         let agents: Vec<DirectoryAgent> = resp.json().await?;
         Ok(handle_map(agents))
