@@ -146,6 +146,10 @@ nubi-agent --url http://localhost:9099 --token nubi_xxx \
 | `--pass-env` | `NUBI_PASS_ENV` | — | Extra env vars (comma-separated names) the CLI may see |
 | `--mandate-strict` | `NUBI_MANDATE_STRICT` | `false` | Answer nothing until the agent's mandate has been fetched |
 | `--no-local-skills` | `NUBI_NO_LOCAL_SKILLS` | `false` | Skip `~/.nubi/skills` and per-agent skill files |
+| `--live-sessions` | `NUBI_LIVE_SESSIONS` | `false` | Keep one Claude Code session up per room: background work outlives the turn and wakes the agent when it finishes; answers go through `nubi_send` (needs `--mcp-url`) |
+| `--live-max` | `NUBI_LIVE_MAX` | `3` | Live sessions kept up at once; the one idle longest stops first |
+| `--live-idle-secs` | `NUBI_LIVE_IDLE_SECS` | `600` | Stop a live session with nothing running after this long |
+| `--heartbeat-url` | `NUBI_HEARTBEAT_URL` | — | POSTed every minute while the agent works, for launchers that stop idle agents (`NUBI_HEARTBEAT_TOKEN` as bearer) |
 
 </details>
 

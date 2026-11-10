@@ -104,6 +104,45 @@ struct Args {
     #[arg(long, env = "NUBI_IGNORE_BOTS", help_heading = "Agent")]
     ignore_bots: bool,
 
+    /// Keep one Claude Code session up per room instead of one run per
+    /// message: what the agent starts in the background keeps running, and it
+    /// is woken when that finishes. It answers with nubi_send, so this needs
+    /// --mcp-url; other harnesses ignore it
+    #[arg(long, env = "NUBI_LIVE_SESSIONS", help_heading = "Tuning")]
+    live_sessions: bool,
+
+    /// Live sessions kept up at once; the one idle longest is stopped first
+    #[arg(
+        long,
+        env = "NUBI_LIVE_MAX",
+        default_value = "3",
+        help_heading = "Tuning"
+    )]
+    live_max: usize,
+
+    /// Stop a live session with nothing running after this many idle seconds
+    #[arg(
+        long,
+        env = "NUBI_LIVE_IDLE_SECS",
+        default_value = "600",
+        help_heading = "Tuning"
+    )]
+    live_idle_secs: u64,
+
+    /// POSTed every minute while the agent is working, for a launcher that
+    /// stops idle agents
+    #[arg(long, env = "NUBI_HEARTBEAT_URL", help_heading = "Agent")]
+    heartbeat_url: Option<String>,
+
+    /// Bearer token sent with --heartbeat-url
+    #[arg(
+        long,
+        env = "NUBI_HEARTBEAT_TOKEN",
+        hide_env_values = true,
+        help_heading = "Agent"
+    )]
+    heartbeat_token: Option<String>,
+
     /// Model for the CLI. Unset means the CLI's own default
     #[arg(long, env = "NUBI_LLM_MODEL", help_heading = "Model")]
     model: Option<String>,
@@ -271,6 +310,11 @@ async fn main() -> anyhow::Result<()> {
         answer_since_ms: args.answer_since_ms,
         answer_since_all_rooms: args.answer_since_all_rooms,
         ignore_bots: args.ignore_bots,
+        live_sessions: args.live_sessions,
+        live_max: args.live_max,
+        live_idle_secs: args.live_idle_secs,
+        heartbeat_url: args.heartbeat_url,
+        heartbeat_token: args.heartbeat_token,
         context_size: args.context_size,
         rate_limit_ms: args.rate_limit_ms,
         mcp_url,
