@@ -2979,6 +2979,17 @@ mod tests {
             ))
             .await
             .unwrap();
+        // Not an id at all: never looked up, counts as a bot.
+        shared
+            .ingest(&sse_from(
+                "general",
+                4,
+                "../rooms/x",
+                now,
+                "@support-bot hey",
+            ))
+            .await
+            .unwrap();
         // Unknown to the engine: counts as a bot.
         shared
             .ingest(&sse_from(
