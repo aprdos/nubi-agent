@@ -158,6 +158,19 @@ pub trait AgentRuntime: Send + Sync {
         false
     }
 
+    /// How to start a session that stays up for a room (see [`crate::live`]),
+    /// when this runtime runs them. None: every turn is a [`Self::run`].
+    fn live_command(&self, _session: Option<&Session>) -> Option<crate::live::LiveCommand> {
+        None
+    }
+
+    /// What a live turn's `result` event says about the run (errors, the
+    /// session id, usage). Its text is never posted: a live session answers
+    /// with nubi_send.
+    fn live_output(&self, _result: &serde_json::Value) -> RunOutput {
+        RunOutput::default()
+    }
+
     /// Whether this runtime supports MCP tools.
     fn supports_mcp(&self) -> bool;
 

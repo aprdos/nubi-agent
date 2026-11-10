@@ -100,6 +100,10 @@ pub struct Settings {
     /// A file of rules shared by every agent on this machine, included in
     /// the system prompt when it exists.
     pub team_memory: Option<PathBuf>,
+    /// Keep one CLI session up per room and answer through nubi_send (see
+    /// [`crate::live`]), when the harness supports it and nubi's MCP server
+    /// is wired in.
+    pub live: bool,
     /// Extra env vars, by exact name, the CLI gets from nubi-agent's
     /// environment on top of [`BASE_ENV`] and its own prefixes.
     pub pass_env: Vec<String>,
@@ -121,6 +125,7 @@ impl Default for Settings {
             turn_timeout: DEFAULT_TURN_TIMEOUT,
             context_chars: DEFAULT_CONTEXT_CHARS,
             team_memory: None,
+            live: false,
             pass_env: Vec::new(),
         }
     }
@@ -265,6 +270,17 @@ pub trait Harness: Send + Sync {
         prompt: &str,
         session: Option<&Session>,
     ) -> Invocation;
+
+    /// Arguments and env for a session that stays up between messages
+    /// (see [`crate::live`]), when the CLI can run one. None by default.
+    fn live_invocation(
+        &self,
+        _settings: &Settings,
+        _system_prompt: &str,
+        _session: Option<&Session>,
+    ) -> Option<Invocation> {
+        None
+    }
 
     /// Pull the final answer out of what the CLI printed.
     fn parse_output(&self, stdout: &str) -> anyhow::Result<Parsed> {
@@ -504,19 +520,42 @@ impl CliRuntime {
              in a DM is addressed to the other side.\n\n",
         );
 
-        out.push_str(
-            "Where your reply goes. Every turn names the room you were addressed in. Your \
-             reply is posted back into that room, and you choose who it is for: leave \
-             mentions and expect_reply empty when your answer closes the exchange, name the \
-             people in both when you need something back from them, and set post to false \
-             when you already delivered the answer to this room with nubi_send so it is not \
-             posted twice. Write into a different room only when you genuinely need \
-             something from there; answer the person who asked you where they asked. \
-             Your reply is the last thing you do in a turn: once it is accepted, stop, with \
-             no more tool calls and no second reply. Anything that shows up after it in the \
-             same turn (an empty or placeholder message, a tool result) is not a new message \
-             to answer; new messages always arrive in a new turn.\n\n",
-        );
+        if self.live_enabled() {
+            out.push_str(
+                "Where your reply goes. Nothing you write as your final answer is shown to \
+                 anyone: people only see what you send with nubi_send. Answer the person who \
+                 asked you in the room you were addressed in (its id is in every message), \
+                 with mentions and expect_reply naming whoever must act on it, or both empty \
+                 when your answer closes the exchange. Write into a different room only when \
+                 you genuinely need something from there. One message per answer; no \
+                 announcing what you are about to do. Not answering is a choice: make it only \
+                 when the message needs nothing from you.\n\n",
+            );
+            out.push_str(
+                "Waiting on something. You keep running between messages, and what you start \
+                 in the background keeps running after your turn ends. When something takes \
+                 time (CI, a deploy, a long build, a reply you are waiting for), start a \
+                 background command that waits for it, for example a loop that polls `gh api` \
+                 until the checks finish and prints the outcome, then end your turn. When the \
+                 command finishes you are woken in the same room with its output, and you tell \
+                 people with nubi_send. Never say you will keep an eye on something without \
+                 starting such a command, and stop it once you no longer need it.\n\n",
+            );
+        } else {
+            out.push_str(
+                "Where your reply goes. Every turn names the room you were addressed in. Your \
+                 reply is posted back into that room, and you choose who it is for: leave \
+                 mentions and expect_reply empty when your answer closes the exchange, name the \
+                 people in both when you need something back from them, and set post to false \
+                 when you already delivered the answer to this room with nubi_send so it is not \
+                 posted twice. Write into a different room only when you genuinely need \
+                 something from there; answer the person who asked you where they asked. \
+                 Your reply is the last thing you do in a turn: once it is accepted, stop, with \
+                 no more tool calls and no second reply. Anything that shows up after it in the \
+                 same turn (an empty or placeholder message, a tool result) is not a new message \
+                 to answer; new messages always arrive in a new turn.\n\n",
+            );
+        }
 
         out.push_str(
             "One of you, many rooms. You are in several rooms at once, each in its own \
@@ -691,6 +730,22 @@ impl CliRuntime {
     pub fn with_team_memory(mut self, path: Option<PathBuf>) -> Self {
         self.settings.team_memory = path;
         self
+    }
+
+    pub fn with_live(mut self, live: bool) -> Self {
+        self.settings.live = live;
+        self
+    }
+
+    /// Whether this runtime will run live sessions: asked for, the harness
+    /// can, and the agent has nubi_send to answer with.
+    pub fn live_enabled(&self) -> bool {
+        self.settings.live
+            && self.settings.mcp.is_some()
+            && self
+                .harness
+                .live_invocation(&self.settings, "", None)
+                .is_some()
     }
 
     pub fn memory_file(&self) -> &'static str {
@@ -1326,6 +1381,56 @@ impl AgentRuntime for CliRuntime {
 
     fn supports_sessions(&self) -> bool {
         self.harness.supports_sessions()
+    }
+
+    fn live_output(&self, result: &serde_json::Value) -> RunOutput {
+        let parsed = match self.harness.parse_output(&result.to_string()) {
+            Ok(p) => p,
+            Err(e) => {
+                return RunOutput {
+                    is_error: true,
+                    error: Some(e.to_string()),
+                    ..Default::default()
+                }
+            }
+        };
+        RunOutput {
+            text: strip_thinking_tags(parsed.text.trim()),
+            reply: None,
+            mandate_hash: None,
+            is_error: parsed.is_error,
+            error: parsed.error,
+            num_turns: parsed.num_turns,
+            session_id: parsed.session_id,
+            cost_usd: parsed.cost_usd,
+            duration_ms: parsed.duration_ms,
+            usage: parsed.usage,
+            model_usage: parsed.model_usage,
+        }
+    }
+
+    fn live_command(&self, session: Option<&Session>) -> Option<crate::live::LiveCommand> {
+        if !self.live_enabled() {
+            return None;
+        }
+        let (system_prompt, mandate_hash) = self.system_prompt_and_hash();
+        let inv = self
+            .harness
+            .live_invocation(&self.settings, &system_prompt, session)?;
+        let mut env = inherited_env(
+            std::env::vars_os(),
+            self.harness.as_ref(),
+            &self.settings.pass_env,
+        );
+        env.extend(inv.env.into_iter().map(|(k, v)| (k.into(), v.into())));
+        Some(crate::live::LiveCommand {
+            program: self.harness.binary().to_string(),
+            args: inv.args,
+            env,
+            cwd: self.settings.workspace.clone(),
+            prompt_key: crate::live::prompt_key(&system_prompt),
+            mandate_hash,
+        })
     }
 
     fn supports_mcp(&self) -> bool {
@@ -2438,6 +2543,47 @@ mod tests {
         fn invocation(&self, _: &Settings, _: &str, _: &str, _: Option<&Session>) -> Invocation {
             Invocation::default()
         }
+    }
+
+    #[test]
+    fn live_sessions_need_the_flag_and_an_mcp_server() {
+        let mcp = || {
+            Some(McpServer {
+                url: "http://mcp".into(),
+                token: "t".into(),
+            })
+        };
+        // Asked for, with nubi_send to answer through: stream-json in and
+        // out, our messages echoed, no reply schema, and the prompt says how
+        // answers and background work go.
+        let rt = CliRuntime::new(HarnessKind::Claude, "bot")
+            .with_mcp(mcp())
+            .with_live(true);
+        let cmd = rt.live_command(None).expect("live");
+        assert_eq!(cmd.program, "claude");
+        let args = cmd.args.join(" ");
+        assert!(args.contains("--input-format stream-json"), "{args}");
+        assert!(args.contains("--replay-user-messages"), "{args}");
+        assert!(!args.contains("--json-schema"), "{args}");
+        assert!(args.contains("--allowedTools=mcp__nubi"), "{args}");
+        let prompt = rt.build_system_prompt();
+        assert!(prompt.contains("people only see what you send with nubi_send"));
+        assert!(prompt.contains("Waiting on something"));
+        assert!(!prompt.contains("set post to false"));
+
+        // No MCP server: nothing to answer with, so per-turn runs as before.
+        let rt = CliRuntime::new(HarnessKind::Claude, "bot").with_live(true);
+        assert!(rt.live_command(None).is_none());
+        assert!(!rt.build_system_prompt().contains("Waiting on something"));
+        // Not asked for.
+        let rt = CliRuntime::new(HarnessKind::Claude, "bot").with_mcp(mcp());
+        assert!(rt.live_command(None).is_none());
+        assert!(rt.build_system_prompt().contains("set post to false"));
+        // A harness without live sessions.
+        let rt = CliRuntime::new(HarnessKind::Codex, "bot")
+            .with_mcp(mcp())
+            .with_live(true);
+        assert!(rt.live_command(None).is_none());
     }
 
     #[test]

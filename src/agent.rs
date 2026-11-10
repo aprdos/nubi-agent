@@ -7,15 +7,18 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use tokio::sync::mpsc;
 use tokio::sync::{OwnedRwLockReadGuard, OwnedRwLockWriteGuard, RwLock as TurnLock, Semaphore};
 use tokio::time::interval;
+
+use crate::live::{LiveCommand, LiveSession, LiveTurn};
 
 use crate::buffer::{BufferedMessage, RoomBuffer};
 use crate::harness::{age, now_ms, one_line, write_private, CliRuntime, HarnessKind, McpServer};
 use crate::mandate::{FetchError, Fetched, Mandate, MandateLoader};
 use crate::nubi::{usage_metadata, NubiClient, Outgoing, Refused};
 use crate::runtime::{
-    AgentRuntime, Attachment, RunOutput, Session, ThreadAnchor, Trigger, TurnInput,
+    AgentRuntime, Attachment, RunOutput, Session, StructuredReply, ThreadAnchor, Trigger, TurnInput,
 };
 use crate::skills::{CompositeSkillLoader, RoomSkillLoader, Skill, SkillLoader};
 use crate::types::{file_kind_word, FileRef, LogEntry, MandateUpdate, SendMessage, SseData};
@@ -128,6 +131,19 @@ pub struct AgentConfig {
     /// Never load filesystem skills (the client-side twin of the engine's
     /// `mandate_only` policy).
     pub no_local_skills: bool,
+    /// Keep one CLI session up per room and answer through nubi_send, so
+    /// background work outlives the turn that started it (see
+    /// [`crate::live`]). Needs a harness that can and an MCP server.
+    pub live_sessions: bool,
+    /// Live sessions kept up at once; the one idle longest goes first.
+    pub live_max: usize,
+    /// A live session with nothing running is stopped after this long.
+    pub live_idle_secs: u64,
+    /// Told every minute while the agent is working (a turn, or background
+    /// work in a live session), so a launcher that stops idle agents doesn't
+    /// stop it mid-task. Sent with `heartbeat_token` as a bearer token.
+    pub heartbeat_url: Option<String>,
+    pub heartbeat_token: Option<String>,
 }
 
 impl Default for AgentConfig {
@@ -157,6 +173,11 @@ impl Default for AgentConfig {
             harness: HarnessKind::default(),
             mandate_strict: false,
             no_local_skills: false,
+            live_sessions: false,
+            live_max: 3,
+            live_idle_secs: 600,
+            heartbeat_url: None,
+            heartbeat_token: None,
         }
     }
 }
@@ -384,6 +405,11 @@ struct Shared {
     families: Mutex<HashMap<String, Arc<TurnLock<()>>>>,
     /// Turns running right now, by room.
     in_flight: Mutex<HashMap<String, InFlight>>,
+    /// Live sessions by room (see [`crate::live`]).
+    live: Mutex<HashMap<String, Arc<LiveSession>>>,
+    /// Turns live sessions started on their own, with their room.
+    live_tx: mpsc::UnboundedSender<(String, LiveTurn)>,
+    live_rx: Mutex<Option<mpsc::UnboundedReceiver<(String, LiveTurn)>>>,
 }
 
 /// The main agent that listens to nubi and responds via a harness CLI
@@ -446,6 +472,7 @@ impl Agent {
             .with_compact_at_pct(config.compact_at_pct)
             .with_turn_timeout(Duration::from_secs(config.turn_timeout_secs.max(1)))
             .with_team_memory(team_memory)
+            .with_live(config.live_sessions)
     }
 
     /// Wire the shared state together and inject the ad-hoc skills.
@@ -473,6 +500,7 @@ impl Agent {
             .map(|ws| load_sessions(&sessions_path(ws)))
             .unwrap_or_default();
 
+        let (live_tx, live_rx) = mpsc::unbounded_channel();
         let shared = Shared {
             config,
             nubi,
@@ -495,6 +523,9 @@ impl Agent {
             mandate_refresh: tokio::sync::Mutex::new(()),
             families: Mutex::new(HashMap::new()),
             in_flight: Mutex::new(HashMap::new()),
+            live: Mutex::new(HashMap::new()),
+            live_tx,
+            live_rx: Mutex::new(Some(live_rx)),
         };
         if let Err(e) = shared.apply_mandate() {
             eprintln!("[nubi-agent] Cannot inject skills: {}", e);
@@ -613,6 +644,13 @@ impl Agent {
         );
 
         tokio::spawn(flush_offsets(Arc::clone(&self.shared)));
+        if let Some(rx) = self.shared.live_rx.lock().unwrap().take() {
+            tokio::spawn(Arc::clone(&self.shared).live_turns(rx));
+            tokio::spawn(Arc::clone(&self.shared).prune_live());
+        }
+        if self.shared.config.heartbeat_url.is_some() {
+            tokio::spawn(Arc::clone(&self.shared).heartbeat());
+        }
 
         let sse_url = self.shared.nubi.stream_url(&self.shared.config.rooms);
 
@@ -2131,6 +2169,202 @@ impl Shared {
         eprintln!("{line}");
     }
 
+    /// One turn in the room's live session: send the prompt, wait for the
+    /// turn to end, and ask once more when it ended without a word to the
+    /// room. Nothing is posted from here; the session answers with nubi_send.
+    async fn live_run(
+        &self,
+        room_id: &str,
+        prompt: &str,
+        cmd: LiveCommand,
+    ) -> anyhow::Result<RunOutput> {
+        let mandate_hash = cmd.mandate_hash.clone();
+        let live = self.live_session(room_id, cmd)?;
+        let timeout = Duration::from_secs(self.config.turn_timeout_secs.max(1));
+        let mut turn = match live.turn(prompt, timeout).await {
+            Ok(t) => t,
+            Err(e) => {
+                self.drop_live(room_id);
+                return Err(e);
+            }
+        };
+        if !turn.answered(room_id) && !self.runtime.live_output(&turn.result).is_error {
+            eprintln!(
+                "[nubi-agent] Nothing sent to {} yet, asking once more",
+                room_id
+            );
+            let nudge = format!(
+                "[Nothing reached {room_id} this turn. If the message needs an answer, send it \
+                 now with nubi_send (room_id \"{room_id}\"). If it needs none, end your turn \
+                 without sending anything.]"
+            );
+            match live.turn(&nudge, timeout).await {
+                Ok(next) => {
+                    let mut sent = std::mem::take(&mut turn.sent_to);
+                    sent.extend(next.sent_to.iter().cloned());
+                    turn = LiveTurn {
+                        sent_to: sent,
+                        ..next
+                    };
+                }
+                Err(e) => {
+                    self.drop_live(room_id);
+                    return Err(e);
+                }
+            }
+            if !turn.answered(room_id) {
+                eprintln!("[nubi-agent] {} left without an answer", room_id);
+            }
+        }
+        let mut out = self.runtime.live_output(&turn.result);
+        out.mandate_hash = mandate_hash;
+        out.text.clear();
+        out.reply = Some(StructuredReply {
+            text: String::new(),
+            mentions: Vec::new(),
+            expect_reply: None,
+            post: false,
+        });
+        Ok(out)
+    }
+
+    /// The room's live session, started (or restarted, when the system
+    /// prompt changed and nothing is running in it) as needed.
+    fn live_session(&self, room_id: &str, cmd: LiveCommand) -> anyhow::Result<Arc<LiveSession>> {
+        let mut live = self.live.lock().unwrap();
+        if let Some(s) = live.get(room_id) {
+            if !s.ended() && (s.prompt_key == cmd.prompt_key || s.busy()) {
+                return Ok(Arc::clone(s));
+            }
+            if let Some(old) = live.remove(room_id) {
+                eprintln!("[nubi-agent] Restarting the live session for {}", room_id);
+                old.stop();
+            }
+        }
+        // Room for one more: stop the one idle longest with nothing running.
+        while live.len() >= self.config.live_max.max(1) {
+            let oldest = live
+                .iter()
+                .filter(|(_, s)| !s.busy())
+                .max_by_key(|(_, s)| s.idle_for())
+                .map(|(r, _)| r.clone());
+            let Some(room) = oldest else { break };
+            if let Some(s) = live.remove(&room) {
+                eprintln!(
+                    "[nubi-agent] Stopping the live session for {} to make room",
+                    room
+                );
+                s.stop();
+            }
+        }
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let session = LiveSession::spawn(&cmd, tx)?;
+        let forward = self.live_tx.clone();
+        let room = room_id.to_string();
+        tokio::spawn(async move {
+            while let Some(turn) = rx.recv().await {
+                if forward.send((room.clone(), turn)).is_err() {
+                    break;
+                }
+            }
+        });
+        eprintln!("[nubi-agent] Live session started for {}", room_id);
+        live.insert(room_id.to_string(), Arc::clone(&session));
+        Ok(session)
+    }
+
+    fn drop_live(&self, room_id: &str) {
+        if let Some(s) = self.live.lock().unwrap().remove(room_id) {
+            s.stop();
+        }
+    }
+
+    /// Turns live sessions start on their own (a background command
+    /// finished): keep the session id, the journal and the log up to date.
+    /// What they had to say went out with nubi_send.
+    async fn live_turns(self: Arc<Self>, mut rx: mpsc::UnboundedReceiver<(String, LiveTurn)>) {
+        while let Some((room_id, turn)) = rx.recv().await {
+            let out = self.runtime.live_output(&turn.result);
+            let last = self.session_last_index(&room_id);
+            if let Some(id) = out.session_id.clone() {
+                self.record_session(&room_id, id, last);
+            }
+            if turn.answered(&room_id) {
+                self.buffer.lock().unwrap().mark_responded(&room_id);
+            }
+            let summary = if turn.sent_to.is_empty() {
+                "on its own: nothing sent".to_string()
+            } else {
+                format!("on its own: sent to {}", turn.sent_to.join(", "))
+            };
+            eprintln!("[nubi-agent] {}: {}", room_id, summary);
+            self.journal_append(&room_id, &summary);
+            self.log_turn(
+                &room_id,
+                last,
+                if out.is_error {
+                    Outcome::Failed
+                } else {
+                    Outcome::Tools
+                },
+                1,
+                out.duration_ms.unwrap_or(0),
+                Some(&out),
+                "live",
+            );
+        }
+    }
+
+    /// Stop live sessions idle with nothing running, and any idle six times
+    /// that long even with something still running in it.
+    async fn prune_live(self: Arc<Self>) {
+        let idle = Duration::from_secs(self.config.live_idle_secs.max(1));
+        let mut ticker = interval(Duration::from_secs(30));
+        loop {
+            ticker.tick().await;
+            self.live.lock().unwrap().retain(|room, s| {
+                if s.ended() {
+                    return false;
+                }
+                let quiet = s.idle_for();
+                if (!s.busy() && quiet >= idle) || quiet >= idle * 6 {
+                    eprintln!(
+                        "[nubi-agent] Stopping the live session for {} (idle {}s)",
+                        room,
+                        quiet.as_secs()
+                    );
+                    s.stop();
+                    return false;
+                }
+                true
+            });
+        }
+    }
+
+    /// Tell the launcher every minute that the agent is working.
+    async fn heartbeat(self: Arc<Self>) {
+        let Some(url) = self.config.heartbeat_url.clone() else {
+            return;
+        };
+        let client = reqwest::Client::new();
+        let mut ticker = interval(Duration::from_secs(60));
+        loop {
+            ticker.tick().await;
+            let working = !self.in_flight.lock().unwrap().is_empty()
+                || self.live.lock().unwrap().values().any(|s| s.busy());
+            if !working {
+                continue;
+            }
+            let mut req = client.post(&url).timeout(Duration::from_secs(10));
+            if let Some(t) = &self.config.heartbeat_token {
+                req = req.bearer_auth(t);
+            }
+            if let Err(e) = req.send().await.and_then(|r| r.error_for_status()) {
+                eprintln!("[nubi-agent] Heartbeat failed: {}", e);
+            }
+        }
+    }
+
     /// Run the harness with a typing indicator held for as long as it runs.
     async fn run_with_typing(
         &self,
@@ -2169,8 +2403,11 @@ impl Shared {
             })
         });
 
-        // Run the harness CLI
-        let result = self.runtime.run(prompt, session).await;
+        // Run the harness CLI, or hand the message to the room's live session
+        let result = match self.runtime.live_command(session) {
+            Some(cmd) => self.live_run(room_id, prompt, cmd).await,
+            None => self.runtime.run(prompt, session).await,
+        };
 
         // Signal typing to stop
         done.store(true, Ordering::Relaxed);
@@ -2263,6 +2500,8 @@ mod tests {
         /// Rooms running right now, and every pair that ran at once.
         live: Mutex<Vec<String>>,
         overlaps: Mutex<Vec<(String, String)>>,
+        /// Run turns in this live session command instead of `run`.
+        live_cmd: RwLock<Option<LiveCommand>>,
     }
 
     impl FakeState {
@@ -2399,6 +2638,16 @@ mod tests {
         }
         fn supports_sessions(&self) -> bool {
             self.0.sessions_supported.load(Ordering::SeqCst)
+        }
+        fn live_command(&self, _session: Option<&Session>) -> Option<LiveCommand> {
+            self.0.live_cmd.read().unwrap().clone()
+        }
+        fn live_output(&self, result: &serde_json::Value) -> RunOutput {
+            RunOutput {
+                is_error: result["is_error"].as_bool().unwrap_or(false),
+                session_id: result["session_id"].as_str().map(String::from),
+                ..Default::default()
+            }
         }
         fn supports_mcp(&self) -> bool {
             false
@@ -3030,6 +3279,145 @@ mod tests {
             .unwrap();
         posts_reach(&engine, 1).await;
         assert_eq!(fake.runs.load(Ordering::SeqCst), 1);
+    }
+
+    /// A stand-in for `claude` with stream-json input: it logs every message
+    /// it reads, echoes it, answers in `general` with nubi_send unless the
+    /// message says "silent", and for "bg" also starts a turn of its own a
+    /// moment later, as a finished background command would.
+    fn fake_live_cli(dir: &Path) -> LiveCommand {
+        let script = dir.join("fake-claude.sh");
+        fs::write(
+            &script,
+            r#"while IFS= read -r line; do
+  printf '%s\n' "$line" >> "$LOG"
+  printf '%s\n' "$line" | sed 's/^{/{"isReplay":true,/'
+  case "$line" in
+    *silent*) ;;
+    *) printf '{"type":"assistant","message":{"content":[{"type":"tool_use","name":"mcp__nubi__nubi_send","input":{"room_id":"general","text":"hi"}}]}}\n' ;;
+  esac
+  printf '{"type":"result","subtype":"success","result":"ok","session_id":"s1"}\n'
+  case "$line" in
+    *bg*) (sleep 0.3
+      printf '{"type":"system","subtype":"task_notification","task_id":"b1","status":"completed"}\n'
+      printf '{"type":"assistant","message":{"content":[{"type":"tool_use","name":"mcp__nubi__nubi_send","input":{"room_id":"general","text":"done"}}]}}\n'
+      printf '{"type":"result","subtype":"success","result":"ok","session_id":"s2"}\n') ;;
+  esac
+done
+"#,
+        )
+        .unwrap();
+        LiveCommand {
+            program: "sh".into(),
+            args: vec![script.to_string_lossy().into_owned()],
+            env: vec![
+                ("PATH".into(), std::env::var_os("PATH").unwrap_or_default()),
+                ("LOG".into(), dir.join("input.log").into_os_string()),
+            ],
+            cwd: None,
+            prompt_key: 1,
+            mandate_hash: None,
+        }
+    }
+
+    fn live_inputs(dir: &Path) -> Vec<String> {
+        fs::read_to_string(dir.join("input.log"))
+            .unwrap_or_default()
+            .lines()
+            .map(String::from)
+            .collect()
+    }
+
+    async fn wait_until(mut done: impl FnMut() -> bool) {
+        for _ in 0..500 {
+            if done() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("timed out");
+    }
+
+    #[tokio::test]
+    async fn a_live_session_answers_through_nubi_send_and_nothing_is_posted() {
+        let engine = MockEngine::start(MockState::default()).await;
+        let (agent, fake) = agent(&engine, AgentConfig::default()).await;
+        fake.sessions_supported.store(true, Ordering::SeqCst);
+        let dir = temp_workspace();
+        *fake.live_cmd.write().unwrap() = Some(fake_live_cli(&dir));
+
+        agent
+            .shared
+            .ingest(&sse("general", 1, "@support-bot hi"))
+            .await
+            .unwrap();
+        wait_until(|| agent.shared.offsets.lock().unwrap().unanswered.is_empty()).await;
+        wait_until(|| live_inputs(&dir).len() == 1).await;
+        // Same session for the next message: no second process, no nudge.
+        agent
+            .shared
+            .ingest(&sse("general", 2, "@support-bot again"))
+            .await
+            .unwrap();
+        wait_until(|| live_inputs(&dir).len() == 2).await;
+        wait_until(|| agent.shared.offsets.lock().unwrap().unanswered.is_empty()).await;
+
+        assert_eq!(fake.runs.load(Ordering::SeqCst), 0, "no per-turn runs");
+        assert!(engine.state().posts.is_empty(), "nubi-agent posts nothing");
+        assert_eq!(agent.shared.live.lock().unwrap().len(), 1);
+        assert_eq!(agent.shared.sessions.lock().unwrap()["general"].id, "s1");
+    }
+
+    #[tokio::test]
+    async fn a_live_turn_that_sends_nothing_is_nudged_once() {
+        let engine = MockEngine::start(MockState::default()).await;
+        let (agent, fake) = agent(&engine, AgentConfig::default()).await;
+        let dir = temp_workspace();
+        *fake.live_cmd.write().unwrap() = Some(fake_live_cli(&dir));
+
+        agent
+            .shared
+            .ingest(&sse("general", 1, "@support-bot stay silent"))
+            .await
+            .unwrap();
+        wait_until(|| live_inputs(&dir).len() == 2).await;
+        wait_until(|| agent.shared.offsets.lock().unwrap().unanswered.is_empty()).await;
+        let inputs = live_inputs(&dir);
+        assert!(
+            inputs[1].contains("Nothing reached general"),
+            "{}",
+            inputs[1]
+        );
+        assert!(engine.state().posts.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_turn_the_live_session_starts_itself_is_recorded() {
+        let engine = MockEngine::start(MockState::default()).await;
+        let (agent, fake) = agent(&engine, AgentConfig::default()).await;
+        let dir = temp_workspace();
+        *fake.live_cmd.write().unwrap() = Some(fake_live_cli(&dir));
+        let rx = agent.shared.live_rx.lock().unwrap().take().unwrap();
+        tokio::spawn(Arc::clone(&agent.shared).live_turns(rx));
+
+        agent
+            .shared
+            .ingest(&sse("general", 1, "@support-bot start the bg check"))
+            .await
+            .unwrap();
+        // The background "check" finishes and the session reports on its own.
+        wait_until(|| {
+            agent
+                .shared
+                .sessions
+                .lock()
+                .unwrap()
+                .get("general")
+                .is_some_and(|r| r.id == "s2")
+        })
+        .await;
+        assert_eq!(live_inputs(&dir).len(), 1, "nobody wrote to it again");
+        assert!(engine.state().posts.is_empty());
     }
 
     #[tokio::test]

@@ -1,6 +1,7 @@
 pub mod agent;
 pub mod buffer;
 pub mod harness;
+pub mod live;
 pub mod mandate;
 #[cfg(test)]
 mod mock_engine;

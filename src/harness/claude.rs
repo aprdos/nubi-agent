@@ -11,6 +11,59 @@ impl Claude {
     fn mcp_config_path(settings: &Settings) -> PathBuf {
         settings.state_dir().join("claude-mcp.json")
     }
+
+    /// Flags and environment both kinds of run share.
+    fn common(
+        inv: &mut Invocation,
+        settings: &Settings,
+        system_prompt: &str,
+        session: Option<&Session>,
+    ) {
+        if settings.skip_permissions {
+            inv.arg("--dangerously-skip-permissions");
+        }
+        if let Some(ref model) = settings.model {
+            inv.arg("--model").arg(model);
+        }
+        if let Some(ref model) = settings.fallback_model {
+            inv.arg("--fallback-model").arg(model);
+        }
+        if let Some(ref effort) = settings.effort {
+            inv.arg("--effort").arg(effort);
+        }
+        // Appended, not replacing: Claude Code's own prompt carries its tool
+        // guidance for Bash/Edit/Read, which the agent uses as much as nubi.
+        inv.arg("--append-system-prompt").arg(system_prompt);
+        match session {
+            Some(s) if s.resume => {
+                inv.arg("--resume").arg(&s.id);
+            }
+            Some(s) => {
+                inv.arg("--session-id").arg(&s.id);
+            }
+            None => {}
+        }
+        if settings.mcp.is_some() {
+            inv.arg("--mcp-config")
+                .arg(Self::mcp_config_path(settings).to_string_lossy())
+                // Headless runs cannot answer a permission prompt, so without
+                // this every nubi tool call is denied unless the agent also
+                // runs with --skip-permissions. The `=` form keeps the
+                // variadic flag from swallowing the next argument.
+                .arg("--allowedTools=mcp__nubi");
+        }
+        if let Some(pct) = settings.compact_at_pct {
+            // Claude Code's own auto-compaction, as a share of the context
+            // window; the default waits until the window is nearly full.
+            inv.env("CLAUDE_AUTOCOMPACT_PCT_OVERRIDE", pct.to_string());
+        }
+        if let Some(ref url) = settings.llm_base_url {
+            inv.env("ANTHROPIC_BASE_URL", url);
+        }
+        if let Some(ref key) = settings.llm_api_key {
+            inv.env("ANTHROPIC_API_KEY", key);
+        }
+    }
 }
 
 impl Harness for Claude {
@@ -83,51 +136,30 @@ impl Harness for Claude {
         inv.arg("--output-format").arg("stream-json");
         inv.arg("--verbose");
         inv.arg("--json-schema").arg(REPLY_SCHEMA.to_string());
-        if settings.skip_permissions {
-            inv.arg("--dangerously-skip-permissions");
-        }
-        if let Some(ref model) = settings.model {
-            inv.arg("--model").arg(model);
-        }
-        if let Some(ref model) = settings.fallback_model {
-            inv.arg("--fallback-model").arg(model);
-        }
-        if let Some(ref effort) = settings.effort {
-            inv.arg("--effort").arg(effort);
-        }
-        // Appended, not replacing: Claude Code's own prompt carries its tool
-        // guidance for Bash/Edit/Read, which the agent uses as much as nubi.
-        inv.arg("--append-system-prompt").arg(system_prompt);
-        match session {
-            Some(s) if s.resume => {
-                inv.arg("--resume").arg(&s.id);
-            }
-            Some(s) => {
-                inv.arg("--session-id").arg(&s.id);
-            }
-            None => {}
-        }
-        if settings.mcp.is_some() {
-            inv.arg("--mcp-config")
-                .arg(Self::mcp_config_path(settings).to_string_lossy())
-                // Headless runs cannot answer a permission prompt, so without
-                // this every nubi tool call is denied unless the agent also
-                // runs with --skip-permissions. The `=` form keeps the
-                // variadic flag from swallowing the next argument.
-                .arg("--allowedTools=mcp__nubi");
-        }
-        if let Some(pct) = settings.compact_at_pct {
-            // Claude Code's own auto-compaction, as a share of the context
-            // window; the default waits until the window is nearly full.
-            inv.env("CLAUDE_AUTOCOMPACT_PCT_OVERRIDE", pct.to_string());
-        }
-        if let Some(ref url) = settings.llm_base_url {
-            inv.env("ANTHROPIC_BASE_URL", url);
-        }
-        if let Some(ref key) = settings.llm_api_key {
-            inv.env("ANTHROPIC_API_KEY", key);
-        }
+        Self::common(&mut inv, settings, system_prompt, session);
         inv
+    }
+
+    /// A session that stays up: messages arrive on stdin as stream-json, one
+    /// `result` event ends each turn, and a background command finishing
+    /// starts a turn of its own. No reply schema (Claude Code holds it to the
+    /// first turn only); the agent answers with nubi_send instead.
+    fn live_invocation(
+        &self,
+        settings: &Settings,
+        system_prompt: &str,
+        session: Option<&Session>,
+    ) -> Option<Invocation> {
+        let mut inv = Invocation::default();
+        inv.arg("-p");
+        inv.arg("--input-format").arg("stream-json");
+        inv.arg("--output-format").arg("stream-json");
+        inv.arg("--verbose");
+        // Each message of ours is echoed when the session takes it up, which
+        // is how a turn we started is told from one it started itself.
+        inv.arg("--replay-user-messages");
+        Self::common(&mut inv, settings, system_prompt, session);
+        Some(inv)
     }
 
     fn watch(&self) -> Option<Box<dyn OutputWatch>> {
