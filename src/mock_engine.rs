@@ -46,6 +46,8 @@ pub struct MockState {
     pub me_failures: Vec<u16>,
     /// Committed offsets per room, kept monotonic as the engine does.
     pub offsets: HashMap<String, u64>,
+    /// `agent_type` per agent id for `GET /agents/{agent}`; unknown ids 404.
+    pub agent_types: HashMap<String, String>,
     /// Attachment bytes by upload id. `/content` redirects to a storage
     /// route on a different host name, as the engine redirects to S3.
     pub uploads: HashMap<String, Vec<u8>>,
@@ -72,6 +74,7 @@ impl MockEngine {
             .route("/v1/spaces/{space}/rooms", get(list_rooms))
             .route("/v1/spaces/{space}/skills/{room}/prompt", get(skill_prompt))
             .route("/v1/spaces/{space}/agents/{agent}/mandate", get(mandate))
+            .route("/v1/spaces/{space}/agents/{agent}", get(agent_card))
             .route(
                 "/v1/spaces/{space}/rooms/{room}/messages",
                 post(post_message).get(history),
@@ -227,6 +230,16 @@ async fn storage(State(s): Shared, Path(upload): Path<String>, headers: HeaderMa
     s.storage_auth.push(auth);
     match s.uploads.get(&upload) {
         Some(bytes) => ([("content-type", "image/png")], bytes.clone()).into_response(),
+        None => StatusCode::NOT_FOUND.into_response(),
+    }
+}
+
+async fn agent_card(
+    State(s): Shared,
+    Path((_space, agent)): Path<(String, String)>,
+) -> axum::response::Response {
+    match s.lock().unwrap().agent_types.get(&agent) {
+        Some(t) => Json(json!({"agent_id": agent, "agent_type": t})).into_response(),
         None => StatusCode::NOT_FOUND.into_response(),
     }
 }

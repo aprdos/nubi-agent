@@ -94,6 +94,16 @@ struct Args {
     #[arg(long, env = "NUBI_ANSWER_SINCE_MS", help_heading = "Agent")]
     answer_since_ms: Option<u64>,
 
+    /// Skip mentions older than the start (or --answer-since-ms) in every
+    /// room, not only rooms never read. For launchers that answer the older
+    /// ones themselves
+    #[arg(long, env = "NUBI_ANSWER_SINCE_ALL_ROOMS", help_heading = "Agent")]
+    answer_since_all_rooms: bool,
+
+    /// Answer people only: leave mentions from bots (other agents) alone
+    #[arg(long, env = "NUBI_IGNORE_BOTS", help_heading = "Agent")]
+    ignore_bots: bool,
+
     /// Model for the CLI. Unset means the CLI's own default
     #[arg(long, env = "NUBI_LLM_MODEL", help_heading = "Model")]
     model: Option<String>,
@@ -259,6 +269,8 @@ async fn main() -> anyhow::Result<()> {
         skip_permissions: args.skip_permissions,
         pass_env: args.pass_env,
         answer_since_ms: args.answer_since_ms,
+        answer_since_all_rooms: args.answer_since_all_rooms,
+        ignore_bots: args.ignore_bots,
         context_size: args.context_size,
         rate_limit_ms: args.rate_limit_ms,
         mcp_url,
