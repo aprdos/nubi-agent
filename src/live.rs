@@ -284,11 +284,20 @@ impl LiveSession {
             "message": { "role": "user", "content": text },
         })
         .to_string();
-        {
+        let written = {
             let mut stdin = self.stdin.lock().await;
-            stdin.write_all(line.as_bytes()).await?;
-            stdin.write_all(b"\n").await?;
-            stdin.flush().await?;
+            async {
+                stdin.write_all(line.as_bytes()).await?;
+                stdin.write_all(b"\n").await?;
+                stdin.flush().await
+            }
+            .await
+        };
+        if let Err(e) = written {
+            // The pipe is gone, so is the session: end it, which also drops
+            // the slot this message took in `waiting`.
+            self.stop();
+            return Err(anyhow::anyhow!("writing to the session: {e}"));
         }
         match tokio::time::timeout(timeout, rx).await {
             Ok(Ok(turn)) => Ok(turn),
@@ -340,12 +349,15 @@ impl Drop for LiveSession {
     }
 }
 
-/// A stable key for a system prompt.
+/// A stable key for a system prompt (FNV-1a: the same everywhere, unlike
+/// `DefaultHasher`).
 pub fn prompt_key(system_prompt: &str) -> u64 {
-    use std::hash::{Hash, Hasher};
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    system_prompt.hash(&mut h);
-    h.finish()
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in system_prompt.bytes() {
+        h ^= u64::from(b);
+        h = h.wrapping_mul(0x0100_0000_01b3);
+    }
+    h
 }
 
 #[cfg(test)]
@@ -493,6 +505,24 @@ mod tests {
         cli.echo().await;
         let err = turn.await.unwrap().unwrap_err();
         assert!(err.to_string().contains("no answer"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn a_session_whose_pipe_is_gone_ends_instead_of_holding_a_slot() {
+        let (ours_out, _theirs_out) = duplex(64);
+        let (ours_in, theirs_in) = duplex(64);
+        drop(theirs_in);
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let s = LiveSession::from_io(ours_out, ours_in, 1, None, tx);
+        assert!(s.turn("hello", T).await.is_err());
+        assert!(s.ended());
+        assert!(!s.busy());
+    }
+
+    #[test]
+    fn the_prompt_key_is_fixed_fnv() {
+        assert_eq!(prompt_key(""), 0xcbf2_9ce4_8422_2325);
+        assert_ne!(prompt_key("a"), prompt_key("b"));
     }
 
     #[test]

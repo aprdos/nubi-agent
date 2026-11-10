@@ -2231,32 +2231,41 @@ impl Shared {
     /// The room's live session, started (or restarted, when the system
     /// prompt changed and nothing is running in it) as needed.
     fn live_session(&self, room_id: &str, cmd: LiveCommand) -> anyhow::Result<Arc<LiveSession>> {
-        let mut live = self.live.lock().unwrap();
-        if let Some(s) = live.get(room_id) {
-            if !s.ended() && (s.prompt_key == cmd.prompt_key || s.busy()) {
-                return Ok(Arc::clone(s));
+        // Decide under the lock, start the process outside it: turns in
+        // other rooms, the pruner and the heartbeat all take this lock.
+        let mut stopping = Vec::new();
+        {
+            let mut live = self.live.lock().unwrap();
+            if let Some(s) = live.get(room_id) {
+                if !s.ended() && (s.prompt_key == cmd.prompt_key || s.busy()) {
+                    return Ok(Arc::clone(s));
+                }
+                if let Some(old) = live.remove(room_id) {
+                    eprintln!("[nubi-agent] Restarting the live session for {}", room_id);
+                    stopping.push(old);
+                }
             }
-            if let Some(old) = live.remove(room_id) {
-                eprintln!("[nubi-agent] Restarting the live session for {}", room_id);
-                old.stop();
+            // Room for one more: stop the one idle longest with nothing running.
+            while live.len() >= self.config.live_max.max(1) {
+                let oldest = live
+                    .iter()
+                    .filter(|(_, s)| !s.busy())
+                    .max_by_key(|(_, s)| s.idle_for())
+                    .map(|(r, _)| r.clone());
+                let Some(room) = oldest else { break };
+                if let Some(s) = live.remove(&room) {
+                    eprintln!(
+                        "[nubi-agent] Stopping the live session for {} to make room",
+                        room
+                    );
+                    stopping.push(s);
+                }
             }
         }
-        // Room for one more: stop the one idle longest with nothing running.
-        while live.len() >= self.config.live_max.max(1) {
-            let oldest = live
-                .iter()
-                .filter(|(_, s)| !s.busy())
-                .max_by_key(|(_, s)| s.idle_for())
-                .map(|(r, _)| r.clone());
-            let Some(room) = oldest else { break };
-            if let Some(s) = live.remove(&room) {
-                eprintln!(
-                    "[nubi-agent] Stopping the live session for {} to make room",
-                    room
-                );
-                s.stop();
-            }
+        for s in stopping {
+            s.stop();
         }
+
         let (tx, mut rx) = mpsc::unbounded_channel();
         let session = LiveSession::spawn(&cmd, tx)?;
         let forward = self.live_tx.clone();
@@ -2269,7 +2278,16 @@ impl Shared {
             }
         });
         eprintln!("[nubi-agent] Live session started for {}", room_id);
-        live.insert(room_id.to_string(), Arc::clone(&session));
+        // A room's turns run one at a time, so nothing started another
+        // session for it meanwhile; if something did, keep the newer one.
+        if let Some(other) = self
+            .live
+            .lock()
+            .unwrap()
+            .insert(room_id.to_string(), Arc::clone(&session))
+        {
+            other.stop();
+        }
         Ok(session)
     }
 
@@ -2319,7 +2337,7 @@ impl Shared {
     /// that long even with something still running in it.
     async fn prune_live(self: Arc<Self>) {
         let idle = Duration::from_secs(self.config.live_idle_secs.max(1));
-        let mut ticker = interval(Duration::from_secs(30));
+        let mut ticker = interval(idle.min(Duration::from_secs(30)));
         loop {
             ticker.tick().await;
             self.live.lock().unwrap().retain(|room, s| {
