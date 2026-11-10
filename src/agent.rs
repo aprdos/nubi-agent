@@ -97,6 +97,13 @@ pub struct AgentConfig {
     /// on, not only those after this process started. Set by whoever starts
     /// the agent for a mention it must not miss.
     pub answer_since_ms: Option<u64>,
+    /// Apply that cutoff in every room, not only rooms never read before.
+    /// For a launcher that answers older mentions itself, so a fresh process
+    /// doesn't also answer what it missed while it was down.
+    pub answer_since_all_rooms: bool,
+    /// Leave mentions from bots (agents) unanswered; answer only people.
+    /// For a launcher whose agent may be woken by people only.
+    pub ignore_bots: bool,
     pub mcp_url: Option<String>,
     /// How often the typing indicator is refreshed while a turn runs; 0
     /// sets it once and leaves it.
@@ -134,6 +141,8 @@ impl Default for AgentConfig {
             context_size: 30,
             rate_limit_ms: 5000,
             answer_since_ms: None,
+            answer_since_all_rooms: false,
+            ignore_bots: false,
             mcp_url: None,
             heartbeat_interval_secs: 5,
             llm_base_url: None,
@@ -351,6 +360,8 @@ struct Shared {
     /// Whether a room had never acked an offset when we first saw it. Decided
     /// once and never revised, so the flusher's own commits can't flip it.
     cold: Mutex<HashMap<String, bool>>,
+    /// Whether a sender is a bot, by agent id, as the engine said once.
+    bots: Mutex<HashMap<String, bool>>,
     /// Rooms whose buffer has already been seeded with server history.
     primed: Mutex<HashSet<String>>,
     replies: Semaphore,
@@ -470,6 +481,7 @@ impl Agent {
             dispatch: Mutex::new(Dispatch::default()),
             offsets: Arc::new(Mutex::new(Offsets::default())),
             cold: Mutex::new(HashMap::new()),
+            bots: Mutex::new(HashMap::new()),
             primed: Mutex::new(HashSet::new()),
             // Fair: permits go out in the order they were asked for.
             replies: Semaphore::new(parallel_turns),
@@ -1128,8 +1140,19 @@ impl Shared {
         }
 
         // A room we have never acked replays its entire history on connect.
-        // Only there do we fall back to "ignore anything older than this process".
-        if entry.timestamp_ms < self.start_time_ms && self.is_cold(&room_id).await {
+        // Only there do we fall back to "ignore anything older than this process",
+        // unless the launcher asked for that cutoff everywhere.
+        if entry.timestamp_ms < self.start_time_ms
+            && (self.config.answer_since_all_rooms || self.is_cold(&room_id).await)
+        {
+            return Ok(());
+        }
+
+        if self.config.ignore_bots && self.sender_is_bot(&entry.sender).await {
+            eprintln!(
+                "[nubi-agent] {}: ignored mention from bot {}",
+                room_id, entry.sender
+            );
             return Ok(());
         }
 
@@ -1220,6 +1243,27 @@ impl Shared {
             }
             None => {
                 offsets.seen.insert(room_id.to_string(), index);
+                true
+            }
+        }
+    }
+
+    /// Whether `sender` is a bot. A lookup that fails counts as one: with
+    /// `ignore_bots` on, an unknown sender must not wake the agent.
+    async fn sender_is_bot(&self, sender: &str) -> bool {
+        if let Some(&bot) = self.bots.lock().unwrap().get(sender) {
+            return bot;
+        }
+        match self.nubi.is_bot(sender).await {
+            Ok(bot) => {
+                self.bots.lock().unwrap().insert(sender.to_string(), bot);
+                bot
+            }
+            Err(e) => {
+                eprintln!(
+                    "[nubi-agent] Cannot tell whether {} is a bot: {}",
+                    sender, e
+                );
                 true
             }
         }
@@ -2831,6 +2875,159 @@ mod tests {
         })
         .to_string();
         agent.shared.ingest(&data).await.unwrap();
+        posts_reach(&engine, 1).await;
+        assert_eq!(fake.runs.load(Ordering::SeqCst), 1);
+    }
+
+    fn sse_from(room: &str, index: u64, sender: &str, at_ms: u64, text: &str) -> String {
+        serde_json::json!({
+            "room_id": room,
+            "entry": {
+                "global_index": index,
+                "sender": sender,
+                "timestamp_ms": at_ms,
+                "payload": {"type": "message", "parts": [{"kind": "text", "text": text}]}
+            }
+        })
+        .to_string()
+    }
+
+    #[tokio::test]
+    async fn an_old_mention_in_a_room_read_before_is_answered_by_default() {
+        // Without answer_since_all_rooms, a room with a committed offset
+        // resumes from it: a mention from before the start still counts.
+        let mut state = MockState::default();
+        state.offsets.insert("docs".into(), 3);
+        let engine = MockEngine::start(state).await;
+        let (agent, fake) = agent(&engine, AgentConfig::default()).await;
+        let old = now_ms() - 60_000;
+        agent
+            .shared
+            .ingest(&sse_from("docs", 4, "aprido", old, "@support-bot ping"))
+            .await
+            .unwrap();
+        posts_reach(&engine, 1).await;
+        assert_eq!(fake.runs.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn answer_since_all_rooms_skips_old_mentions_everywhere() {
+        let mut state = MockState::default();
+        state.offsets.insert("docs".into(), 3);
+        let engine = MockEngine::start(state).await;
+        let since = now_ms() - 10_000;
+        let config = AgentConfig {
+            answer_since_ms: Some(since),
+            answer_since_all_rooms: true,
+            ..AgentConfig::default()
+        };
+        let (agent, fake) = agent(&engine, config).await;
+        let shared = &agent.shared;
+        // Before the cutoff, in a room read before: skipped.
+        shared
+            .ingest(&sse_from(
+                "docs",
+                4,
+                "aprido",
+                since - 60_000,
+                "@support-bot old",
+            ))
+            .await
+            .unwrap();
+        // At the cutoff (the mention that started it) and after: answered.
+        shared
+            .ingest(&sse_from(
+                "general",
+                1,
+                "aprido",
+                since,
+                "@support-bot trigger",
+            ))
+            .await
+            .unwrap();
+        shared
+            .ingest(&sse_from("docs", 5, "aprido", now_ms(), "@support-bot new"))
+            .await
+            .unwrap();
+        posts_reach(&engine, 2).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(fake.runs.load(Ordering::SeqCst), 2);
+        let rooms: Vec<String> = engine.state().posts.iter().map(|p| p.0.clone()).collect();
+        assert!(rooms.contains(&"general".to_string()) && rooms.contains(&"docs".to_string()));
+    }
+
+    #[tokio::test]
+    async fn ignore_bots_answers_people_only() {
+        let mut state = MockState::default();
+        state.agent_types.insert("aprido".into(), "user".into());
+        state.agent_types.insert("pineapple".into(), "bot".into());
+        let engine = MockEngine::start(state).await;
+        let config = AgentConfig {
+            ignore_bots: true,
+            ..AgentConfig::default()
+        };
+        let (agent, fake) = agent(&engine, config).await;
+        let shared = &agent.shared;
+        let now = now_ms();
+        shared
+            .ingest(&sse_from(
+                "general",
+                1,
+                "pineapple",
+                now,
+                "@support-bot do this",
+            ))
+            .await
+            .unwrap();
+        // Not an id at all: never looked up, counts as a bot.
+        shared
+            .ingest(&sse_from(
+                "general",
+                2,
+                "../rooms/x",
+                now,
+                "@support-bot hey",
+            ))
+            .await
+            .unwrap();
+        // Unknown to the engine: counts as a bot.
+        shared
+            .ingest(&sse_from(
+                "general",
+                3,
+                "ghost",
+                now,
+                "@support-bot and this",
+            ))
+            .await
+            .unwrap();
+        shared
+            .ingest(&sse_from("general", 4, "aprido", now, "@support-bot hi"))
+            .await
+            .unwrap();
+        posts_reach(&engine, 1).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(fake.runs.load(Ordering::SeqCst), 1);
+        assert_eq!(engine.state().posts.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn bots_are_answered_unless_told_otherwise() {
+        let mut state = MockState::default();
+        state.agent_types.insert("pineapple".into(), "bot".into());
+        let engine = MockEngine::start(state).await;
+        let (agent, fake) = agent(&engine, AgentConfig::default()).await;
+        agent
+            .shared
+            .ingest(&sse_from(
+                "general",
+                1,
+                "pineapple",
+                now_ms(),
+                "@support-bot do this",
+            ))
+            .await
+            .unwrap();
         posts_reach(&engine, 1).await;
         assert_eq!(fake.runs.load(Ordering::SeqCst), 1);
     }

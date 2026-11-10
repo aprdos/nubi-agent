@@ -411,6 +411,38 @@ impl NubiClient {
         &self.token
     }
 
+    /// Whether `agent_id` is a bot rather than a person. The engine defaults
+    /// `agent_type` to bot, so a card without one is a bot.
+    pub async fn is_bot(&self, agent_id: &str) -> anyhow::Result<bool> {
+        #[derive(Deserialize)]
+        struct Card {
+            #[serde(default)]
+            agent_type: Option<String>,
+        }
+        // The sender comes off the stream: same characters as a room id, or
+        // it doesn't go into a URL path.
+        if !crate::agent::is_room_id(agent_id) {
+            anyhow::bail!(
+                "Refusing to look up malformed agent id {:?}",
+                short(agent_id)
+            );
+        }
+        let resp = self
+            .client
+            .get(format!(
+                "{}/v1/spaces/{}/agents/{}",
+                self.base_url, self.space, agent_id
+            ))
+            .header("Authorization", format!("Bearer {}", self.token))
+            .send()
+            .await?;
+        if !resp.status().is_success() {
+            anyhow::bail!("Failed to look up agent {}: {}", agent_id, resp.status());
+        }
+        let card: Card = resp.json().await?;
+        Ok(card.agent_type.as_deref() != Some("user"))
+    }
+
     /// Commit a read offset for this room and return the server's resulting value.
     ///
     /// The server clamps monotonically, so committing 0 reads back the current
