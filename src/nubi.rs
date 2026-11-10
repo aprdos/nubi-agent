@@ -419,6 +419,14 @@ impl NubiClient {
             #[serde(default)]
             agent_type: Option<String>,
         }
+        // The sender comes off the stream: same characters as a room id, or
+        // it doesn't go into a URL path.
+        if !crate::agent::is_room_id(agent_id) {
+            anyhow::bail!(
+                "Refusing to look up malformed agent id {:?}",
+                short(agent_id)
+            );
+        }
         let resp = self
             .client
             .get(format!(
