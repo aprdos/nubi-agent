@@ -2983,7 +2983,7 @@ mod tests {
         shared
             .ingest(&sse_from(
                 "general",
-                4,
+                2,
                 "../rooms/x",
                 now,
                 "@support-bot hey",
@@ -2994,7 +2994,7 @@ mod tests {
         shared
             .ingest(&sse_from(
                 "general",
-                2,
+                3,
                 "ghost",
                 now,
                 "@support-bot and this",
@@ -3002,7 +3002,7 @@ mod tests {
             .await
             .unwrap();
         shared
-            .ingest(&sse_from("general", 3, "aprido", now, "@support-bot hi"))
+            .ingest(&sse_from("general", 4, "aprido", now, "@support-bot hi"))
             .await
             .unwrap();
         posts_reach(&engine, 1).await;
