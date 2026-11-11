@@ -2462,14 +2462,20 @@ fn per_model_usage(
 }
 
 /// Add the names in `expect_reply` to `mentions`, in the form the engine
-/// takes there (no `@`, lowercase, id characters; the engine resolves handles
-/// itself). A name that still isn't id-shaped stays only in `expect_reply`.
+/// takes there: no `@`, lowercase, and its id shape
+/// (`^[a-z0-9][a-z0-9_-]{0,63}$`); the engine resolves handles itself. A name
+/// that still doesn't fit (a space, a dot, only punctuation) stays only in
+/// `expect_reply`, since in `mentions` it would get the message refused.
 fn add_reply_names_to_mentions(mentions: &mut Vec<String>, expect_reply: Option<&[String]>) {
     for name in expect_reply.unwrap_or_default() {
         let n = name.trim().trim_start_matches('@').to_lowercase();
-        let id_shaped = !n.is_empty()
-            && n.chars()
-                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'));
+        let mut chars = n.chars();
+        let id_shaped = n.len() <= 64
+            && chars
+                .next()
+                .is_some_and(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
+            && chars
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '-' | '_'));
         if id_shaped && !mentions.iter().any(|m| m.eq_ignore_ascii_case(&n)) {
             mentions.push(n);
         }
@@ -3461,7 +3467,13 @@ done
         let mut m = vec!["apple".to_string()];
         add_reply_names_to_mentions(
             &mut m,
-            Some(&["@Apple".into(), "Pine".into(), "not an id".into()]),
+            Some(&[
+                "@Apple".into(),
+                "Pine".into(),
+                "not an id".into(),
+                "---".into(),
+                "a.b".into(),
+            ]),
         );
         assert_eq!(m, vec!["apple", "pine"]);
         let mut none: Vec<String> = Vec::new();
