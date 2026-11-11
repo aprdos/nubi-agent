@@ -1211,6 +1211,7 @@ impl Shared {
                 text: entry.text(),
                 index: entry.global_index,
                 expect_reply: entry.expect_reply_list(),
+                cc: entry.cc_list(),
                 timestamp_ms: entry.timestamp_ms,
                 attachments,
             },
@@ -2040,13 +2041,10 @@ impl Shared {
             self.record_session(room_id, id, newest.index);
         }
 
-        let (post, text, mut mentions, expect_reply) = match out.reply.clone() {
-            Some(r) => (r.post, r.text, r.mentions, r.expect_reply),
-            None => (true, out.text.clone(), Vec::new(), None),
+        let (post, text, mentions, cc) = match out.reply.clone() {
+            Some(r) => (r.post, r.text, r.mentions, r.cc),
+            None => (true, out.text.clone(), Vec::new(), Vec::new()),
         };
-        // Whoever must answer has to receive the message first: a name only
-        // in expect_reply wakes nobody (nubi-mcp's nubi_send does the same).
-        add_reply_names_to_mentions(&mut mentions, expect_reply.as_deref());
         let text = text.trim().to_string();
         let outcome = if !post || text.is_empty() {
             Outcome::Tools
@@ -2063,8 +2061,8 @@ impl Shared {
                 eprintln!(
                     "[nubi-agent] Responding ({} chars{})",
                     text.len(),
-                    if expect_reply.as_ref().is_some_and(|w| !w.is_empty()) {
-                        format!(", reply from {}", expect_reply.as_ref().unwrap().join(", "))
+                    if !mentions.is_empty() {
+                        format!(", for {}", mentions.join(", "))
                     } else {
                         String::new()
                     }
@@ -2072,7 +2070,7 @@ impl Shared {
                 let msg = NubiClient::message(Outgoing {
                     text: &text,
                     mentions: &mentions,
-                    expect_reply: expect_reply.as_deref(),
+                    cc: &cc,
                     mandate_hash: out.mandate_hash.as_deref(),
                     usage: usage_metadata(
                         &self.config.llm_provider,
@@ -2225,7 +2223,7 @@ impl Shared {
         out.reply = Some(StructuredReply {
             text: String::new(),
             mentions: Vec::new(),
-            expect_reply: None,
+            cc: Vec::new(),
             post: false,
         });
         Ok(out)
@@ -2459,21 +2457,6 @@ fn per_model_usage(
         models.insert(configured.unwrap_or("unknown").to_string(), out.usage);
     }
     models
-}
-
-/// Add the names in `expect_reply` to `mentions`, in the form the engine
-/// takes there (no `@`, lowercase, id characters; the engine resolves handles
-/// itself). A name that still isn't id-shaped stays only in `expect_reply`.
-fn add_reply_names_to_mentions(mentions: &mut Vec<String>, expect_reply: Option<&[String]>) {
-    for name in expect_reply.unwrap_or_default() {
-        let n = name.trim().trim_start_matches('@').to_lowercase();
-        let id_shaped = !n.is_empty()
-            && n.chars()
-                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'));
-        if id_shaped && !mentions.iter().any(|m| m.eq_ignore_ascii_case(&n)) {
-            mentions.push(n);
-        }
-    }
 }
 
 #[cfg(test)]
@@ -2797,6 +2780,7 @@ mod tests {
             text: text.into(),
             index,
             expect_reply: None,
+            cc: Vec::new(),
             timestamp_ms: now_ms(),
             attachments: vec![],
         }
@@ -2821,7 +2805,7 @@ mod tests {
         let s = engine.state();
         assert_eq!(s.posts.len(), 1);
         assert_eq!(s.posts[0].1["metadata"]["mandate_hash"], body["hash"]);
-        assert_eq!(s.posts[0].1["metadata"]["expect_reply"], json!([]));
+        assert!(s.posts[0].1["metadata"].get("expect_reply").is_none());
         // Startup fetch, then a conditional check before the turn.
         assert_eq!(s.mandate_requests, vec![None, Some(etag_for(&body))]);
     }
@@ -2867,14 +2851,15 @@ mod tests {
         *fake.reply.write().unwrap() = Some(StructuredReply {
             text: "pine, can you re-review?".into(),
             mentions: vec!["pine".into()],
-            expect_reply: Some(vec!["pine".into()]),
+            cc: vec!["apple".into()],
             post: true,
         });
         agent.shared.reply("general", &[trigger()]).await.unwrap();
         {
             let s = engine.state();
             assert_eq!(s.posts[0].1["mentions"], json!(["pine"]));
-            assert_eq!(s.posts[0].1["metadata"]["expect_reply"], json!(["pine"]));
+            assert_eq!(s.posts[0].1["metadata"]["cc"], json!(["apple"]));
+            assert!(s.posts[0].1["metadata"].get("expect_reply").is_none());
         }
 
         // post: false means the answer already went out via tools.
@@ -3454,19 +3439,6 @@ done
         .await;
         assert_eq!(live_inputs(&dir).len(), 1, "nobody wrote to it again");
         assert!(engine.state().posts.is_empty());
-    }
-
-    #[test]
-    fn reply_names_join_mentions_in_engine_form() {
-        let mut m = vec!["apple".to_string()];
-        add_reply_names_to_mentions(
-            &mut m,
-            Some(&["@Apple".into(), "Pine".into(), "not an id".into()]),
-        );
-        assert_eq!(m, vec!["apple", "pine"]);
-        let mut none: Vec<String> = Vec::new();
-        add_reply_names_to_mentions(&mut none, None);
-        assert!(none.is_empty());
     }
 
     #[tokio::test]

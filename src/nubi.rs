@@ -102,18 +102,18 @@ fn http_client() -> Client {
         .expect("reqwest client builds with rustls")
 }
 
-/// Metadata on every reply nubi-agent posts.
-///
-/// `expect_reply` defaults to `[]`, the loop-brake: unlike the engine,
-/// nubi-agent falls back to parsing "@name" out of message text, so a reply
-/// that merely says "@foo" in prose must not trigger foo. A reply that
-/// genuinely wants an answer names who in `expect_reply`.
+/// Metadata on every reply nubi-agent posts: `cc` when the reply copies
+/// someone, the mandate stamp and the usage. Who must act is `mentions`
+/// alone; nothing narrows it any more.
 fn post_metadata(
-    expect_reply: Option<&[String]>,
+    cc: &[String],
     mandate_hash: Option<&str>,
     usage: Option<serde_json::Value>,
 ) -> serde_json::Value {
-    let mut meta = serde_json::json!({"expect_reply": expect_reply.unwrap_or(&[])});
+    let mut meta = serde_json::json!({});
+    if !cc.is_empty() {
+        meta["cc"] = serde_json::json!(cc);
+    }
     if let Some(hash) = mandate_hash {
         meta["mandate_hash"] = hash.into();
     }
@@ -193,7 +193,8 @@ pub fn normalize_model(model: &str) -> String {
 pub struct Outgoing<'a> {
     pub text: &'a str,
     pub mentions: &'a [String],
-    pub expect_reply: Option<&'a [String]>,
+    /// `metadata.cc`: who should see it without acting.
+    pub cc: &'a [String],
     /// Hash of the mandate that was in the prompt for this reply, stamped as
     /// `metadata.mandate_hash` so an engine in strict mode can tell the reply
     /// was written under the current mandate.
@@ -338,7 +339,7 @@ impl NubiClient {
                 text: out.text.to_string(),
             }],
             mentions: out.mentions.to_vec(),
-            metadata: Some(post_metadata(out.expect_reply, out.mandate_hash, out.usage)),
+            metadata: Some(post_metadata(out.cc, out.mandate_hash, out.usage)),
         }
     }
 
@@ -640,18 +641,15 @@ mod tests {
 
     #[test]
     fn metadata_carries_the_mandate_hash_only_when_given() {
+        assert_eq!(post_metadata(&[], None, None), serde_json::json!({}));
         assert_eq!(
-            post_metadata(None, None, None),
-            serde_json::json!({"expect_reply": []})
-        );
-        assert_eq!(
-            post_metadata(None, Some("sha256:ab"), None),
-            serde_json::json!({"expect_reply": [], "mandate_hash": "sha256:ab"})
+            post_metadata(&[], Some("sha256:ab"), None),
+            serde_json::json!({"mandate_hash": "sha256:ab"})
         );
         let who = vec!["pine".to_string()];
         assert_eq!(
-            post_metadata(Some(&who), None, None),
-            serde_json::json!({"expect_reply": ["pine"]})
+            post_metadata(&who, None, None),
+            serde_json::json!({"cc": ["pine"]})
         );
     }
 
@@ -734,7 +732,7 @@ mod tests {
         Outgoing {
             text,
             mentions: &[],
-            expect_reply: None,
+            cc: &[],
             mandate_hash: None,
             usage: None,
         }

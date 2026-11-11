@@ -66,6 +66,7 @@ async fn main() -> anyhow::Result<()> {
             text: message,
             index: 1,
             expect_reply: None,
+            cc: Vec::new(),
             timestamp_ms: 0,
             attachments: vec![],
         }],
@@ -87,8 +88,8 @@ async fn main() -> anyhow::Result<()> {
     println!("{}", out.text);
     if let Some(reply) = out.reply {
         eprintln!(
-            "[smoke] mentions={:?} expect_reply={:?} post={}",
-            reply.mentions, reply.expect_reply, reply.post
+            "[smoke] mentions={:?} cc={:?} post={}",
+            reply.mentions, reply.cc, reply.post
         );
     }
     eprintln!(

@@ -144,6 +144,23 @@ impl LogEntry {
             .unwrap_or_default()
     }
 
+    /// `metadata.cc`: who was copied, to see the message but not act on it.
+    pub fn cc_list(&self) -> Vec<String> {
+        self.payload
+            .metadata
+            .as_ref()
+            .and_then(|m| m.get("cc"))
+            .and_then(|v| v.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str())
+                    .map(|s| normalize_id(s).to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     /// `metadata.expect_reply` when it is a well-formed list, else None.
     pub fn expect_reply_list(&self) -> Option<Vec<String>> {
         let arr = self

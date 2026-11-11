@@ -212,7 +212,8 @@ async fn the_readme_quick_start_gets_a_reply() {
     assert_eq!(room, &format!("dm.alice.{AGENT}"), "{body}");
     assert_eq!(body["parts"][0]["text"], REPLY, "{body}");
     assert_eq!(body["mentions"], json!(["alice"]), "{body}");
-    assert_eq!(body["metadata"]["expect_reply"], json!([]), "{body}");
+    // Who must act is `mentions` alone; replies no longer carry expect_reply.
+    assert!(body["metadata"].get("expect_reply").is_none(), "{body}");
 
     let me_auth = state.lock().unwrap().me_auth.clone();
     assert_eq!(me_auth, vec![Some(format!("Bearer {TOKEN}"))]);
