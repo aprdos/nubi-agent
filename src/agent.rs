@@ -1170,7 +1170,7 @@ impl Shared {
         }
 
         // Not ours to answer (our own, a room message without a mention, or
-        // `expect_reply` names someone else): it is already in the buffer, so
+        // we are only cc'd): it is already in the buffer, so
         // we read it as context on the next real trigger. nubi-managed starts
         // sandboxes by the same rule (nubi_agent_rules).
         if !entry.wants_reply(&self.config.agent_id, &room_id) {
@@ -1210,7 +1210,6 @@ impl Shared {
                 sender: entry.sender.clone(),
                 text: entry.text(),
                 index: entry.global_index,
-                expect_reply: entry.expect_reply_list(),
                 cc: entry.cc_list(),
                 timestamp_ms: entry.timestamp_ms,
                 attachments,
@@ -2779,7 +2778,6 @@ mod tests {
             sender: sender.into(),
             text: text.into(),
             index,
-            expect_reply: None,
             cc: Vec::new(),
             timestamp_ms: now_ms(),
             attachments: vec![],
@@ -2805,7 +2803,6 @@ mod tests {
         let s = engine.state();
         assert_eq!(s.posts.len(), 1);
         assert_eq!(s.posts[0].1["metadata"]["mandate_hash"], body["hash"]);
-        assert!(s.posts[0].1["metadata"].get("expect_reply").is_none());
         // Startup fetch, then a conditional check before the turn.
         assert_eq!(s.mandate_requests, vec![None, Some(etag_for(&body))]);
     }
@@ -2859,7 +2856,6 @@ mod tests {
             let s = engine.state();
             assert_eq!(s.posts[0].1["mentions"], json!(["pine"]));
             assert_eq!(s.posts[0].1["metadata"]["cc"], json!(["apple"]));
-            assert!(s.posts[0].1["metadata"].get("expect_reply").is_none());
         }
 
         // post: false means the answer already went out via tools.

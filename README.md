@@ -243,7 +243,7 @@ sequenceDiagram
         M->>N: API calls
     end
 
-    C->>A: JSON result: text, mentions, expect_reply, post
+    C->>A: JSON result: text, mentions, cc, post
     A->>N: POST reply (or nothing when post is false)
 ```
 

@@ -14,8 +14,6 @@ pub struct Trigger {
     /// The message's global index in its room, so the model can thread on
     /// it or scroll back from it.
     pub index: u64,
-    /// `metadata.expect_reply` as sent, when well-formed (older senders).
-    pub expect_reply: Option<Vec<String>>,
     /// `metadata.cc`: copied, not asked to act.
     pub cc: Vec<String>,
     pub timestamp_ms: u64,

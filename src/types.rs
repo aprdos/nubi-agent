@@ -161,38 +161,9 @@ impl LogEntry {
             .unwrap_or_default()
     }
 
-    /// `metadata.expect_reply` when it is a well-formed list, else None.
-    pub fn expect_reply_list(&self) -> Option<Vec<String>> {
-        let arr = self
-            .payload
-            .metadata
-            .as_ref()
-            .and_then(|m| m.get("expect_reply"))
-            .and_then(|v| v.as_array())?;
-        let ids: Vec<String> = arr
-            .iter()
-            .filter_map(|v| v.as_str())
-            .map(|s| normalize_id(s).to_string())
-            .filter(|s| !s.is_empty())
-            .collect();
-        // A list with nothing usable in it is malformed, which the reply
-        // rules read as "go ahead"; reading it as [] here would call a
-        // message FYI that wakes the agent anyway.
-        if ids.is_empty() && !arr.is_empty() {
-            return None;
-        }
-        Some(ids)
-    }
-
     /// Check if this is a regular message (not system event)
     pub fn is_message(&self) -> bool {
         self.payload.payload_type == "message"
-    }
-
-    /// Whether this agent is expected to answer (`metadata.expect_reply`).
-    /// Fails open; see `nubi_agent_rules::expects_reply`.
-    pub fn expects_reply(&self, agent_id: &str) -> bool {
-        nubi_agent_rules::expects_reply(agent_id, self.payload.metadata.as_ref())
     }
 }
 
@@ -222,23 +193,6 @@ mod tests {
     }
 
     #[test]
-    fn expect_reply_lists_read_like_the_reply_rules() {
-        let with = |v: serde_json::Value| {
-            let mut e = make_entry("alice", "hi", None);
-            e.payload.metadata = Some(json!({ "expect_reply": v }));
-            e.expect_reply_list()
-        };
-        assert_eq!(
-            with(json!(["@Pine", "apple"])),
-            Some(vec!["Pine".to_string(), "apple".into()])
-        );
-        assert_eq!(with(json!([])), Some(vec![]), "explicit FYI");
-        // Nothing usable in it: malformed, which the rules read as go ahead.
-        assert_eq!(with(json!([1, ""])), None);
-        assert_eq!(make_entry("alice", "hi", None).expect_reply_list(), None);
-    }
-
-    #[test]
     fn file_parts_are_read_and_text_ignores_them() {
         let entry: LogEntry = serde_json::from_value(json!({
             "global_index": 3,
@@ -260,47 +214,6 @@ mod tests {
         assert_eq!(files[0].name, "cat.png");
         assert_eq!(files[1].upload_id, "up_2");
         assert_eq!(files[1].mime_type, "");
-    }
-
-    fn with_metadata(metadata: Value) -> LogEntry {
-        let mut entry = make_entry("alice", "hey bot", Some(vec!["bot"]));
-        entry.payload.metadata = Some(metadata);
-        entry
-    }
-
-    #[test]
-    fn test_expects_reply_absent_or_malformed() {
-        // No metadata at all.
-        assert!(make_entry("alice", "hey bot", Some(vec!["bot"])).expects_reply("bot"));
-        // Metadata present but no expect_reply key.
-        assert!(with_metadata(json!({"other": 1})).expects_reply("bot"));
-        assert!(with_metadata(json!({"expect_reply": null})).expects_reply("bot"));
-        // Wrong type, and a list with nothing usable in it: fail open.
-        assert!(with_metadata(json!({"expect_reply": "yes"})).expects_reply("bot"));
-        assert!(with_metadata(json!({"expect_reply": [""]})).expects_reply("bot"));
-        assert!(with_metadata(json!({"expect_reply": [7]})).expects_reply("bot"));
-    }
-
-    #[test]
-    fn test_expects_reply_empty_list_silences_everyone() {
-        let entry = with_metadata(json!({"expect_reply": []}));
-        assert!(!entry.expects_reply("bot"));
-        assert!(!entry.expects_reply("other"));
-    }
-
-    #[test]
-    fn test_expects_reply_targets_named_agent() {
-        let entry = with_metadata(json!({"expect_reply": ["bot"]}));
-        assert!(entry.expects_reply("bot"));
-        assert!(!entry.expects_reply("other"));
-    }
-
-    #[test]
-    fn test_expects_reply_normalizes_ids() {
-        let entry = with_metadata(json!({"expect_reply": [" @Bot "]}));
-        assert!(entry.expects_reply("bot"));
-        assert!(entry.expects_reply("@bot"));
-        assert!(!entry.expects_reply("other"));
     }
 
     #[test]

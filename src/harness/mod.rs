@@ -273,7 +273,7 @@ pub trait Harness: Send + Sync {
     ) -> Invocation;
 
     /// Whether its final answer comes back in [`REPLY_SCHEMA`] shape, so the
-    /// reply carries its own mentions and expect_reply. Otherwise it is
+    /// reply carries its own mentions and cc. Otherwise it is
     /// posted as plain text that wakes nobody.
     fn structured_replies(&self) -> bool {
         false
@@ -949,7 +949,6 @@ fn message_header(
     timestamp_ms: u64,
     sender: &str,
     mentions: &[String],
-    expect_reply: Option<&[String]>,
     cc: &[String],
     now: u64,
 ) -> String {
@@ -957,14 +956,6 @@ fn message_header(
     if !mentions.is_empty() {
         let names: Vec<String> = mentions.iter().map(|m| format!("@{}", name(m))).collect();
         header.push_str(&format!(" → {}", names.join(" ")));
-    }
-    match expect_reply {
-        Some([]) => header.push_str(", FYI"),
-        Some(who) => {
-            let who: Vec<String> = who.iter().map(|w| name(w)).collect();
-            header.push_str(&format!(", reply from {}", who.join(", ")))
-        }
-        None => {}
     }
     if !cc.is_empty() {
         let who: Vec<String> = cc.iter().map(|w| name(w)).collect();
@@ -1130,7 +1121,6 @@ impl AgentRuntime for CliRuntime {
                         msg.timestamp_ms,
                         &msg.sender,
                         &msg.mentions,
-                        msg.expect_reply.as_deref(),
                         &msg.cc,
                         now
                     ),
@@ -1170,7 +1160,6 @@ impl AgentRuntime for CliRuntime {
                         msg.timestamp_ms,
                         &msg.sender,
                         &msg.mentions,
-                        msg.expect_reply.as_deref(),
                         &msg.cc,
                         now
                     ),
@@ -1204,15 +1193,7 @@ impl AgentRuntime for CliRuntime {
             let t = &turn.triggers[0];
             prompt.push_str(&format!(
                 "[New message — {}]\n{}\n\n[Your response]",
-                message_header(
-                    t.index,
-                    t.timestamp_ms,
-                    &t.sender,
-                    &[],
-                    t.expect_reply.as_deref(),
-                    &t.cc,
-                    now
-                ),
+                message_header(t.index, t.timestamp_ms, &t.sender, &[], &t.cc, now),
                 with_attachments(&untrusted(&t.text), &t.attachments)
             ));
         } else {
@@ -1220,15 +1201,7 @@ impl AgentRuntime for CliRuntime {
             for t in &turn.triggers {
                 prompt.push_str(&format!(
                     "[{}] {}\n",
-                    message_header(
-                        t.index,
-                        t.timestamp_ms,
-                        &t.sender,
-                        &[],
-                        t.expect_reply.as_deref(),
-                        &t.cc,
-                        now
-                    ),
+                    message_header(t.index, t.timestamp_ms, &t.sender, &[], &t.cc, now),
                     with_attachments(&untrusted(&t.text), &t.attachments)
                 ));
             }
@@ -1559,7 +1532,6 @@ mod tests {
             text: text.to_string(),
             timestamp_ms: now_ms(),
             mentions: vec![],
-            expect_reply: None,
             cc: Vec::new(),
             files: vec![],
         }
@@ -1570,7 +1542,6 @@ mod tests {
             sender: sender.into(),
             text: text.into(),
             index,
-            expect_reply: None,
             cc: Vec::new(),
             timestamp_ms: now_ms(),
             attachments: vec![],
@@ -1729,13 +1700,12 @@ mod tests {
     }
 
     #[test]
-    fn context_carries_index_time_mentions_and_expect_reply() {
+    fn context_carries_index_time_mentions_and_cc() {
         let rt = CliRuntime::new(HarnessKind::Claude, "bot");
         let mut asked = msg(2, "carol", "@bot can you check?");
         asked.mentions = vec!["bot".into()];
-        asked.expect_reply = Some(vec!["bot".into()]);
         let mut fyi = msg(3, "dave", "deploy done");
-        fyi.expect_reply = Some(vec![]);
+        fyi.cc = vec!["bot".into()];
         let context = vec![msg(1, "bob", "hey everyone"), asked, fyi];
         let prompt = rt.build_prompt(&turn(
             "general",
@@ -1744,11 +1714,11 @@ mod tests {
         ));
         assert!(prompt.contains("[#1 now bob] hey everyone"), "{prompt}");
         assert!(
-            prompt.contains("[#2 now carol → @bot, reply from bot] @bot can you check?"),
+            prompt.contains("[#2 now carol → @bot] @bot can you check?"),
             "{prompt}"
         );
         assert!(
-            prompt.contains("[#3 now dave, FYI] deploy done"),
+            prompt.contains("[#3 now dave, cc bot] deploy done"),
             "{prompt}"
         );
         assert!(prompt.contains("[New message — #4 now alice]\nhello"));
@@ -1951,7 +1921,7 @@ mod tests {
 
     #[test]
     fn claude_json_result_is_read_in_full() {
-        let out = r#"{"type":"result","subtype":"success","is_error":false,"duration_ms":4120,"num_turns":3,"result":"it is green","session_id":"s-1","total_cost_usd":0.0421,"usage":{"input_tokens":12,"output_tokens":340,"cache_read_input_tokens":20480,"cache_creation_input_tokens":1536},"modelUsage":{"claude-opus-4-5":{"inputTokens":10,"outputTokens":300,"cacheReadInputTokens":20480,"cacheCreationInputTokens":1536,"costUSD":0.04},"claude-haiku-4-5-20251001":{"inputTokens":2,"outputTokens":40,"costUSD":0.0001}},"structured_output":{"text":"it is green","mentions":["alice"],"expect_reply":[],"post":true}}"#;
+        let out = r#"{"type":"result","subtype":"success","is_error":false,"duration_ms":4120,"num_turns":3,"result":"it is green","session_id":"s-1","total_cost_usd":0.0421,"usage":{"input_tokens":12,"output_tokens":340,"cache_read_input_tokens":20480,"cache_creation_input_tokens":1536},"modelUsage":{"claude-opus-4-5":{"inputTokens":10,"outputTokens":300,"cacheReadInputTokens":20480,"cacheCreationInputTokens":1536,"costUSD":0.04},"claude-haiku-4-5-20251001":{"inputTokens":2,"outputTokens":40,"costUSD":0.0001}},"structured_output":{"text":"it is green","mentions":["alice"],"cc":[],"post":true}}"#;
         let p = claude::Claude.parse_output(out).unwrap();
         assert_eq!(p.text, "it is green");
         assert!(!p.is_error);
@@ -1997,7 +1967,7 @@ mod tests {
                 r#"{{"type":"user","parent_tool_use_id":null,"message":{{"role":"user","content":[{{"type":"tool_result","tool_use_id":"{id}","content":"ok","is_error":{is_error}}}]}}}}"#
             )
         }
-        pub const SENT: &str = r#"{"text":"","mentions":[],"expect_reply":[],"post":false}"#;
+        pub const SENT: &str = r#"{"text":"","mentions":[],"cc":[],"post":false}"#;
     }
 
     #[test]
@@ -2181,7 +2151,7 @@ mod tests {
         let out = [
             stream::init("s-1"),
             stream::text("m1", "hi"),
-            r#"{"type":"result","subtype":"success","is_error":false,"num_turns":1,"result":"hi","session_id":"s-1","structured_output":{"text":"hi","mentions":[],"expect_reply":[],"post":true}}"#.into(),
+            r#"{"type":"result","subtype":"success","is_error":false,"num_turns":1,"result":"hi","session_id":"s-1","structured_output":{"text":"hi","mentions":[],"cc":[],"post":true}}"#.into(),
         ]
         .join("\n");
         let p = claude::Claude.parse_output(&out).unwrap();
