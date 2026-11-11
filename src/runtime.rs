@@ -14,8 +14,10 @@ pub struct Trigger {
     /// The message's global index in its room, so the model can thread on
     /// it or scroll back from it.
     pub index: u64,
-    /// `metadata.expect_reply` as sent, when well-formed.
+    /// `metadata.expect_reply` as sent, when well-formed (older senders).
     pub expect_reply: Option<Vec<String>>,
+    /// `metadata.cc`: copied, not asked to act.
+    pub cc: Vec<String>,
     pub timestamp_ms: u64,
     /// Files the message carries, downloaded where possible.
     pub attachments: Vec<Attachment>,
@@ -74,10 +76,10 @@ pub struct Session {
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct StructuredReply {
     pub text: String,
-    /// Agents who should see the message. Empty wakes nobody.
+    /// Who is asked to act on it (the To). Empty wakes nobody.
     pub mentions: Vec<String>,
-    /// Who must answer. None falls back to the loop-brake `[]`.
-    pub expect_reply: Option<Vec<String>>,
+    /// Who should see it without acting (the Cc).
+    pub cc: Vec<String>,
     /// False when the model already delivered its answer via tools and
     /// nothing should be posted.
     pub post: bool,

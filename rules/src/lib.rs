@@ -18,23 +18,62 @@ pub struct Message<'a> {
     pub mentions: &'a [String],
     /// The text of its parts, joined.
     pub text: &'a str,
-    /// The payload's `metadata`, for `expect_reply`.
+    /// The payload's `metadata`, for `cc`, `chain` and the older
+    /// `expect_reply`.
     pub metadata: Option<&'a Value>,
 }
 
+/// Agent messages in a row, with no person in between, after which a
+/// mention from an agent wakes nobody. The engine counts them into
+/// `metadata.chain` on every agent's message; a person speaking resets it.
+pub const CHAIN_LIMIT: u64 = 8;
+
 /// Whether `agent_id` should answer `msg`.
 ///
-/// Never its own messages. In a DM, every message; in a room, one that
-/// mentions it (`@here` mentions everyone). Either way, unless
-/// `expect_reply` says someone else should answer.
+/// A mention is the signal to act, like an email's To: in a room, a message
+/// that mentions the agent (`@here` mentions everyone); in a DM, every
+/// message. `metadata.cc` is the Cc: names there see it but are not asked to
+/// act, even when mentioned. Never its own messages, and never once agents
+/// have answered each other `CHAIN_LIMIT` times without a person in between.
+///
+/// A message that still carries `expect_reply` (from senders before `cc`)
+/// is read the old way as well: it can narrow who answers further.
 pub fn wants_reply(agent_id: &str, msg: &Message) -> bool {
     if msg.sender == agent_id {
+        return false;
+    }
+    if chain_exhausted(msg.metadata) {
         return false;
     }
     if !is_dm(msg.room) && !mentions(agent_id, msg.mentions, msg.text) {
         return false;
     }
+    if in_list(agent_id, msg.metadata, "cc") {
+        return false;
+    }
     expects_reply(agent_id, msg.metadata)
+}
+
+/// The engine's count of agent messages in a row says this one comes after
+/// too many: agents have been answering each other with no person around.
+pub fn chain_exhausted(metadata: Option<&Value>) -> bool {
+    metadata
+        .and_then(|m| m.get("chain"))
+        .and_then(Value::as_u64)
+        .is_some_and(|n| n >= CHAIN_LIMIT)
+}
+
+/// Whether `metadata.<key>` lists `agent_id` (as an id or `@id`, any case).
+fn in_list(agent_id: &str, metadata: Option<&Value>, key: &str) -> bool {
+    let me = normalize_id(agent_id);
+    metadata
+        .and_then(|m| m.get(key))
+        .and_then(Value::as_array)
+        .is_some_and(|ids| {
+            ids.iter()
+                .filter_map(Value::as_str)
+                .any(|id| normalize_id(id).eq_ignore_ascii_case(me))
+        })
 }
 
 /// Direct-message rooms are `dm.<a>.<b>`.
@@ -105,6 +144,98 @@ pub fn expects_reply(agent_id: &str, metadata: Option<&Value>) -> bool {
 /// An agent id as people write it: `@id`, with stray spaces.
 pub fn normalize_id(raw: &str) -> &str {
     raw.trim().trim_start_matches('@').trim()
+}
+
+#[cfg(test)]
+mod to_and_cc_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn wants(agent: &str, room: &str, mentions: &[&str], text: &str, meta: Value) -> bool {
+        let mentions: Vec<String> = mentions.iter().map(|s| s.to_string()).collect();
+        let meta = (!meta.is_null()).then_some(meta);
+        wants_reply(
+            agent,
+            &Message {
+                room,
+                sender: "alice",
+                mentions: &mentions,
+                text,
+                metadata: meta.as_ref(),
+            },
+        )
+    }
+
+    #[test]
+    fn a_mention_wakes_and_cc_only_informs() {
+        assert!(wants("pine", "r", &["pine"], "take this", Value::Null));
+        assert!(!wants("pine", "r", &[], "no one named", Value::Null));
+        // Mentioned and copied: sees it, isn't asked.
+        assert!(!wants(
+            "pine",
+            "r",
+            &["pine", "apple"],
+            "x",
+            json!({"cc": ["pine"]})
+        ));
+        assert!(wants(
+            "apple",
+            "r",
+            &["pine", "apple"],
+            "x",
+            json!({"cc": ["pine"]})
+        ));
+        assert!(!wants(
+            "pine",
+            "r",
+            &["here"],
+            "x",
+            json!({"cc": ["@Pine"]})
+        ));
+        // In a DM everything is addressed to the agent, unless it's copied.
+        assert!(wants("pine", "dm.alice.pine", &[], "hi", Value::Null));
+        assert!(!wants(
+            "pine",
+            "dm.alice.pine",
+            &[],
+            "fyi",
+            json!({"cc": ["pine"]})
+        ));
+    }
+
+    #[test]
+    fn long_agent_chains_stop_waking_anyone() {
+        let at = |n: u64| wants("pine", "r", &["pine"], "x", json!({"chain": n}));
+        assert!(at(1));
+        assert!(at(CHAIN_LIMIT - 1));
+        assert!(!at(CHAIN_LIMIT));
+        assert!(!at(CHAIN_LIMIT + 5));
+    }
+
+    #[test]
+    fn older_messages_with_expect_reply_still_narrow_who_answers() {
+        assert!(!wants(
+            "pine",
+            "r",
+            &["pine"],
+            "x",
+            json!({"expect_reply": []})
+        ));
+        assert!(!wants(
+            "pine",
+            "r",
+            &["pine", "apple"],
+            "x",
+            json!({"expect_reply": ["apple"]})
+        ));
+        assert!(wants(
+            "apple",
+            "r",
+            &["pine", "apple"],
+            "x",
+            json!({"expect_reply": ["apple"]})
+        ));
+    }
 }
 
 #[cfg(test)]

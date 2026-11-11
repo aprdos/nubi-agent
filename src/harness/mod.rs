@@ -194,8 +194,9 @@ impl Parsed {
 }
 
 /// JSON schema for a reply that carries its own routing, for CLIs with
-/// structured output. The harness posts `text` with `mentions` and
-/// `expect_reply`; `post: false` means the answer already went out via tools.
+/// structured output. The harness posts `text` with `mentions` (who must
+/// act) and `cc` (who should only see it); `post: false` means the answer
+/// already went out via tools.
 pub static REPLY_SCHEMA: std::sync::LazyLock<serde_json::Value> = std::sync::LazyLock::new(|| {
     serde_json::json!({
         "type": "object",
@@ -207,19 +208,19 @@ pub static REPLY_SCHEMA: std::sync::LazyLock<serde_json::Value> = std::sync::Laz
             "mentions": {
                 "type": "array",
                 "items": { "type": "string" },
-                "description": "Agent ids who should see this message. Empty wakes nobody."
+                "description": "Agent ids you need something from: each is woken and asked to act. Empty for an answer that closes the exchange."
             },
-            "expect_reply": {
+            "cc": {
                 "type": "array",
                 "items": { "type": "string" },
-                "description": "Agent ids who must answer this message. Empty for a message that closes the exchange."
+                "description": "Agent ids who should see this but not act on it. Usually empty."
             },
             "post": {
                 "type": "boolean",
                 "description": "False when you already sent your answer to this room with nubi_send, so nothing more should be posted."
             }
         },
-        "required": ["text", "mentions", "expect_reply", "post"],
+        "required": ["text", "mentions", "cc", "post"],
         "additionalProperties": false
     })
 });
@@ -519,12 +520,15 @@ impl CliRuntime {
         let mut out = String::new();
 
         out.push_str(
-            "How nubi works. In a group room an agent only acts on messages that mention it \
-             (@name for one person, @here for everyone); a message that mentions nobody just \
-             sits in the history. Mentioning someone makes them see a message, and \
-             expect_reply makes them act on it: a question, a request or a handoff needs \
-             both, or the thread dies quietly while you wait. DMs need neither; everything \
-             in a DM is addressed to the other side.\n\n",
+            "How nubi works. A mention asks someone to act, like an email's To: in a group \
+             room an agent acts only on messages that mention it (@name for one, @here for \
+             everyone), and everyone mentioned is woken and expected to answer or do \
+             something. cc is the Cc: names there see the message but are not asked to act. \
+             A message that mentions nobody wakes nobody; it just sits in the history. \
+             Writing @name in your text counts as a mention too, so refer to people without \
+             the @ unless you need them to act. In a DM everything is addressed to the other \
+             side. When agents have answered each other many times in a row with no person \
+             in between, mentions from agents stop waking anyone until a person speaks.\n\n",
         );
 
         if self.live_enabled() {
@@ -532,8 +536,8 @@ impl CliRuntime {
                 "Where your reply goes. Nothing you write as your final answer is shown to \
                  anyone: people only see what you send with nubi_send. Answer the person who \
                  asked you in the room you were addressed in (its id is in every message), \
-                 with mentions and expect_reply naming whoever must act on it, or both empty \
-                 when your answer closes the exchange. Write into a different room only when \
+                 mentioning only whoever you need something from, and nobody when your answer \
+                 closes the exchange. Write into a different room only when \
                  you genuinely need something from there. One message per answer; no \
                  announcing what you are about to do. Not answering is a choice: make it only \
                  when the message needs nothing from you.\n\n",
@@ -559,8 +563,8 @@ impl CliRuntime {
             if self.settings.mcp.is_some() {
                 out.push_str(
                     "When you need something from someone (a question, a request, a handoff), \
-                     send it with nubi_send, naming them in mentions and expect_reply, and keep \
-                     your posted answer to what is left to say. ",
+                     send it with nubi_send, mentioning them, and keep your posted answer to \
+                     what is left to say. ",
                 );
             }
             out.push_str(
@@ -573,8 +577,8 @@ impl CliRuntime {
             out.push_str(
                 "Where your reply goes. Every turn names the room you were addressed in. Your \
                  reply is posted back into that room, and you choose who it is for: leave \
-                 mentions and expect_reply empty when your answer closes the exchange, name the \
-                 people in both when you need something back from them, and set post to false \
+                 mentions empty when your answer closes the exchange, mention the people you \
+                 need something from (cc anyone who should only see it), and set post to false \
                  when you already delivered the answer to this room with nubi_send so it is not \
                  posted twice. Write into a different room only when you genuinely need \
                  something from there; answer the person who asked you where they asked. \
@@ -939,13 +943,14 @@ pub fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
-/// `#12 3m ago alice → @pine @palm, reply from pine`
+/// `#12 3m ago alice → @pine @palm, cc apple`
 fn message_header(
     index: u64,
     timestamp_ms: u64,
     sender: &str,
     mentions: &[String],
     expect_reply: Option<&[String]>,
+    cc: &[String],
     now: u64,
 ) -> String {
     let mut header = format!("#{} {} {}", index, age(timestamp_ms, now), name(sender));
@@ -960,6 +965,10 @@ fn message_header(
             header.push_str(&format!(", reply from {}", who.join(", ")))
         }
         None => {}
+    }
+    if !cc.is_empty() {
+        let who: Vec<String> = cc.iter().map(|w| name(w)).collect();
+        header.push_str(&format!(", cc {}", who.join(", ")));
     }
     header
 }
@@ -1061,7 +1070,7 @@ fn structured_reply(value: &serde_json::Value) -> Option<StructuredReply> {
     Some(StructuredReply {
         text,
         mentions: list("mentions").unwrap_or_default(),
-        expect_reply: list("expect_reply"),
+        cc: list("cc").unwrap_or_default(),
         post: obj.get("post").and_then(|v| v.as_bool()).unwrap_or(true),
     })
 }
@@ -1122,6 +1131,7 @@ impl AgentRuntime for CliRuntime {
                         &msg.sender,
                         &msg.mentions,
                         msg.expect_reply.as_deref(),
+                        &msg.cc,
                         now
                     ),
                     untrusted(&with_files(&msg.text, &msg.files))
@@ -1161,6 +1171,7 @@ impl AgentRuntime for CliRuntime {
                         &msg.sender,
                         &msg.mentions,
                         msg.expect_reply.as_deref(),
+                        &msg.cc,
                         now
                     ),
                     untrusted(&with_files(&msg.text, &msg.files))
@@ -1199,6 +1210,7 @@ impl AgentRuntime for CliRuntime {
                     &t.sender,
                     &[],
                     t.expect_reply.as_deref(),
+                    &t.cc,
                     now
                 ),
                 with_attachments(&untrusted(&t.text), &t.attachments)
@@ -1214,6 +1226,7 @@ impl AgentRuntime for CliRuntime {
                         &t.sender,
                         &[],
                         t.expect_reply.as_deref(),
+                        &t.cc,
                         now
                     ),
                     with_attachments(&untrusted(&t.text), &t.attachments)
@@ -1547,6 +1560,7 @@ mod tests {
             timestamp_ms: now_ms(),
             mentions: vec![],
             expect_reply: None,
+            cc: Vec::new(),
             files: vec![],
         }
     }
@@ -1557,6 +1571,7 @@ mod tests {
             text: text.into(),
             index,
             expect_reply: None,
+            cc: Vec::new(),
             timestamp_ms: now_ms(),
             attachments: vec![],
         }
@@ -1958,7 +1973,7 @@ mod tests {
         assert_eq!((haiku.input, haiku.cache_read), (Some(2), None));
         let reply = structured_reply(p.structured.as_ref().unwrap()).unwrap();
         assert_eq!(reply.mentions, vec!["alice"]);
-        assert_eq!(reply.expect_reply, Some(vec![]));
+        assert!(reply.cc.is_empty());
         assert!(reply.post);
     }
 

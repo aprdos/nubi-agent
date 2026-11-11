@@ -97,6 +97,7 @@ async fn main() -> anyhow::Result<()> {
                 text: case.trigger.text.clone(),
                 index: case.context.len() as u64 + 1,
                 expect_reply: None,
+                cc: Vec::new(),
                 timestamp_ms: now,
                 attachments: vec![],
             }],
@@ -107,10 +108,7 @@ async fn main() -> anyhow::Result<()> {
         cost += out.cost_usd.unwrap_or(0.0);
         let reply = match &out.reply {
             Some(r) if !r.post => "(posted nothing; answered via tools)".to_string(),
-            Some(r) => format!(
-                "{}\n[mentions: {:?}, expect_reply: {:?}]",
-                r.text, r.mentions, r.expect_reply
-            ),
+            Some(r) => format!("{}\n[mentions: {:?}, cc: {:?}]", r.text, r.mentions, r.cc),
             None => out.text.clone(),
         };
 

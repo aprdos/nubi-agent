@@ -18,6 +18,8 @@ pub struct BufferedMessage {
     pub mentions: Vec<String>,
     /// Who it asked to answer, when the sender said.
     pub expect_reply: Option<Vec<String>>,
+    /// `metadata.cc`: copied, not asked to act.
+    pub cc: Vec<String>,
     /// Names of the files it carries. Context only lists them; the files
     /// themselves are fetched for messages the agent answers.
     pub files: Vec<FileRef>,
@@ -34,6 +36,7 @@ impl BufferedMessage {
             timestamp_ms,
             mentions: vec![],
             expect_reply: None,
+            cc: Vec::new(),
             files: vec![],
         }
     }
@@ -46,6 +49,7 @@ impl BufferedMessage {
             timestamp_ms: entry.timestamp_ms,
             mentions: entry.mention_list(),
             expect_reply: entry.expect_reply_list(),
+            cc: entry.cc_list(),
             files: entry.files(),
         }
     }
