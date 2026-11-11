@@ -102,6 +102,10 @@ impl Harness for Claude {
         true
     }
 
+    fn structured_replies(&self) -> bool {
+        true
+    }
+
     /// Claude Code loads project skills from `.claude/skills/` in its cwd.
     fn skills_dir(&self, workspace: &Path) -> Option<PathBuf> {
         Some(workspace.join(".claude").join("skills"))

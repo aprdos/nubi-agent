@@ -2040,10 +2040,13 @@ impl Shared {
             self.record_session(room_id, id, newest.index);
         }
 
-        let (post, text, mentions, expect_reply) = match out.reply.clone() {
+        let (post, text, mut mentions, expect_reply) = match out.reply.clone() {
             Some(r) => (r.post, r.text, r.mentions, r.expect_reply),
             None => (true, out.text.clone(), Vec::new(), None),
         };
+        // Whoever must answer has to receive the message first: a name only
+        // in expect_reply wakes nobody (nubi-mcp's nubi_send does the same).
+        add_reply_names_to_mentions(&mut mentions, expect_reply.as_deref());
         let text = text.trim().to_string();
         let outcome = if !post || text.is_empty() {
             Outcome::Tools
@@ -2456,6 +2459,21 @@ fn per_model_usage(
         models.insert(configured.unwrap_or("unknown").to_string(), out.usage);
     }
     models
+}
+
+/// Add the names in `expect_reply` to `mentions`, in the form the engine
+/// takes there (no `@`, lowercase, id characters; the engine resolves handles
+/// itself). A name that still isn't id-shaped stays only in `expect_reply`.
+fn add_reply_names_to_mentions(mentions: &mut Vec<String>, expect_reply: Option<&[String]>) {
+    for name in expect_reply.unwrap_or_default() {
+        let n = name.trim().trim_start_matches('@').to_lowercase();
+        let id_shaped = !n.is_empty()
+            && n.chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'));
+        if id_shaped && !mentions.iter().any(|m| m.eq_ignore_ascii_case(&n)) {
+            mentions.push(n);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -3436,6 +3454,19 @@ done
         .await;
         assert_eq!(live_inputs(&dir).len(), 1, "nobody wrote to it again");
         assert!(engine.state().posts.is_empty());
+    }
+
+    #[test]
+    fn reply_names_join_mentions_in_engine_form() {
+        let mut m = vec!["apple".to_string()];
+        add_reply_names_to_mentions(
+            &mut m,
+            Some(&["@Apple".into(), "Pine".into(), "not an id".into()]),
+        );
+        assert_eq!(m, vec!["apple", "pine"]);
+        let mut none: Vec<String> = Vec::new();
+        add_reply_names_to_mentions(&mut none, None);
+        assert!(none.is_empty());
     }
 
     #[tokio::test]
