@@ -59,6 +59,12 @@ impl Claude {
         }
         if let Some(ref url) = settings.llm_base_url {
             inv.env("ANTHROPIC_BASE_URL", url);
+            // Behind a custom base URL, Claude Code (2.1.247+) defers MCP tools
+            // behind ToolSearch and `tool_reference` blocks. Through a Kiro
+            // gateway the model then calls tools by mangled names (XML in the
+            // name), the upstream refuses every later request carrying that
+            // call, and the session is stuck. Load the tools up front instead.
+            inv.env("ENABLE_TOOL_SEARCH", "false");
         }
         if let Some(ref key) = settings.llm_api_key {
             inv.env("ANTHROPIC_API_KEY", key);
