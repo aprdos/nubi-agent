@@ -1871,6 +1871,22 @@ mod tests {
     }
 
     #[test]
+    fn claude_behind_a_gateway_loads_mcp_tools_up_front() {
+        // Direct to Anthropic: Claude Code's own default.
+        let s = settings();
+        let inv = claude::Claude.invocation(&s, "SYS", "hi", None);
+        assert_eq!(env(&inv, "ENABLE_TOOL_SEARCH"), None);
+        // Behind a gateway: no deferred tools, per-turn and live alike.
+        let mut s = settings();
+        s.llm_base_url = Some("http://gateway/llm".into());
+        let inv = claude::Claude.invocation(&s, "SYS", "hi", None);
+        assert_eq!(env(&inv, "ENABLE_TOOL_SEARCH"), Some("false"));
+        assert_eq!(env(&inv, "ANTHROPIC_BASE_URL"), Some("http://gateway/llm"));
+        let live = claude::Claude.live_invocation(&s, "SYS", None).unwrap();
+        assert_eq!(env(&live, "ENABLE_TOOL_SEARCH"), Some("false"));
+    }
+
+    #[test]
     fn claude_sessions_start_with_an_id_and_continue_with_resume() {
         let s = settings();
         let fresh = Session {
