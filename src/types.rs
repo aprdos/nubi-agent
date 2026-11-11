@@ -152,13 +152,19 @@ impl LogEntry {
             .as_ref()
             .and_then(|m| m.get("expect_reply"))
             .and_then(|v| v.as_array())?;
-        Some(
-            arr.iter()
-                .filter_map(|v| v.as_str())
-                .map(|s| normalize_id(s).to_string())
-                .filter(|s| !s.is_empty())
-                .collect(),
-        )
+        let ids: Vec<String> = arr
+            .iter()
+            .filter_map(|v| v.as_str())
+            .map(|s| normalize_id(s).to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        // A list with nothing usable in it is malformed, which the reply
+        // rules read as "go ahead"; reading it as [] here would call a
+        // message FYI that wakes the agent anyway.
+        if ids.is_empty() && !arr.is_empty() {
+            return None;
+        }
+        Some(ids)
     }
 
     /// Check if this is a regular message (not system event)
@@ -196,6 +202,23 @@ mod tests {
                 metadata: None,
             },
         }
+    }
+
+    #[test]
+    fn expect_reply_lists_read_like_the_reply_rules() {
+        let with = |v: serde_json::Value| {
+            let mut e = make_entry("alice", "hi", None);
+            e.payload.metadata = Some(json!({ "expect_reply": v }));
+            e.expect_reply_list()
+        };
+        assert_eq!(
+            with(json!(["@Pine", "apple"])),
+            Some(vec!["Pine".to_string(), "apple".into()])
+        );
+        assert_eq!(with(json!([])), Some(vec![]), "explicit FYI");
+        // Nothing usable in it: malformed, which the rules read as go ahead.
+        assert_eq!(with(json!([1, ""])), None);
+        assert_eq!(make_entry("alice", "hi", None).expect_reply_list(), None);
     }
 
     #[test]

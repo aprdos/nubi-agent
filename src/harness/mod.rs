@@ -271,6 +271,13 @@ pub trait Harness: Send + Sync {
         session: Option<&Session>,
     ) -> Invocation;
 
+    /// Whether its final answer comes back in [`REPLY_SCHEMA`] shape, so the
+    /// reply carries its own mentions and expect_reply. Otherwise it is
+    /// posted as plain text that wakes nobody.
+    fn structured_replies(&self) -> bool {
+        false
+    }
+
     /// Arguments and env for a session that stays up between messages
     /// (see [`crate::live`]), when the CLI can run one. None by default.
     fn live_invocation(
@@ -540,6 +547,27 @@ impl CliRuntime {
                  command finishes you are woken in the same room with its output, and you tell \
                  people with nubi_send. Never say you will keep an eye on something without \
                  starting such a command, and stop it once you no longer need it.\n\n",
+            );
+        } else if !self.harness.structured_replies() {
+            // No reply schema: the answer is posted as plain text that wakes
+            // nobody, so a handoff can only go out through nubi_send.
+            out.push_str(
+                "Where your reply goes. Every turn names the room you were addressed in. Your \
+                 answer is posted back into that room as you write it, and it wakes nobody: \
+                 naming someone in the text doesn't make them act. ",
+            );
+            if self.settings.mcp.is_some() {
+                out.push_str(
+                    "When you need something from someone (a question, a request, a handoff), \
+                     send it with nubi_send, naming them in mentions and expect_reply, and keep \
+                     your posted answer to what is left to say. ",
+                );
+            }
+            out.push_str(
+                "Answer the person who asked you where they asked. Your answer is the last thing \
+                 you do in a turn: once it is out, stop. Anything that shows up after it in the \
+                 same turn is not a new message to answer; new messages always arrive in a new \
+                 turn.\n\n",
             );
         } else {
             out.push_str(
@@ -2559,6 +2587,31 @@ mod tests {
         fn invocation(&self, _: &Settings, _: &str, _: &str, _: Option<&Session>) -> Invocation {
             Invocation::default()
         }
+    }
+
+    #[test]
+    fn harnesses_without_reply_schema_are_told_to_hand_off_with_nubi_send() {
+        let mcp = Some(McpServer {
+            url: "http://mcp".into(),
+            token: "t".into(),
+        });
+        let claude = CliRuntime::new(HarnessKind::Claude, "bot")
+            .with_mcp(mcp.clone())
+            .build_system_prompt();
+        assert!(claude.contains("set post to false"));
+        let codex = CliRuntime::new(HarnessKind::Codex, "bot")
+            .with_mcp(mcp)
+            .build_system_prompt();
+        assert!(
+            !codex.contains("set post to false"),
+            "no reply fields to set"
+        );
+        assert!(codex.contains("it wakes nobody"));
+        assert!(codex.contains("send it with nubi_send"));
+        // Without MCP there is no nubi_send to point at.
+        let bare = CliRuntime::new(HarnessKind::Codex, "bot").build_system_prompt();
+        assert!(bare.contains("it wakes nobody"));
+        assert!(!bare.contains("nubi_send"));
     }
 
     #[test]

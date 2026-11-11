@@ -48,18 +48,26 @@ pub fn mentions(agent_id: &str, mentions: &[String], text: &str) -> bool {
     if mentions.iter().any(|m| m == agent_id || m == "here") {
         return true;
     }
-    if text.contains("@here") {
-        return true;
-    }
-    // An exact @mention, not a prefix of a longer id. Every occurrence:
-    // "@bot-x then @bot" names bot.
-    let pattern = format!("@{agent_id}");
-    text.match_indices(&pattern).any(
-        |(pos, _)| match text[pos + pattern.len()..].chars().next() {
-            None => true,
-            Some(c) => !c.is_alphanumeric() && c != '-' && c != '_',
-        },
-    )
+    at_name(text, "here") || at_name(text, agent_id)
+}
+
+/// Whether `text` has `@name` as a word of its own: not a prefix of a longer
+/// name ("@bot-x then @bot" names bot, "@hereford" names nobody) and not
+/// inside an address ("ops@here.com"). Every occurrence counts.
+fn at_name(text: &str, name: &str) -> bool {
+    let is_name_char = |c: char| c.is_alphanumeric() || c == '-' || c == '_';
+    let pattern = format!("@{name}");
+    text.match_indices(&pattern).any(|(pos, _)| {
+        let before_ok = text[..pos]
+            .chars()
+            .next_back()
+            .is_none_or(|c| !is_name_char(c) && c != '.');
+        let after_ok = text[pos + pattern.len()..]
+            .chars()
+            .next()
+            .is_none_or(|c| !is_name_char(c));
+        before_ok && after_ok
+    })
 }
 
 /// Whether `agent_id` is expected to answer, by `metadata.expect_reply`.
@@ -97,6 +105,22 @@ pub fn expects_reply(agent_id: &str, metadata: Option<&Value>) -> bool {
 /// An agent id as people write it: `@id`, with stray spaces.
 pub fn normalize_id(raw: &str) -> &str {
     raw.trim().trim_start_matches('@').trim()
+}
+
+#[cfg(test)]
+mod at_name_tests {
+    use super::*;
+
+    #[test]
+    fn here_and_ids_are_whole_words_in_text() {
+        assert!(mentions("bot", &[], "@here standup"));
+        assert!(mentions("bot", &[], "ping @here."));
+        assert!(!mentions("bot", &[], "lunch at @hereford"));
+        assert!(!mentions("bot", &[], "mail ops@here.com"));
+        assert!(mentions("bot", &[], "@bot-x then @bot"));
+        assert!(!mentions("bot", &[], "@bot-x only"));
+        assert!(!mentions("bot", &[], "write to me@bot"));
+    }
 }
 
 #[cfg(test)]
