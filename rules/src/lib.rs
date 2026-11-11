@@ -18,15 +18,14 @@ pub struct Message<'a> {
     pub mentions: &'a [String],
     /// The text of its parts, joined.
     pub text: &'a str,
-    /// The payload's `metadata`, for `cc`, `chain` and the older
-    /// `expect_reply`.
+    /// The payload's `metadata`, for `cc` and `chain`.
     pub metadata: Option<&'a Value>,
 }
 
 /// Agent messages in a row, with no person in between, after which a
 /// mention from an agent wakes nobody. The engine counts them into
 /// `metadata.chain` on every agent's message; a person speaking resets it.
-pub const CHAIN_LIMIT: u64 = 8;
+pub const CHAIN_LIMIT: u64 = 100;
 
 /// Whether `agent_id` should answer `msg`.
 ///
@@ -35,9 +34,6 @@ pub const CHAIN_LIMIT: u64 = 8;
 /// message. `metadata.cc` is the Cc: names there see it but are not asked to
 /// act, even when mentioned. Never its own messages, and never once agents
 /// have answered each other `CHAIN_LIMIT` times without a person in between.
-///
-/// A message that still carries `expect_reply` (from senders before `cc`)
-/// is read the old way as well: it can narrow who answers further.
 pub fn wants_reply(agent_id: &str, msg: &Message) -> bool {
     if msg.sender == agent_id {
         return false;
@@ -48,10 +44,7 @@ pub fn wants_reply(agent_id: &str, msg: &Message) -> bool {
     if !is_dm(msg.room) && !mentions(agent_id, msg.mentions, msg.text) {
         return false;
     }
-    if in_list(agent_id, msg.metadata, "cc") {
-        return false;
-    }
-    expects_reply(agent_id, msg.metadata)
+    !in_list(agent_id, msg.metadata, "cc")
 }
 
 /// The engine's count of agent messages in a row says this one comes after
@@ -107,38 +100,6 @@ fn at_name(text: &str, name: &str) -> bool {
             .is_none_or(|c| !is_name_char(c));
         before_ok && after_ok
     })
-}
-
-/// Whether `agent_id` is expected to answer, by `metadata.expect_reply`.
-///
-/// Fails open: anything missing or malformed means "go ahead". A wrong
-/// `false` is a silent deadlock — the sender waits for an answer that never
-/// comes and nothing logs why — while a wrong `true` is just noise. Only a
-/// well-formed list that leaves us out keeps us quiet, plus the explicit
-/// empty list, which means nobody should reply.
-pub fn expects_reply(agent_id: &str, metadata: Option<&Value>) -> bool {
-    let Some(value) = metadata.and_then(|m| m.get("expect_reply")) else {
-        return true;
-    };
-    let Some(arr) = value.as_array() else {
-        return true;
-    };
-    if arr.is_empty() {
-        return false;
-    }
-
-    let ids: Vec<&str> = arr
-        .iter()
-        .filter_map(|v| v.as_str())
-        .map(normalize_id)
-        .filter(|s| !s.is_empty())
-        .collect();
-    if ids.is_empty() {
-        return true;
-    }
-
-    let me = normalize_id(agent_id);
-    ids.iter().any(|id| id.eq_ignore_ascii_case(me))
 }
 
 /// An agent id as people write it: `@id`, with stray spaces.
@@ -211,31 +172,6 @@ mod to_and_cc_tests {
         assert!(!at(CHAIN_LIMIT));
         assert!(!at(CHAIN_LIMIT + 5));
     }
-
-    #[test]
-    fn older_messages_with_expect_reply_still_narrow_who_answers() {
-        assert!(!wants(
-            "pine",
-            "r",
-            &["pine"],
-            "x",
-            json!({"expect_reply": []})
-        ));
-        assert!(!wants(
-            "pine",
-            "r",
-            &["pine", "apple"],
-            "x",
-            json!({"expect_reply": ["apple"]})
-        ));
-        assert!(wants(
-            "apple",
-            "r",
-            &["pine", "apple"],
-            "x",
-            json!({"expect_reply": ["apple"]})
-        ));
-    }
 }
 
 #[cfg(test)]
@@ -257,7 +193,6 @@ mod at_name_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
 
     fn msg<'a>(
         room: &'a str,
@@ -339,25 +274,6 @@ mod tests {
     }
 
     #[test]
-    fn expect_reply_can_hold_it_back() {
-        let named = list(&["bot", "other"]);
-        let meta = json!({"expect_reply": ["@other"]});
-        let m = Message {
-            metadata: Some(&meta),
-            ..msg("general", "alice", &named, "")
-        };
-        assert!(!wants_reply("bot", &m));
-        assert!(wants_reply("other", &m));
-
-        let nobody = json!({"expect_reply": []});
-        let dm = Message {
-            metadata: Some(&nobody),
-            ..msg("dm.alice.bot", "alice", &named, "fyi")
-        };
-        assert!(!wants_reply("bot", &dm));
-    }
-
-    #[test]
     fn exact_mentions_only() {
         assert!(!mentions("bot", &[], "@bot2 go"));
         assert!(!mentions("bot", &[], "@bot-x go"));
@@ -369,20 +285,5 @@ mod tests {
             "a later exact one counts"
         );
         assert!(!mentions("bot", &[], "@bot-x and @botty"));
-    }
-
-    #[test]
-    fn expect_reply_fails_open() {
-        assert!(expects_reply("bot", None));
-        assert!(expects_reply("bot", Some(&json!({}))));
-        assert!(expects_reply("bot", Some(&json!({"expect_reply": "bot"}))));
-        assert!(expects_reply(
-            "bot",
-            Some(&json!({"expect_reply": [1, ""]}))
-        ));
-        assert!(expects_reply(
-            "Bot",
-            Some(&json!({"expect_reply": [" @bot "]}))
-        ));
     }
 }

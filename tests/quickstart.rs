@@ -126,7 +126,7 @@ async fn start_engine(state: Arc<Mutex<Engine>>) -> String {
 /// turn that calls StructuredOutput with the reply, its result, the final
 /// result object.
 fn fake_claude(dir: &std::path::Path) {
-    let reply = json!({"text": REPLY, "mentions": ["alice"], "expect_reply": [], "post": true});
+    let reply = json!({"text": REPLY, "mentions": ["alice"], "cc": [], "post": true});
     let lines = [
         json!({"type": "system", "subtype": "init", "session_id": "s-1"}),
         json!({"type": "assistant", "message": {"id": "m-1", "model": "fake-model",
@@ -212,8 +212,6 @@ async fn the_readme_quick_start_gets_a_reply() {
     assert_eq!(room, &format!("dm.alice.{AGENT}"), "{body}");
     assert_eq!(body["parts"][0]["text"], REPLY, "{body}");
     assert_eq!(body["mentions"], json!(["alice"]), "{body}");
-    // Who must act is `mentions` alone; replies no longer carry expect_reply.
-    assert!(body["metadata"].get("expect_reply").is_none(), "{body}");
 
     let me_auth = state.lock().unwrap().me_auth.clone();
     assert_eq!(me_auth, vec![Some(format!("Bearer {TOKEN}"))]);
