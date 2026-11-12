@@ -1923,11 +1923,17 @@ impl Shared {
                 );
             }
 
+            let live_up = self.live.lock().unwrap().contains_key(room_id);
             eprintln!(
                 "[nubi-agent] Running {:?}{}...",
                 self.config.harness,
                 match &session {
+                    _ if live_up => " (live session)",
+                    Some(s) if s.resume && self.runtime.live_command(None).is_some() => {
+                        " (live session, resuming the conversation)"
+                    }
                     Some(s) if s.resume => " (resuming session)",
+                    Some(_) if self.runtime.live_command(None).is_some() => " (live session)",
                     Some(_) => " (new session)",
                     None => "",
                 }

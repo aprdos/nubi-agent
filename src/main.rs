@@ -104,12 +104,23 @@ struct Args {
     #[arg(long, env = "NUBI_IGNORE_BOTS", help_heading = "Agent")]
     ignore_bots: bool,
 
-    /// Keep one Claude Code session up per room instead of one run per
-    /// message: what the agent starts in the background keeps running, and it
-    /// is woken when that finishes. It answers with nubi_send, so this needs
-    /// --mcp-url; other harnesses ignore it
-    #[arg(long, env = "NUBI_LIVE_SESSIONS", help_heading = "Tuning")]
+    /// Keep one Claude Code session up per room (the default) instead of
+    /// one run per message: what the agent starts in the background keeps
+    /// running, and it is woken when that finishes. It answers with
+    /// nubi_send, so it needs an MCP server; other harnesses run one run
+    /// per message regardless
+    #[arg(long, env = "NUBI_LIVE_SESSIONS", default_value_t = true, action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true", help_heading = "Tuning", overrides_with = "no_live_sessions")]
     live_sessions: bool,
+
+    /// One run per message instead of a live session: nothing the agent
+    /// starts outlives its turn, and it cannot come back later on its own
+    #[arg(
+        long,
+        env = "NUBI_NO_LIVE_SESSIONS",
+        help_heading = "Tuning",
+        overrides_with = "live_sessions"
+    )]
+    no_live_sessions: bool,
 
     /// Live sessions kept up at once; the one idle longest is stopped first
     #[arg(
@@ -124,7 +135,7 @@ struct Args {
     #[arg(
         long,
         env = "NUBI_LIVE_IDLE_SECS",
-        default_value = "600",
+        default_value = "1800",
         help_heading = "Tuning"
     )]
     live_idle_secs: u64,
@@ -310,7 +321,7 @@ async fn main() -> anyhow::Result<()> {
         answer_since_ms: args.answer_since_ms,
         answer_since_all_rooms: args.answer_since_all_rooms,
         ignore_bots: args.ignore_bots,
-        live_sessions: args.live_sessions,
+        live_sessions: args.live_sessions && !args.no_live_sessions,
         live_max: args.live_max,
         live_idle_secs: args.live_idle_secs,
         heartbeat_url: args.heartbeat_url,
@@ -443,6 +454,21 @@ mod tests {
         assert!(args.model.is_none());
         assert!(args.fallback_model.is_none());
         assert_eq!(args.rooms, "*");
+        assert!(args.live_sessions && !args.no_live_sessions);
+    }
+
+    /// Live sessions are on unless asked off, either way round.
+    #[test]
+    fn live_sessions_are_on_by_default_and_can_be_turned_off() {
+        let live = |argv: &[&str]| {
+            let a = Args::try_parse_from(["nubi-agent", "--token", "nubi_x"].iter().chain(argv))
+                .unwrap();
+            a.live_sessions && !a.no_live_sessions
+        };
+        assert!(live(&[]));
+        assert!(live(&["--live-sessions"]));
+        assert!(!live(&["--no-live-sessions"]));
+        assert!(!live(&["--live-sessions=false"]));
     }
 
     /// The help text tells a newcomer the two things they need and never

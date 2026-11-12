@@ -121,11 +121,15 @@ async fn start_engine(state: Arc<Mutex<Engine>>) -> String {
     format!("http://{addr}")
 }
 
-/// A `claude` that answers `--version`, and otherwise prints the stream a
-/// `claude -p --output-format stream-json` run prints: init, one assistant
-/// turn that calls StructuredOutput with the reply, its result, the final
-/// result object.
-fn fake_claude(dir: &std::path::Path) {
+/// A `claude` that answers `--version`, and otherwise speaks the two
+/// stream-json protocols nubi-agent uses. As a live session (`--input-format
+/// stream-json`, the default) it reads one message from stdin, echoes it,
+/// answers the DM with nubi_send (a real POST to the engine, as nubi-mcp
+/// would make, plus the tool_use event nubi-agent watches for) and prints the
+/// result, then stays up until its stdin closes. As a one-off run it prints
+/// init, one assistant turn that calls StructuredOutput with the reply, its
+/// result, the final result object.
+fn fake_claude(dir: &std::path::Path, engine_url: &str) {
     let reply = json!({"text": REPLY, "mentions": ["alice"], "cc": [], "post": true});
     let lines = [
         json!({"type": "system", "subtype": "init", "session_id": "s-1"}),
@@ -140,6 +144,33 @@ fn fake_claude(dir: &std::path::Path) {
     let mut script = String::from(
         "#!/bin/sh\nfor a in \"$@\"; do [ \"$a\" = --version ] && { echo '0.0.0 (fake)'; exit 0; }; done\n",
     );
+    let sent = json!({"message_id": "fake-1", "parts": [{"kind": "text", "text": REPLY}], "mentions": ["alice"]});
+    let send_event = json!({"type": "assistant", "message": {"id": "m-1", "model": "fake-model",
+        "usage": {"input_tokens": 10, "output_tokens": 5},
+        "content": [{"type": "tool_use", "id": "t-1", "name": "mcp__nubi__nubi_send",
+            "input": {"room_id": format!("dm.alice.{AGENT}"), "text": REPLY}}]}});
+    let live_result = json!({"type": "result", "subtype": "success", "is_error": false, "result": "",
+        "session_id": "s-1", "num_turns": 1, "duration_ms": 1, "total_cost_usd": 0.0});
+    script.push_str(&format!(
+        "case \" $* \" in *' --input-format '*)\n\
+         echo '{init}'\n\
+         IFS= read -r line || exit 0\n\
+         printf '%s\\n' \"$line\" | sed 's/^{{/{{\"isReplay\":true,/'\n\
+         curl -s -o /dev/null -X POST -H 'Authorization: Bearer {token}' -H 'Content-Type: application/json' \
+         -d '{sent}' '{engine}/v1/spaces/{space}/rooms/dm.alice.{agent}/messages'\n\
+         echo '{send}'\n\
+         echo '{result}'\n\
+         cat > /dev/null\n\
+         exit 0;;\nesac\n",
+        init = json!({"type": "system", "subtype": "init", "session_id": "s-1"}),
+        token = TOKEN,
+        sent = sent.to_string().replace('\'', "'\\''"),
+        engine = engine_url,
+        space = SPACE,
+        agent = AGENT,
+        send = send_event.to_string().replace('\'', "'\\''"),
+        result = live_result.to_string().replace('\'', "'\\''"),
+    ));
     for line in lines {
         // Single-quoted for the shell, so a quote inside the JSON must close,
         // escape and reopen the quoting.
@@ -159,7 +190,7 @@ async fn the_readme_quick_start_gets_a_reply() {
     let home = tempfile::tempdir().unwrap();
     let bin_dir = home.path().join("bin");
     std::fs::create_dir_all(&bin_dir).unwrap();
-    fake_claude(&bin_dir);
+    fake_claude(&bin_dir, &engine_url);
     let real_bin = std::path::Path::new(env!("CARGO_BIN_EXE_nubi-agent"));
     let path = format!(
         "{}:{}:{}",

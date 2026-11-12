@@ -146,9 +146,10 @@ nubi-agent --url http://localhost:9099 --token nubi_xxx \
 | `--pass-env` | `NUBI_PASS_ENV` | — | Extra env vars (comma-separated names) the CLI may see |
 | `--mandate-strict` | `NUBI_MANDATE_STRICT` | `false` | Answer nothing until the agent's mandate has been fetched |
 | `--no-local-skills` | `NUBI_NO_LOCAL_SKILLS` | `false` | Skip `~/.nubi/skills` and per-agent skill files |
-| `--live-sessions` | `NUBI_LIVE_SESSIONS` | `false` | Keep one Claude Code session up per room: background work outlives the turn and wakes the agent when it finishes; answers go through `nubi_send` (needs `--mcp-url`) |
+| `--live-sessions` | `NUBI_LIVE_SESSIONS` | `true` | Keep one Claude Code session up per room: background work outlives the turn and wakes the agent when it finishes; answers go through `nubi_send` |
+| `--no-live-sessions` | `NUBI_NO_LIVE_SESSIONS` | `false` | One `claude -p` run per message instead; nothing the agent starts outlives its turn |
 | `--live-max` | `NUBI_LIVE_MAX` | `3` | Live sessions kept up at once; the one idle longest stops first |
-| `--live-idle-secs` | `NUBI_LIVE_IDLE_SECS` | `600` | Stop a live session with nothing running after this long |
+| `--live-idle-secs` | `NUBI_LIVE_IDLE_SECS` | `1800` | Stop a live session with nothing running after this long |
 | `--heartbeat-url` | `NUBI_HEARTBEAT_URL` | — | POSTed every minute while the agent works, for launchers that stop idle agents (`NUBI_HEARTBEAT_TOKEN` as bearer) |
 
 </details>
@@ -230,22 +231,29 @@ sequenceDiagram
     participant M as nubi-mcp
 
     N->>A: SSE: @bot help me debug this
-    A->>A: Build prompt + context, pick the room's session
+    A->>A: Build prompt + context
     A->>N: Set typing indicator
-    A->>C: claude -p "..." --resume <session> --mcp-config ...
+    A->>C: start the room's session once:<br/>claude -p --input-format stream-json --mcp-config ...
+    A->>C: stdin: the message, as a user event
 
-    loop Every 5s while processing
+    loop Every 5s while the turn runs
         A-->>N: Refresh typing indicator
     end
 
-    opt Claude uses MCP tools
-        C->>M: nubi_send, nubi_poll, nubi_create_thread, ...
-        M->>N: API calls
-    end
+    C->>M: nubi_send (the answer), nubi_poll, ...
+    M->>N: API calls
+    C->>A: result event: the turn is over
 
-    C->>A: JSON result: text, mentions, cc, post
-    A->>N: POST reply (or nothing when post is false)
+    opt The agent started a background command (a poll loop, say)
+        C-->>C: it keeps running after the turn
+        C->>A: a turn of its own when it finishes
+        C->>M: nubi_send: the outcome
+    end
 ```
+
+With `--no-live-sessions` (or a CLI other than Claude Code) every message is one
+`claude -p "..." --resume <session>` run instead, whose JSON result (text,
+mentions, cc, post) nubi-agent posts itself.
 
 1. **Listen.** nubi-agent follows nubi's SSE stream for mentions and DMs.
 2. **Batch.** Messages that arrive within half a second of each other are answered in one turn.
@@ -257,8 +265,8 @@ sequenceDiagram
    A thread also gets what its room said since, and every turn sees what the
    agent is doing and just did in its other rooms, so it can pick up work
    already started elsewhere instead of starting it again.
-4. **Run.** The CLI runs in the agent's workspace, connected to nubi-mcp through a per-run MCP config.
-5. **Reply.** The answer is posted with the routing the model chose, or not at all when the model already answered through tools.
+4. **Run.** With Claude Code, one session per room stays up between messages (a live session): messages go in on stdin, and a background command the agent started (a loop polling a PR's checks, say) keeps running after the turn and wakes the agent in that room when it finishes. The session stops after `--live-idle-secs` with nothing running. With `--no-live-sessions`, or another CLI, each message is one run in the agent's workspace, connected to nubi-mcp through a per-run MCP config, and nothing outlives the turn.
+5. **Reply.** A live session answers with `nubi_send`, choosing who it is for. A per-message run's answer is posted with the routing the model chose, or not at all when the model already answered through tools.
 
 When things go wrong, a turn has a timeout and one retry, and Claude Code
 gets a fallback model. If a turn still fails, the room gets a one-line note
