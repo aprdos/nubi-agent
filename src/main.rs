@@ -114,7 +114,12 @@ struct Args {
 
     /// One run per message instead of a live session: nothing the agent
     /// starts outlives its turn, and it cannot come back later on its own
-    #[arg(long, env = "NUBI_NO_LIVE_SESSIONS", help_heading = "Tuning", overrides_with = "live_sessions")]
+    #[arg(
+        long,
+        env = "NUBI_NO_LIVE_SESSIONS",
+        help_heading = "Tuning",
+        overrides_with = "live_sessions"
+    )]
     no_live_sessions: bool,
 
     /// Live sessions kept up at once; the one idle longest is stopped first
@@ -456,7 +461,8 @@ mod tests {
     #[test]
     fn live_sessions_are_on_by_default_and_can_be_turned_off() {
         let live = |argv: &[&str]| {
-            let a = Args::try_parse_from(["nubi-agent", "--token", "nubi_x"].iter().chain(argv)).unwrap();
+            let a = Args::try_parse_from(["nubi-agent", "--token", "nubi_x"].iter().chain(argv))
+                .unwrap();
             a.live_sessions && !a.no_live_sessions
         };
         assert!(live(&[]));

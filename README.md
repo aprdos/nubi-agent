@@ -231,22 +231,29 @@ sequenceDiagram
     participant M as nubi-mcp
 
     N->>A: SSE: @bot help me debug this
-    A->>A: Build prompt + context, pick the room's session
+    A->>A: Build prompt + context
     A->>N: Set typing indicator
-    A->>C: claude -p "..." --resume <session> --mcp-config ...
+    A->>C: start the room's session once:<br/>claude -p --input-format stream-json --mcp-config ...
+    A->>C: stdin: the message, as a user event
 
-    loop Every 5s while processing
+    loop Every 5s while the turn runs
         A-->>N: Refresh typing indicator
     end
 
-    opt Claude uses MCP tools
-        C->>M: nubi_send, nubi_poll, nubi_create_thread, ...
-        M->>N: API calls
-    end
+    C->>M: nubi_send (the answer), nubi_poll, ...
+    M->>N: API calls
+    C->>A: result event: the turn is over
 
-    C->>A: JSON result: text, mentions, cc, post
-    A->>N: POST reply (or nothing when post is false)
+    opt The agent started a background command (a poll loop, say)
+        C-->>C: it keeps running after the turn
+        C->>A: a turn of its own when it finishes
+        C->>M: nubi_send: the outcome
+    end
 ```
+
+With `--no-live-sessions` (or a CLI other than Claude Code) every message is one
+`claude -p "..." --resume <session>` run instead, whose JSON result (text,
+mentions, cc, post) nubi-agent posts itself.
 
 1. **Listen.** nubi-agent follows nubi's SSE stream for mentions and DMs.
 2. **Batch.** Messages that arrive within half a second of each other are answered in one turn.
