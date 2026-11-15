@@ -12,6 +12,11 @@
 //! the echo of a message we wrote (`--replay-user-messages`), or with no echo
 //! at all when the CLI started it. The latter come out of
 //! [`LiveSession::spontaneous`].
+//!
+//! A message for a room whose turn is still running need not wait for it:
+//! [`LiveSession::steer`] writes it at once, and the CLI hands it to the
+//! model at its next step (after the tool call in progress), inside the
+//! same turn. That turn's one `result` ends it too.
 
 use std::collections::{HashSet, VecDeque};
 use std::ffi::OsString;
@@ -116,8 +121,10 @@ struct Current {
 
 #[derive(Default)]
 struct State {
-    /// Messages written and not yet taken up, oldest first.
-    waiting: VecDeque<oneshot::Sender<LiveTurn>>,
+    /// Messages written and not yet taken up, oldest first: a turn's,
+    /// with whoever waits for it, or `None` for one steered into the
+    /// running turn.
+    waiting: VecDeque<Option<oneshot::Sender<LiveTurn>>>,
     /// The turn in progress, if any.
     current: Option<Current>,
     background: HashSet<String>,
@@ -127,13 +134,22 @@ struct State {
 
 impl State {
     fn take_up(&mut self) {
-        let owner = self.waiting.pop_front();
+        let owner = match self.waiting.pop_front() {
+            Some(Some(owner)) => Some(owner),
+            // Steered: folded into the running turn, or, when that turn had
+            // already ended, starting one of the CLI's own.
+            Some(None) => {
+                self.current.get_or_insert_with(Current::default);
+                return;
+            }
+            None => None,
+        };
         match self.current.as_mut() {
             // The CLI started a turn and our message was folded into it.
             Some(c) if c.owner.is_none() => c.owner = owner,
             Some(_) => {
                 if let Some(o) = owner {
-                    self.waiting.push_front(o);
+                    self.waiting.push_front(Some(o));
                 }
             }
             None => {
@@ -277,23 +293,9 @@ impl LiveSession {
             if s.ended {
                 anyhow::bail!("the session has ended");
             }
-            s.waiting.push_back(tx);
+            s.waiting.push_back(Some(tx));
         }
-        let line = serde_json::json!({
-            "type": "user",
-            "message": { "role": "user", "content": text },
-        })
-        .to_string();
-        let written = {
-            let mut stdin = self.stdin.lock().await;
-            async {
-                stdin.write_all(line.as_bytes()).await?;
-                stdin.write_all(b"\n").await?;
-                stdin.flush().await
-            }
-            .await
-        };
-        if let Err(e) = written {
+        if let Err(e) = self.write(text).await {
             // The pipe is gone, so is the session: end it, which also drops
             // the slot this message took in `waiting`.
             self.stop();
@@ -304,6 +306,42 @@ impl LiveSession {
             Ok(Err(_)) => anyhow::bail!("the session ended during the turn"),
             Err(_) => anyhow::bail!("no answer within {}s", timeout.as_secs()),
         }
+    }
+
+    /// Hand a message to the turn that is running (or about to), without
+    /// waiting for it to end: the CLI shows it to the model at its next
+    /// step. False, with nothing written, when no turn of ours is under way
+    /// or the session is gone; the message then needs a turn of its own.
+    ///
+    /// Written just as the turn ends, the CLI may take it up as a turn of its
+    /// own, which comes out of `spontaneous` like any other.
+    pub async fn steer(&self, text: &str) -> bool {
+        {
+            let mut s = self.state.lock().unwrap();
+            let ours = s.current.as_ref().is_some_and(|c| c.owner.is_some())
+                || s.waiting.iter().any(Option::is_some);
+            if s.ended || !ours {
+                return false;
+            }
+            s.waiting.push_back(None);
+        }
+        if self.write(text).await.is_err() {
+            self.stop();
+            return false;
+        }
+        true
+    }
+
+    async fn write(&self, text: &str) -> std::io::Result<()> {
+        let line = serde_json::json!({
+            "type": "user",
+            "message": { "role": "user", "content": text },
+        })
+        .to_string();
+        let mut stdin = self.stdin.lock().await;
+        stdin.write_all(line.as_bytes()).await?;
+        stdin.write_all(b"\n").await?;
+        stdin.flush().await
     }
 
     pub fn ended(&self) -> bool {
@@ -517,6 +555,72 @@ mod tests {
         assert!(s.turn("hello", T).await.is_err());
         assert!(s.ended());
         assert!(!s.busy());
+    }
+
+    #[tokio::test]
+    async fn a_steered_message_joins_the_running_turn() {
+        let (s, mut cli, mut rx) = session();
+        // Nothing of ours is running: nothing to steer into.
+        assert!(!s.steer("early").await);
+
+        let turn = tokio::spawn({
+            let s = Arc::clone(&s);
+            async move { s.turn("first", T).await }
+        });
+        cli.echo().await;
+        cli.say(
+            serde_json::json!({"type": "assistant", "message": {"content": [
+                {"type": "tool_use", "name": "Bash", "input": {"command": "sleep 1"}}
+            ]}}),
+        )
+        .await;
+        assert!(s.steer("second").await);
+        // The CLI takes it up after the tool call, in the same turn.
+        let steered = cli.read().await;
+        assert_eq!(steered["message"]["content"], "second");
+        let mut echo = steered.clone();
+        echo["isReplay"] = Value::Bool(true);
+        cli.say(echo).await;
+        cli.send("r1").await;
+        cli.result("done").await;
+
+        let t = turn.await.unwrap().unwrap();
+        assert!(!t.spontaneous);
+        assert_eq!(t.sent_to, vec!["r1".to_string()]);
+        assert!(!s.busy());
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn a_message_steered_too_late_starts_a_turn_of_the_clis_own() {
+        let (s, mut cli, mut rx) = session();
+        let turn = tokio::spawn({
+            let s = Arc::clone(&s);
+            async move { s.turn("first", T).await }
+        });
+        cli.echo().await;
+        assert!(s.steer("second").await);
+        let steered = cli.read().await;
+        // The turn ends before the CLI got to it...
+        cli.result("done").await;
+        assert!(!turn.await.unwrap().unwrap().spontaneous);
+        // ...so it starts the next one itself.
+        let mut echo = steered.clone();
+        echo["isReplay"] = Value::Bool(true);
+        cli.say(echo).await;
+        cli.send("r1").await;
+        cli.result("second done").await;
+        let t = tokio::time::timeout(T, rx.recv()).await.unwrap().unwrap();
+        assert!(t.spontaneous);
+        assert!(t.answered("r1"));
+        // And our next turn still gets its own result.
+        let next = tokio::spawn({
+            let s = Arc::clone(&s);
+            async move { s.turn("third", T).await }
+        });
+        cli.echo().await;
+        cli.result("third done").await;
+        assert!(!next.await.unwrap().unwrap().spontaneous);
     }
 
     #[test]
