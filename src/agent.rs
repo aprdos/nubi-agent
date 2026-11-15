@@ -175,7 +175,7 @@ impl Default for AgentConfig {
             no_local_skills: false,
             live_sessions: false,
             live_max: 3,
-            live_idle_secs: 600,
+            live_idle_secs: 900,
             heartbeat_url: None,
             heartbeat_token: None,
         }
