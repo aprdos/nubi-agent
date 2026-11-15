@@ -234,6 +234,89 @@ impl Drop for InFlightEntry<'_> {
     }
 }
 
+/// A room's turn that is running in a live session: messages for the room
+/// that arrive meanwhile are handed to it (see [`Shared::steer`]) instead of
+/// waiting for a turn of their own.
+struct Steering {
+    thread: Option<ThreadAnchor>,
+    /// Messages handed to the turn so far.
+    joined: Vec<Trigger>,
+}
+
+/// Holds a room's [`Steering`] slot for its turn. Dropped without
+/// [`Self::answered`] (the turn failed, or returned early), the messages
+/// handed to it go back in the room's queue, ahead of anything newer.
+///
+/// Only a turn of the room's worker ([`Shared::serve_room`]) opens one: the
+/// room stays `active` until that worker finds its queue empty, and it
+/// looks again after every turn, so what goes back is picked up there.
+struct SteeringEntry<'a> {
+    shared: &'a Shared,
+    room_id: String,
+    answered: bool,
+}
+
+impl SteeringEntry<'_> {
+    /// Close the slot; the turn answered what it was handed.
+    fn answered(mut self) -> Vec<Trigger> {
+        self.answered = true;
+        self.take()
+    }
+
+    /// What was handed to the turn so far, leaving the slot open.
+    fn drain(&self) -> Vec<Trigger> {
+        self.shared
+            .steering
+            .lock()
+            .map(|mut s| {
+                s.get_mut(&self.room_id)
+                    .map(|s| std::mem::take(&mut s.joined))
+                    .unwrap_or_default()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Put back messages taken with [`Self::drain`], ahead of the rest.
+    fn give_back(&self, mut handed: Vec<Trigger>) {
+        if let Ok(mut s) = self.shared.steering.lock() {
+            if let Some(slot) = s.get_mut(&self.room_id) {
+                handed.append(&mut slot.joined);
+                slot.joined = handed;
+            }
+        }
+    }
+
+    fn take(&self) -> Vec<Trigger> {
+        self.shared
+            .steering
+            .lock()
+            .map(|mut s| s.remove(&self.room_id).map(|s| s.joined))
+            .ok()
+            .flatten()
+            .unwrap_or_default()
+    }
+}
+
+impl Drop for SteeringEntry<'_> {
+    fn drop(&mut self) {
+        let joined = self.take();
+        if self.answered || joined.is_empty() {
+            return;
+        }
+        // Never panic in drop.
+        if let Ok(mut dispatch) = self.shared.dispatch.lock() {
+            debug_assert!(
+                dispatch.active.contains(&self.room_id),
+                "a turn outside its room's worker: nothing would pick these up"
+            );
+            let pending = dispatch.pending.entry(self.room_id.clone()).or_default();
+            let newer = std::mem::take(pending);
+            *pending = joined;
+            pending.extend(newer);
+        }
+    }
+}
+
 /// Append one line to a room's journal.
 fn append_journal(path: &Path, line: &str) {
     use std::io::Write;
@@ -325,6 +408,11 @@ enum TurnEnd {
     Refused,
 }
 
+/// Put before a message handed to a running turn.
+const STEER_NOTE: &str = "[A new message arrived while you were working. Read it before your \
+     next step: it may change or stop what you are doing. Answer it with nubi_send like any \
+     other message, then carry on with whatever still stands.]";
+
 /// How long a room waits before trying a refused turn again.
 #[cfg(not(test))]
 const REFUSED_RETRY: Duration = Duration::from_secs(30);
@@ -407,6 +495,8 @@ struct Shared {
     in_flight: Mutex<HashMap<String, InFlight>>,
     /// Live sessions by room (see [`crate::live`]).
     live: Mutex<HashMap<String, Arc<LiveSession>>>,
+    /// Turns running now that new messages can join, by room.
+    steering: Mutex<HashMap<String, Steering>>,
     /// Turns live sessions started on their own, with their room.
     live_tx: mpsc::UnboundedSender<(String, LiveTurn)>,
     live_rx: Mutex<Option<mpsc::UnboundedReceiver<(String, LiveTurn)>>>,
@@ -524,6 +614,7 @@ impl Agent {
             families: Mutex::new(HashMap::new()),
             in_flight: Mutex::new(HashMap::new()),
             live: Mutex::new(HashMap::new()),
+            steering: Mutex::new(HashMap::new()),
             live_tx,
             live_rx: Mutex::new(Some(live_rx)),
         };
@@ -1204,17 +1295,17 @@ impl Shared {
             .entry(room_id.clone())
             .or_default()
             .insert(entry.global_index);
-        self.enqueue(
-            &room_id,
-            Trigger {
-                sender: entry.sender.clone(),
-                text: entry.text(),
-                index: entry.global_index,
-                cc: entry.cc_list(),
-                timestamp_ms: entry.timestamp_ms,
-                attachments,
-            },
-        );
+        let trigger = Trigger {
+            sender: entry.sender.clone(),
+            text: entry.text(),
+            index: entry.global_index,
+            cc: entry.cc_list(),
+            timestamp_ms: entry.timestamp_ms,
+            attachments,
+        };
+        if !self.steer(&room_id, &trigger).await {
+            self.enqueue(&room_id, trigger);
+        }
 
         Ok(())
     }
@@ -1761,6 +1852,69 @@ impl Shared {
     }
 
     /// Make this one of the room's pending messages, starting a worker if none runs.
+    /// Hand a message to the room's turn when one is running in a live
+    /// session, so the agent reads it at its next step instead of after the
+    /// whole turn: a correction or a "stop" lands while it can still act on
+    /// it. False when there is no such turn; the message is then queued.
+    async fn steer(&self, room_id: &str, trigger: &Trigger) -> bool {
+        let thread = match self.steering.lock().unwrap().get(room_id) {
+            Some(s) => s.thread.clone(),
+            None => return false,
+        };
+        let Some(live) = self.live.lock().unwrap().get(room_id).cloned() else {
+            return false;
+        };
+        let turn = TurnInput {
+            room_id: room_id.to_string(),
+            triggers: vec![trigger.clone()],
+            context: Vec::new(),
+            thread,
+            parent_context: Vec::new(),
+            journal: Vec::new(),
+            elsewhere: Vec::new(),
+            resumed: true,
+        };
+        let text = format!("{STEER_NOTE}\n\n{}", self.runtime.build_prompt(&turn));
+        // The message becomes the turn's in one step with taking its place
+        // in the session: from here the turn can't end without it being
+        // taken up, and a turn that fails puts it back in the queue.
+        {
+            let mut steering = self.steering.lock().unwrap();
+            let Some(slot) = steering.get_mut(room_id) else {
+                return false;
+            };
+            if !live.reserve_steer() {
+                return false;
+            }
+            slot.joined.push(trigger.clone());
+        }
+        if live.write_steered(&text).await {
+            eprintln!(
+                "[nubi-agent] #{} in {} handed to the running turn",
+                trigger.index, room_id
+            );
+        }
+        // A failed write stopped the session: the turn fails and queues the
+        // message again, with whatever else it was handed.
+        true
+    }
+
+    /// Open the room's [`Steering`] slot for the turn about to run.
+    fn start_steering(&self, room_id: &str, thread: Option<ThreadAnchor>) -> SteeringEntry<'_> {
+        self.steering.lock().unwrap().insert(
+            room_id.to_string(),
+            Steering {
+                thread,
+                joined: Vec::new(),
+            },
+        );
+        SteeringEntry {
+            shared: self,
+            room_id: room_id.to_string(),
+            answered: false,
+        }
+    }
+
     fn enqueue(self: &Arc<Self>, room_id: &str, trigger: Trigger) {
         let mut dispatch = self.dispatch.lock().unwrap();
         dispatch
@@ -1883,7 +2037,14 @@ impl Shared {
         self.prime_buffer(room_id).await;
         let thread = self.thread_anchor(room_id).await;
         let journal = self.journal_tail(room_id);
-        let indexes: Vec<u64> = triggers.iter().map(|t| t.index).collect();
+        let mut indexes: Vec<u64> = triggers.iter().map(|t| t.index).collect();
+        // Only a live session takes messages mid-turn; without one, nothing
+        // finds the slot to steer into.
+        let steering = self.start_steering(room_id, thread.clone());
+        // The messages each run answers: a run after one that failed (or
+        // said nothing) also gets what was handed to the one before, which
+        // may never have reached the model.
+        let mut all = triggers.to_vec();
 
         let started = Instant::now();
         let mut session = self.session_for(room_id);
@@ -1891,6 +2052,11 @@ impl Shared {
         let mut nudged = false;
         let outcome: Result<RunOutput, String> = loop {
             runs += 1;
+            if runs > 1 {
+                let handed = steering.drain();
+                indexes.extend(handed.iter().map(|t| t.index));
+                all.extend(handed);
+            }
             let resumed = session.as_ref().is_some_and(|s| s.resume);
             let mut context = self
                 .buffer
@@ -1907,7 +2073,7 @@ impl Shared {
             };
             let turn = TurnInput {
                 room_id: room_id.to_string(),
-                triggers: triggers.to_vec(),
+                triggers: all.clone(),
                 context,
                 thread: thread.clone(),
                 parent_context,
@@ -1999,6 +2165,9 @@ impl Shared {
         let out = match outcome {
             Ok(out) => out,
             Err(cause) => {
+                // Only what the room asked for at the start is apologised
+                // for; what was handed in meanwhile gets a turn of its own.
+                steering.give_back(all.split_off(triggers.len()));
                 let apology = format!(
                     "Couldn't finish that one ({}). Try again or ping me.",
                     short(&cause, 160)
@@ -2040,10 +2209,20 @@ impl Shared {
             }
         };
 
+        // Messages handed to the turn while it ran were answered with it.
+        let mut joined = all.split_off(triggers.len());
+        joined.extend(steering.answered());
+        let _joined_answered = Answering {
+            offsets: Arc::clone(&self.offsets),
+            room_id: room_id.to_string(),
+            indexes: joined.iter().map(|t| t.index).collect(),
+        };
+        let last_index = joined.iter().map(|t| t.index).fold(newest.index, u64::max);
+
         // Remember the conversation for the room's next message.
         if let Some(s) = &session {
             let id = out.session_id.clone().unwrap_or_else(|| s.id.clone());
-            self.record_session(room_id, id, newest.index);
+            self.record_session(room_id, id, last_index);
         }
 
         let (post, text, mentions, cc) = match out.reply.clone() {
@@ -2104,6 +2283,10 @@ impl Shared {
         if outcome == Outcome::Tools {
             self.buffer.lock().unwrap().mark_responded(room_id);
         }
+        let summary = match joined.len() {
+            0 => summary,
+            n => format!("{summary} (+{n} arrived mid-turn)"),
+        };
         self.journal_append(
             room_id,
             &format!(
@@ -3389,6 +3572,207 @@ done
         assert!(engine.state().posts.is_empty(), "nubi-agent posts nothing");
         assert_eq!(agent.shared.live.lock().unwrap().len(), 1);
         assert_eq!(agent.shared.sessions.lock().unwrap()["general"].id, "s1");
+    }
+
+    /// A stand-in CLI whose first turn is a long job: it starts a tool call
+    /// and, before going on, takes up the next message written to it, as the
+    /// real CLI does between steps. Every later message is a turn as usual.
+    fn fake_steered_cli(dir: &Path) -> LiveCommand {
+        let script = dir.join("fake-claude-steered.sh");
+        fs::write(
+            &script,
+            r#"send='{"type":"assistant","message":{"content":[{"type":"tool_use","name":"mcp__nubi__nubi_send","input":{"room_id":"general","text":"hi"}}]}}'
+result='{"type":"result","subtype":"success","result":"ok","session_id":"s1"}'
+IFS= read -r line
+printf '%s\n' "$line" >> "$LOG"
+printf '%s\n' "$line" | sed 's/^{/{"isReplay":true,/'
+printf '{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Bash","input":{"command":"make"}}]}}\n'
+IFS= read -r line
+printf '%s\n' "$line" >> "$LOG"
+printf '%s\n' "$line" | sed 's/^{/{"isReplay":true,/'
+printf '%s\n' "$send"
+printf '%s\n' "$result"
+while IFS= read -r line; do
+  printf '%s\n' "$line" >> "$LOG"
+  printf '%s\n' "$line" | sed 's/^{/{"isReplay":true,/'
+  printf '%s\n' "$send"
+  printf '%s\n' "$result"
+done
+"#,
+        )
+        .unwrap();
+        LiveCommand {
+            args: vec![script.to_string_lossy().into_owned()],
+            ..fake_live_cli(dir)
+        }
+    }
+
+    #[tokio::test]
+    async fn a_message_during_a_live_turn_is_handed_to_it() {
+        let engine = MockEngine::start(MockState::default()).await;
+        let (agent, fake) = agent(&engine, AgentConfig::default()).await;
+        fake.sessions_supported.store(true, Ordering::SeqCst);
+        let dir = temp_workspace();
+        *fake.live_cmd.write().unwrap() = Some(fake_steered_cli(&dir));
+        let shared = &agent.shared;
+
+        shared
+            .ingest(&sse("general", 1, "@support-bot run the build"))
+            .await
+            .unwrap();
+        // The turn is under way (its message taken up, a tool call running).
+        wait_until(|| {
+            shared.steering.lock().unwrap().contains_key("general")
+                && shared
+                    .live
+                    .lock()
+                    .unwrap()
+                    .get("general")
+                    .is_some_and(|s| s.busy())
+                && live_inputs(&dir).len() == 1
+        })
+        .await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        shared
+            .ingest(&sse("general", 2, "@support-bot wait, stop that"))
+            .await
+            .unwrap();
+        wait_until(|| shared.offsets.lock().unwrap().unanswered.is_empty()).await;
+        wait_until(|| !shared.dispatch.lock().unwrap().active.contains("general")).await;
+
+        // Written into the running turn, not queued for one of its own.
+        let inputs = live_inputs(&dir);
+        assert_eq!(inputs.len(), 2, "{inputs:?}");
+        assert!(
+            inputs[1].contains("arrived while you were working"),
+            "{}",
+            inputs[1]
+        );
+        assert!(inputs[1].contains("wait, stop that"), "{}", inputs[1]);
+        assert!(!inputs[1].contains("run the build"), "{}", inputs[1]);
+        // The session carries on from after both.
+        assert_eq!(shared.sessions.lock().unwrap()["general"].last_index, 2);
+        assert!(shared.steering.lock().unwrap().is_empty());
+        let journal = shared.journal_tail("general").join("\n");
+        assert!(journal.contains("+1 arrived mid-turn"), "{journal}");
+    }
+
+    #[tokio::test]
+    async fn a_run_after_one_that_failed_answers_what_was_handed_to_it() {
+        let engine = MockEngine::start(MockState::default()).await;
+        let (agent, fake) = agent(&engine, AgentConfig::default()).await;
+        let dir = temp_workspace();
+        // The first session dies right after taking up the handed message;
+        // the one started for the second run answers whatever it is given.
+        let script = dir.join("fake-claude-dies.sh");
+        fs::write(
+            &script,
+            r#"if [ ! -e "$LOG.died" ]; then
+  IFS= read -r line; printf '%s\n' "$line" >> "$LOG"
+  printf '%s\n' "$line" | sed 's/^{/{"isReplay":true,/'
+  printf '{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Bash","input":{"command":"make"}}]}}\n'
+  IFS= read -r line; printf '%s\n' "$line" >> "$LOG"
+  touch "$LOG.died"; exit 1
+fi
+while IFS= read -r line; do
+  printf '%s\n' "$line" >> "$LOG"
+  printf '%s\n' "$line" | sed 's/^{/{"isReplay":true,/'
+  printf '{"type":"assistant","message":{"content":[{"type":"tool_use","name":"mcp__nubi__nubi_send","input":{"room_id":"general","text":"hi"}}]}}\n'
+  printf '{"type":"result","subtype":"success","result":"ok","session_id":"s1"}\n'
+done
+"#,
+        )
+        .unwrap();
+        *fake.live_cmd.write().unwrap() = Some(LiveCommand {
+            args: vec![script.to_string_lossy().into_owned()],
+            ..fake_live_cli(&dir)
+        });
+        let shared = &agent.shared;
+
+        shared
+            .ingest(&sse("general", 1, "@support-bot run the build"))
+            .await
+            .unwrap();
+        wait_until(|| {
+            shared
+                .live
+                .lock()
+                .unwrap()
+                .get("general")
+                .is_some_and(|s| s.busy())
+                && live_inputs(&dir).len() == 1
+        })
+        .await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        shared
+            .ingest(&sse("general", 2, "@support-bot wait, stop that"))
+            .await
+            .unwrap();
+        wait_until(|| live_inputs(&dir).len() == 3).await;
+        wait_until(|| shared.offsets.lock().unwrap().unanswered.is_empty()).await;
+
+        // The second run is asked both, as messages to answer.
+        let retry = &live_inputs(&dir)[2];
+        assert!(
+            retry.contains("new #1 aprido: @support-bot run the build"),
+            "{retry}"
+        );
+        assert!(
+            retry.contains("new #2 aprido: @support-bot wait, stop that"),
+            "{retry}"
+        );
+        wait_until(|| !shared.dispatch.lock().unwrap().active.contains("general")).await;
+        assert_eq!(live_inputs(&dir).len(), 3, "no turn of its own after that");
+        assert!(engine.state().posts.is_empty(), "no apology");
+    }
+
+    #[tokio::test]
+    async fn without_a_running_live_turn_a_message_waits_its_turn() {
+        let engine = MockEngine::start(MockState::default()).await;
+        let (agent, fake) = agent(&engine, AgentConfig::default()).await;
+        let dir = temp_workspace();
+        *fake.live_cmd.write().unwrap() = Some(fake_live_cli(&dir));
+        let t = trigger_at(1, "aprido", "hi");
+        // Nothing is running in the room, so there is nothing to hand it to.
+        assert!(!agent.shared.steer("general", &t).await);
+        // A turn is open, but no live session is up for it (per-turn mode).
+        let _slot = agent.shared.start_steering("general", None);
+        assert!(!agent.shared.steer("general", &t).await);
+        assert!(live_inputs(&dir).is_empty());
+    }
+
+    #[tokio::test]
+    async fn messages_handed_to_a_turn_that_failed_go_back_in_the_queue() {
+        let engine = MockEngine::start(MockState::default()).await;
+        let (agent, _fake) = agent(&engine, AgentConfig::default()).await;
+        let shared = &agent.shared;
+        {
+            // As in the room's worker, which keeps it active while it runs.
+            let mut dispatch = shared.dispatch.lock().unwrap();
+            dispatch.active.insert("general".into());
+            dispatch
+                .pending
+                .insert("general".into(), vec![trigger_at(3, "aprido", "newer")]);
+        }
+        {
+            let _slot = shared.start_steering("general", None);
+            shared
+                .steering
+                .lock()
+                .unwrap()
+                .get_mut("general")
+                .unwrap()
+                .joined
+                .push(trigger_at(2, "aprido", "joined"));
+            // Dropped without answered(): the turn did not finish.
+        }
+        let pending: Vec<u64> = shared.dispatch.lock().unwrap().pending["general"]
+            .iter()
+            .map(|t| t.index)
+            .collect();
+        assert_eq!(pending, vec![2, 3]);
+        assert!(shared.steering.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
