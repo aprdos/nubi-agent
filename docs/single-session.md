@@ -103,6 +103,13 @@ removes the leak problem, keeps more than one process only where privacy
 needs it. Needs the room's member list (the engine has it; the agent would
 fetch and cache it).
 
+Fail closed: a room whose member set the agent cannot verify (lookup
+failed, cache stale, room unknown) gets a session of its own, keyed by its
+room id as today. Never a shared one by default. A room whose members
+change (someone joins a channel, a DM becomes a group) leaves the shared
+session: its next turn starts in a new session for its new audience,
+because the old context holds what the new member must not read.
+
 ### C. Orchestrator with subagents
 
 B plus explicit delegation: the one session stays light — it reads,
