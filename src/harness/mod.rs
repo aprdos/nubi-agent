@@ -526,7 +526,10 @@ impl CliRuntime {
              something. cc is the Cc: names there see the message but are not asked to act. \
              A message that mentions nobody wakes nobody; it just sits in the history. \
              Writing @name in your text counts as a mention too, so refer to people without \
-             the @ unless you need them to act. In a DM everything is addressed to the other \
+             the @ unless you need them to act. A mention need not be in the text: the app \
+             adds one when a person replies without naming anyone (it goes to the agent who \
+             spoke last), so the → @name after a message's sender is who it mentions, and \
+             counts the same as @name in its text. In a DM everything is addressed to the other \
              side. When agents have answered each other many times in a row with no person \
              in between, mentions from agents stop waking anyone until a person speaks.\n\n",
         );
@@ -1193,7 +1196,7 @@ impl AgentRuntime for CliRuntime {
             let t = &turn.triggers[0];
             prompt.push_str(&format!(
                 "[New message — {}]\n{}\n\n[Your response]",
-                message_header(t.index, t.timestamp_ms, &t.sender, &[], &t.cc, now),
+                message_header(t.index, t.timestamp_ms, &t.sender, &t.mentions, &t.cc, now),
                 with_attachments(&untrusted(&t.text), &t.attachments)
             ));
         } else {
@@ -1201,7 +1204,7 @@ impl AgentRuntime for CliRuntime {
             for t in &turn.triggers {
                 prompt.push_str(&format!(
                     "[{}] {}\n",
-                    message_header(t.index, t.timestamp_ms, &t.sender, &[], &t.cc, now),
+                    message_header(t.index, t.timestamp_ms, &t.sender, &t.mentions, &t.cc, now),
                     with_attachments(&untrusted(&t.text), &t.attachments)
                 ));
             }
@@ -1542,6 +1545,7 @@ mod tests {
             sender: sender.into(),
             text: text.into(),
             index,
+            mentions: vec![],
             cc: Vec::new(),
             timestamp_ms: now_ms(),
             attachments: vec![],
@@ -1555,6 +1559,35 @@ mod tests {
             context,
             ..Default::default()
         }
+    }
+
+    /// A mention the app added (none typed in the text) still shows: the
+    /// model reads `→ @name` as being asked, as it does for `@name`.
+    #[test]
+    fn a_trigger_shows_who_it_mentions() {
+        let rt = CliRuntime::new(HarnessKind::Claude, "bot");
+        let mut asked = trigger(7, "alice", "also fix the other one");
+        asked.mentions = vec!["apple".into()];
+        let prompt = rt.build_prompt(&turn("general", vec![asked.clone()], vec![]));
+        assert!(
+            prompt.contains("[New message — #7 now alice → @apple]\nalso fix the other one"),
+            "{prompt}"
+        );
+        let mut second = trigger(8, "alice", "and stop after that");
+        second.mentions = vec!["apple".into(), "banana".into()];
+        let prompt = rt.build_prompt(&turn("general", vec![asked, second], vec![]));
+        assert!(
+            prompt.contains("[#7 now alice → @apple] also fix"),
+            "{prompt}"
+        );
+        assert!(
+            prompt.contains("[#8 now alice → @apple @banana] and stop"),
+            "{prompt}"
+        );
+        // And the instructions say what the arrow means.
+        assert!(rt
+            .default_instructions()
+            .contains("the → @name after a message's sender"));
     }
 
     #[test]

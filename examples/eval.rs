@@ -96,6 +96,7 @@ async fn main() -> anyhow::Result<()> {
                 sender: case.trigger.sender.clone(),
                 text: case.trigger.text.clone(),
                 index: case.context.len() as u64 + 1,
+                mentions: vec![],
                 cc: Vec::new(),
                 timestamp_ms: now,
                 attachments: vec![],

@@ -65,6 +65,7 @@ async fn main() -> anyhow::Result<()> {
             sender: "alice".into(),
             text: message,
             index: 1,
+            mentions: vec![],
             cc: Vec::new(),
             timestamp_ms: 0,
             attachments: vec![],

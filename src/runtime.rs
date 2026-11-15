@@ -14,6 +14,10 @@ pub struct Trigger {
     /// The message's global index in its room, so the model can thread on
     /// it or scroll back from it.
     pub index: u64,
+    /// Who it mentions (`mentions`), which is how it reached the agent.
+    /// Not always in the text: an app can add a mention the sender never
+    /// typed (a reply goes to the agent who spoke last).
+    pub mentions: Vec<String>,
     /// `metadata.cc`: copied, not asked to act.
     pub cc: Vec<String>,
     pub timestamp_ms: u64,
