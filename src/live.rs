@@ -329,16 +329,29 @@ impl LiveSession {
     /// Written just as the turn ends, the CLI may take it up as a turn of its
     /// own, which comes out of `spontaneous` like any other.
     pub async fn steer(&self, text: &str) -> bool {
-        {
-            let mut s = self.state.lock().unwrap();
-            let ours = s.current.as_ref().is_some_and(|c| c.owner.is_some())
-                || s.carried.is_some()
-                || s.waiting.iter().any(Option::is_some);
-            if s.ended || !ours {
-                return false;
-            }
-            s.waiting.push_back(None);
+        self.reserve_steer() && self.write_steered(text).await
+    }
+
+    /// The first half of [`Self::steer`]: take a place in the running turn,
+    /// or false when there is none. Once it is taken, that turn can't end
+    /// before the message is taken up (or the session ends), so a caller
+    /// can record the message as the turn's before writing it.
+    pub fn reserve_steer(&self) -> bool {
+        let mut s = self.state.lock().unwrap();
+        let ours = s.current.as_ref().is_some_and(|c| c.owner.is_some())
+            || s.carried.is_some()
+            || s.waiting.iter().any(Option::is_some);
+        if s.ended || !ours {
+            return false;
         }
+        s.waiting.push_back(None);
+        true
+    }
+
+    /// The second half of [`Self::steer`]: write the message whose place
+    /// [`Self::reserve_steer`] took. On failure the session is stopped, so
+    /// the turn it was meant for fails too.
+    pub async fn write_steered(&self, text: &str) -> bool {
         if self.write(text).await.is_err() {
             self.stop();
             return false;
