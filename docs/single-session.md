@@ -35,9 +35,11 @@ room?
 1. **Clean contexts.** A room's conversation is not diluted by others; a
    long debugging thread does not push a quick question in `#general`
    towards compaction.
-2. **No cross-room leaks by construction.** A DM's content is not in the
-   context that answers a public channel (except the journal lines
-   `elsewhere()` deliberately adds).
+2. **Less cross-room leakage, not none.** A DM's conversation is not in
+   the context that answers a public channel, but `elsewhere()` does add
+   its journal lines (what the agent did there, in a line each) to every
+   other room's prompt. That needs filtering whichever option we pick
+   (see Recommendation).
 3. **Isolation of failures.** A session that crashes, hangs or gets a bad
    resume affects one room; `drop_live` restarts just that one.
 4. **Simple attribution.** One room per session makes "did this turn
