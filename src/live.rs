@@ -115,6 +115,22 @@ fn parse_line(line: &str) -> Vec<Event> {
     }
 }
 
+/// What a session is up to, as far as its status goes. Watchers see each
+/// change (see [`LiveSession::watch`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Activity {
+    /// Background commands running.
+    pub background: usize,
+    /// Background commands that finished so far.
+    pub background_done: u64,
+    /// A turn the CLI started on its own is running.
+    pub spontaneous: bool,
+    pub ended: bool,
+}
+
+/// Called with (before, after) on every change, under the session's lock.
+type Watcher = Box<dyn FnMut(Activity, Activity) + Send>;
+
 #[derive(Default)]
 struct Current {
     owner: Option<oneshot::Sender<LiveTurn>>,
@@ -134,8 +150,12 @@ struct State {
     /// carries on into it, so whoever waits gets the end of both.
     carried: Option<Current>,
     background: HashSet<String>,
+    background_done: u64,
     last_activity: Option<Instant>,
     ended: bool,
+    watcher: Option<Watcher>,
+    /// What the watcher saw last.
+    seen: Activity,
 }
 
 impl State {
@@ -188,6 +208,7 @@ impl State {
             }
             Event::BackgroundEnded(id) => {
                 self.background.remove(&id);
+                self.background_done += 1;
             }
             Event::Result(result) => {
                 let cur = self.current.take().unwrap_or_default();
@@ -220,6 +241,31 @@ impl State {
         self.current = None;
         self.carried = None;
         self.background.clear();
+        self.notify();
+    }
+
+    fn activity(&self) -> Activity {
+        Activity {
+            background: self.background.len(),
+            background_done: self.background_done,
+            spontaneous: !self.ended
+                && self.waiting.is_empty()
+                && self.carried.is_none()
+                && self.current.as_ref().is_some_and(|c| c.owner.is_none()),
+            ended: self.ended,
+        }
+    }
+
+    /// Tell the watcher, if anything changed since it last heard.
+    fn notify(&mut self) {
+        let next = self.activity();
+        if next == self.seen {
+            return;
+        }
+        let prev = std::mem::replace(&mut self.seen, next);
+        if let Some(watch) = self.watcher.as_mut() {
+            watch(prev, next);
+        }
     }
 }
 
@@ -283,6 +329,7 @@ impl LiveSession {
                 for event in parse_line(&line) {
                     s.apply(event, &spontaneous);
                 }
+                s.notify();
             }
             reader_state.lock().unwrap().end();
         });
@@ -383,6 +430,16 @@ impl LiveSession {
                 || s.current.is_some()
                 || s.carried.is_some()
                 || !s.background.is_empty())
+    }
+
+    /// Call `watch(before, after)` whenever the session's [`Activity`]
+    /// changes, from now on. It runs under the session's lock, in order
+    /// with the turns the session sends: keep it short and never call back
+    /// into the session.
+    pub fn watch(&self, watch: impl FnMut(Activity, Activity) + Send + 'static) {
+        let mut s = self.state.lock().unwrap();
+        s.seen = s.activity();
+        s.watcher = Some(Box::new(watch));
     }
 
     /// Background commands still running.

@@ -37,6 +37,8 @@ pub struct MockState {
     pub posts: Vec<(String, Value)>,
     /// Every typing update: (room, typing), in order.
     pub typing: Vec<(String, bool)>,
+    /// Every status post: (agent, body), in order.
+    pub statuses: Vec<(String, Value)>,
     /// Statuses to answer the next posts with, in order, before accepting
     /// one. A 429 comes with `Retry-After: 0`.
     pub post_failures: Vec<u16>,
@@ -75,6 +77,7 @@ impl MockEngine {
             .route("/v1/spaces/{space}/skills/{room}/prompt", get(skill_prompt))
             .route("/v1/spaces/{space}/agents/{agent}/mandate", get(mandate))
             .route("/v1/spaces/{space}/agents/{agent}", get(agent_card))
+            .route("/v1/spaces/{space}/agents/{agent}/status", post(status))
             .route(
                 "/v1/spaces/{space}/rooms/{room}/messages",
                 post(post_message).get(history),
@@ -200,6 +203,15 @@ async fn typing(
     let on = body["typing"].as_bool().unwrap_or(false);
     s.lock().unwrap().typing.push((room, on));
     StatusCode::OK
+}
+
+async fn status(
+    State(s): Shared,
+    Path((_space, agent)): Path<(String, String)>,
+    Json(body): Json<Value>,
+) -> StatusCode {
+    s.lock().unwrap().statuses.push((agent, body));
+    StatusCode::NO_CONTENT
 }
 
 async fn upload_content(
