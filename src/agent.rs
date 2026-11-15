@@ -2382,10 +2382,11 @@ impl Shared {
                 return Err(e);
             }
         };
-        // Asked again only when the turn did nothing at all: an agent that
-        // sent to another room acted (a PR review request in its channel,
-        // say), and asking it again made it do the same thing twice. Nor
-        // when only `system` spoke: an event wants action, not a reply.
+        // A person who mentioned the agent gets a reply in their room, so a
+        // turn that sent them nothing is asked once more, even when it sent
+        // elsewhere. A turn only `system` started (a GitHub event) is not:
+        // it wants action, often in another room, and asking again made the
+        // agent post the same PR review request twice.
         if !turn.answered(room_id) && !turn.sent_to.is_empty() {
             eprintln!(
                 "[nubi-agent] {} answered elsewhere ({})",
@@ -2394,7 +2395,6 @@ impl Shared {
             );
         }
         if !turn.answered(room_id)
-            && turn.sent_to.is_empty()
             && expects_reply
             && !self.runtime.live_output(&turn.result).is_error
         {
@@ -3822,19 +3822,37 @@ done
     }
 
     #[tokio::test]
-    async fn a_live_turn_that_answered_in_another_room_is_not_asked_again() {
-        // An event in the GitHub room; the agent's answer is a review request
-        // in its PR channel. Asking again made it post that request twice.
+    async fn a_mention_answered_only_in_another_room_is_asked_once_more() {
+        // The person who asked must hear back in their own room.
         let engine = MockEngine::start(MockState::default()).await;
         let (agent, fake) = agent(&engine, AgentConfig::default()).await;
         let dir = temp_workspace();
         *fake.live_cmd.write().unwrap() = Some(fake_live_cli(&dir));
         agent
             .shared
-            .ingest(&sse(
+            .ingest(&sse("docs", 1, "@support-bot post it elsewhere"))
+            .await
+            .unwrap();
+        wait_until(|| live_inputs(&dir).len() == 2).await;
+        assert!(live_inputs(&dir)[1].contains("Nothing reached docs"));
+    }
+
+    #[tokio::test]
+    async fn a_system_event_answered_in_another_room_is_not_asked_again() {
+        // A GitHub event; the agent's answer is a review request in its PR
+        // channel. Asking again made it post that request twice.
+        let engine = MockEngine::start(MockState::default()).await;
+        let (agent, fake) = agent(&engine, AgentConfig::default()).await;
+        let dir = temp_workspace();
+        *fake.live_cmd.write().unwrap() = Some(fake_live_cli(&dir));
+        agent
+            .shared
+            .ingest(&sse_from(
                 "github",
                 1,
-                "@support-bot CI passed, post it elsewhere",
+                "system",
+                now_ms(),
+                "[GitHub] CI passed @support-bot, post it elsewhere",
             ))
             .await
             .unwrap();
