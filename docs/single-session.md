@@ -126,9 +126,14 @@ the right room.
 3. **Then:** C as a skill ("delegate heavy work to a subagent, answer from
    its summary") once B′ holds up.
 
-Go straight to B only if member-set checks turn out to be too costly; then
-put the "never repeat a private room's content elsewhere" rule in the
-system prompt and accept the risk explicitly.
+B on its own is not a fallback: a system-prompt rule ("don't repeat a
+private room's content") is not an isolation boundary, so private and
+public rooms must never share a context. If member-set checks turn out to
+be too costly, stay on A.
+
+The same applies to what A and B′ feed across rooms today: `elsewhere()`
+adds journal lines from every room, a DM's included. Filtering those to
+rooms of the same audience belongs in step 1, whatever comes after.
 
 ## How we'd know it works
 
