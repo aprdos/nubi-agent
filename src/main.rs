@@ -135,7 +135,7 @@ struct Args {
     #[arg(
         long,
         env = "NUBI_LIVE_IDLE_SECS",
-        default_value = "1800",
+        default_value = "900",
         help_heading = "Tuning"
     )]
     live_idle_secs: u64,
