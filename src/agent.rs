@@ -2105,8 +2105,11 @@ impl Shared {
                     None => "",
                 }
             );
+            // A turn only `system` started (GitHub events, notices) owes the
+            // room no reply: the agent acts on it, often in another room.
+            let expects_reply = all.iter().any(|t| t.sender != "system");
             let result = self
-                .run_with_typing(room_id, &prompt, session.as_ref())
+                .run_with_typing(room_id, &prompt, session.as_ref(), expects_reply)
                 .await;
 
             let last_error = match result {
@@ -2367,6 +2370,7 @@ impl Shared {
         room_id: &str,
         prompt: &str,
         cmd: LiveCommand,
+        expects_reply: bool,
     ) -> anyhow::Result<RunOutput> {
         let mandate_hash = cmd.mandate_hash.clone();
         let live = self.live_session(room_id, cmd)?;
@@ -2378,7 +2382,22 @@ impl Shared {
                 return Err(e);
             }
         };
-        if !turn.answered(room_id) && !self.runtime.live_output(&turn.result).is_error {
+        // Asked again only when the turn did nothing at all: an agent that
+        // sent to another room acted (a PR review request in its channel,
+        // say), and asking it again made it do the same thing twice. Nor
+        // when only `system` spoke: an event wants action, not a reply.
+        if !turn.answered(room_id) && !turn.sent_to.is_empty() {
+            eprintln!(
+                "[nubi-agent] {} answered elsewhere ({})",
+                room_id,
+                turn.sent_to.join(", ")
+            );
+        }
+        if !turn.answered(room_id)
+            && turn.sent_to.is_empty()
+            && expects_reply
+            && !self.runtime.live_output(&turn.result).is_error
+        {
             eprintln!(
                 "[nubi-agent] Nothing sent to {} yet, asking once more",
                 room_id
@@ -2579,6 +2598,7 @@ impl Shared {
         room_id: &str,
         prompt: &str,
         session: Option<&Session>,
+        expects_reply: bool,
     ) -> anyhow::Result<RunOutput> {
         let done = Arc::new(AtomicBool::new(false));
         let done_clone = done.clone();
@@ -2613,7 +2633,7 @@ impl Shared {
 
         // Run the harness CLI, or hand the message to the room's live session
         let result = match self.runtime.live_command(session) {
-            Some(cmd) => self.live_run(room_id, prompt, cmd).await,
+            Some(cmd) => self.live_run(room_id, prompt, cmd, expects_reply).await,
             None => self.runtime.run(prompt, session).await,
         };
 
@@ -3502,6 +3522,7 @@ mod tests {
   printf '%s\n' "$line" | sed 's/^{/{"isReplay":true,/'
   case "$line" in
     *silent*) ;;
+    *elsewhere*) printf '{"type":"assistant","message":{"content":[{"type":"tool_use","name":"mcp__nubi__nubi_send","input":{"room_id":"pr-review","text":"please review"}}]}}\n' ;;
     *) printf '{"type":"assistant","message":{"content":[{"type":"tool_use","name":"mcp__nubi__nubi_send","input":{"room_id":"general","text":"hi"}}]}}\n' ;;
   esac
   printf '{"type":"result","subtype":"success","result":"ok","session_id":"s1"}\n'
@@ -3798,6 +3819,62 @@ done
             inputs[1]
         );
         assert!(engine.state().posts.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_live_turn_that_answered_in_another_room_is_not_asked_again() {
+        // An event in the GitHub room; the agent's answer is a review request
+        // in its PR channel. Asking again made it post that request twice.
+        let engine = MockEngine::start(MockState::default()).await;
+        let (agent, fake) = agent(&engine, AgentConfig::default()).await;
+        let dir = temp_workspace();
+        *fake.live_cmd.write().unwrap() = Some(fake_live_cli(&dir));
+        agent
+            .shared
+            .ingest(&sse(
+                "github",
+                1,
+                "@support-bot CI passed, post it elsewhere",
+            ))
+            .await
+            .unwrap();
+        wait_until(|| live_inputs(&dir).len() == 1).await;
+        wait_until(|| agent.shared.offsets.lock().unwrap().unanswered.is_empty()).await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(
+            live_inputs(&dir).len(),
+            1,
+            "no nudge: {:?}",
+            live_inputs(&dir)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_live_turn_only_system_started_is_not_asked_again() {
+        let engine = MockEngine::start(MockState::default()).await;
+        let (agent, fake) = agent(&engine, AgentConfig::default()).await;
+        let dir = temp_workspace();
+        *fake.live_cmd.write().unwrap() = Some(fake_live_cli(&dir));
+        agent
+            .shared
+            .ingest(&sse_from(
+                "github",
+                1,
+                "system",
+                now_ms(),
+                "[GitHub] CI passed @support-bot, stay silent",
+            ))
+            .await
+            .unwrap();
+        wait_until(|| live_inputs(&dir).len() == 1).await;
+        wait_until(|| agent.shared.offsets.lock().unwrap().unanswered.is_empty()).await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(
+            live_inputs(&dir).len(),
+            1,
+            "no nudge: {:?}",
+            live_inputs(&dir)
+        );
     }
 
     #[tokio::test]
