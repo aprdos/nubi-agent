@@ -246,6 +246,10 @@ struct Steering {
 /// Holds a room's [`Steering`] slot for its turn. Dropped without
 /// [`Self::answered`] (the turn failed, or returned early), the messages
 /// handed to it go back in the room's queue, ahead of anything newer.
+///
+/// Only a turn of the room's worker ([`Shared::serve_room`]) opens one: the
+/// room stays `active` until that worker finds its queue empty, and it
+/// looks again after every turn, so what goes back is picked up there.
 struct SteeringEntry<'a> {
     shared: &'a Shared,
     room_id: String,
@@ -301,6 +305,10 @@ impl Drop for SteeringEntry<'_> {
         }
         // Never panic in drop.
         if let Ok(mut dispatch) = self.shared.dispatch.lock() {
+            debug_assert!(
+                dispatch.active.contains(&self.room_id),
+                "a turn outside its room's worker: nothing would pick these up"
+            );
             let pending = dispatch.pending.entry(self.room_id.clone()).or_default();
             let newer = std::mem::take(pending);
             *pending = joined;
@@ -3739,12 +3747,14 @@ done
         let engine = MockEngine::start(MockState::default()).await;
         let (agent, _fake) = agent(&engine, AgentConfig::default()).await;
         let shared = &agent.shared;
-        shared
-            .dispatch
-            .lock()
-            .unwrap()
-            .pending
-            .insert("general".into(), vec![trigger_at(3, "aprido", "newer")]);
+        {
+            // As in the room's worker, which keeps it active while it runs.
+            let mut dispatch = shared.dispatch.lock().unwrap();
+            dispatch.active.insert("general".into());
+            dispatch
+                .pending
+                .insert("general".into(), vec![trigger_at(3, "aprido", "newer")]);
+        }
         {
             let _slot = shared.start_steering("general", None);
             shared
