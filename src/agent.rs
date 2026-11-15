@@ -11,7 +11,7 @@ use tokio::sync::mpsc;
 use tokio::sync::{OwnedRwLockReadGuard, OwnedRwLockWriteGuard, RwLock as TurnLock, Semaphore};
 use tokio::time::interval;
 
-use crate::live::{LiveCommand, LiveSession, LiveTurn};
+use crate::live::{Activity, LiveCommand, LiveSession, LiveTurn};
 
 use crate::buffer::{BufferedMessage, RoomBuffer};
 use crate::harness::{age, now_ms, one_line, write_private, CliRuntime, HarnessKind, McpServer};
@@ -21,6 +21,7 @@ use crate::runtime::{
     AgentRuntime, Attachment, RunOutput, Session, StructuredReply, ThreadAnchor, Trigger, TurnInput,
 };
 use crate::skills::{CompositeSkillLoader, RoomSkillLoader, Skill, SkillLoader};
+use crate::status::{State as StatusState, Status, StatusReporter};
 use crate::types::{file_kind_word, FileRef, LogEntry, MandateUpdate, SendMessage, SseData};
 
 /// How long a room's incoming burst is allowed to settle before we answer.
@@ -338,6 +339,55 @@ fn family_of(room_id: &str) -> String {
         .unwrap_or_else(|| room_id.to_string())
 }
 
+/// A DM or a thread of one: what is said there stays out of other rooms.
+fn is_dm(room_id: &str) -> bool {
+    family_of(room_id).starts_with("dm.")
+}
+
+/// What a turn is doing, for the agent's status: who it answers, or what
+/// woke it when only `system` did (GitHub events).
+fn turn_status(triggers: &[Trigger]) -> String {
+    let mut senders: Vec<&str> = Vec::new();
+    for t in triggers.iter().filter(|t| t.sender != "system") {
+        if !senders.contains(&t.sender.as_str()) {
+            senders.push(&t.sender);
+        }
+    }
+    if senders.is_empty() {
+        "handling a GitHub event".into()
+    } else {
+        format!("answering {}", senders.join(", "))
+    }
+}
+
+/// How long a session sat idle, for its status: `15m`, or `40s` under a
+/// minute.
+fn idle_label(quiet: Duration) -> String {
+    let secs = quiet.as_secs();
+    if secs >= 60 {
+        format!("{}m", secs / 60)
+    } else {
+        format!("{secs}s")
+    }
+}
+
+/// What a live turn's `sent_to` says about how it ended, for the status.
+fn sent_status(room_id: &str, sent_to: &[String], expects_reply: bool) -> String {
+    let mut others: Vec<&str> = Vec::new();
+    for r in sent_to.iter().filter(|r| *r != room_id) {
+        if !others.contains(&r.as_str()) {
+            others.push(r);
+        }
+    }
+    match (sent_to.iter().any(|r| r == room_id), others.is_empty()) {
+        (true, true) => "replied".into(),
+        (true, false) => format!("replied, also sent to {}", others.join(", ")),
+        (false, false) => format!("sent to {}", others.join(", ")),
+        (false, true) if expects_reply => "left without an answer".into(),
+        (false, true) => "done, nothing to send".into(),
+    }
+}
+
 /// Which rooms have pending messages and which already have a worker running.
 #[derive(Default)]
 struct Dispatch {
@@ -500,6 +550,10 @@ struct Shared {
     /// Turns live sessions started on their own, with their room.
     live_tx: mpsc::UnboundedSender<(String, LiveTurn)>,
     live_rx: Mutex<Option<mpsc::UnboundedReceiver<(String, LiveTurn)>>>,
+    /// Where each room's last live turn sent messages, for its status.
+    live_sent: Mutex<HashMap<String, Vec<String>>>,
+    /// What the agent is doing, as people see it (see [`crate::status`]).
+    status: Arc<StatusReporter>,
 }
 
 /// The main agent that listens to nubi and responds via a harness CLI
@@ -591,6 +645,11 @@ impl Agent {
             .unwrap_or_default();
 
         let (live_tx, live_rx) = mpsc::unbounded_channel();
+        let status = Arc::new(StatusReporter::new());
+        // Without a runtime yet (`Agent::new`), `run` starts it.
+        if tokio::runtime::Handle::try_current().is_ok() {
+            status.start(nubi.clone());
+        }
         let shared = Shared {
             config,
             nubi,
@@ -617,6 +676,8 @@ impl Agent {
             steering: Mutex::new(HashMap::new()),
             live_tx,
             live_rx: Mutex::new(Some(live_rx)),
+            live_sent: Mutex::new(HashMap::new()),
+            status,
         };
         if let Err(e) = shared.apply_mandate() {
             eprintln!("[nubi-agent] Cannot inject skills: {}", e);
@@ -734,6 +795,7 @@ impl Agent {
             self.shared.config.agent_id
         );
 
+        self.shared.status.start(self.shared.nubi.clone());
         tokio::spawn(flush_offsets(Arc::clone(&self.shared)));
         if let Some(rx) = self.shared.live_rx.lock().unwrap().take() {
             tokio::spawn(Arc::clone(&self.shared).live_turns(rx));
@@ -1558,11 +1620,14 @@ impl Shared {
     fn elsewhere(&self, room_id: &str) -> Vec<String> {
         let now = now_ms();
         let family = family_of(room_id);
+        // What a DM (or a thread of one) said stays there: only the DM's own
+        // family sees it.
+        let visible = |room: &str| room != room_id && (!is_dm(room) || family_of(room) == family);
 
         let mut lines: Vec<String> = {
             let in_flight = self.in_flight.lock().unwrap();
             let mut running: Vec<(&String, &InFlight)> =
-                in_flight.iter().filter(|(r, _)| *r != room_id).collect();
+                in_flight.iter().filter(|(r, _)| visible(r)).collect();
             running.sort_by_key(|(_, f)| f.started_ms);
             running
                 .iter()
@@ -1579,7 +1644,7 @@ impl Shared {
         // (related, written at, room, entry)
         let mut recent: Vec<(bool, u64, String, String)> = Vec::new();
         for (room, path) in self.journaled_rooms(ELSEWHERE_RELATED_MS) {
-            if room == room_id {
+            if !visible(&room) {
                 continue;
             }
             let related = family_of(&room) == family;
@@ -2022,6 +2087,8 @@ impl Shared {
             return Ok(TurnEnd::Refused);
         }
         let _in_flight = self.start_in_flight(room_id, triggers);
+        self.live_sent.lock().unwrap().remove(room_id);
+        self.status.begin(room_id, &turn_status(triggers));
 
         eprintln!(
             "[nubi-agent] @{} in {}: {}{}",
@@ -2209,6 +2276,7 @@ impl Shared {
                     None,
                     session_kind,
                 );
+                self.status_end(room_id, &format!("failed: {}", short(&cause, 60)));
                 return Ok(TurnEnd::Answered);
             }
         };
@@ -2240,9 +2308,15 @@ impl Shared {
             Outcome::Posted
         };
 
+        let mut status = "replied".to_string();
         let summary = match outcome {
             Outcome::Tools => {
                 eprintln!("[nubi-agent] Answered via tools, nothing to post");
+                let expects_reply = all.iter().any(|t| t.sender != "system");
+                status = match self.live_sent.lock().unwrap().remove(room_id) {
+                    Some(sent) => sent_status(room_id, &sent, expects_reply),
+                    None => "answered via tools".into(),
+                };
                 "answered via tools".to_string()
             }
             _ => {
@@ -2272,12 +2346,16 @@ impl Shared {
                 match posted {
                     Ok(()) => format!("replied: {}", short(&text, 160)),
                     // Refused for good: sending it again would not help.
-                    Err(e) if e.downcast_ref::<Refused>().is_some() => return Err(e),
+                    Err(e) if e.downcast_ref::<Refused>().is_some() => {
+                        self.status_end(room_id, "failed: the reply was refused");
+                        return Err(e);
+                    }
                     Err(e) => {
                         eprintln!(
                             "[nubi-agent] Could not post to {} ({}); trying again later",
                             room_id, e
                         );
+                        status = "replied, delivery pending".into();
                         self.deliver_later(room_id, msg, answering);
                         format!("reply not posted yet: {}", short(&text, 160))
                     }
@@ -2310,8 +2388,29 @@ impl Shared {
             Some(&out),
             session_kind,
         );
+        self.status_end(room_id, &status);
 
         Ok(TurnEnd::Answered)
+    }
+
+    /// A turn in the room ended with `text`. Background work its live
+    /// session still runs keeps the agent working there.
+    fn status_end(&self, room_id: &str, text: &str) {
+        let background = self
+            .live
+            .lock()
+            .unwrap()
+            .get(room_id)
+            .map_or(0, |s| s.background());
+        if background > 0 {
+            self.status.end(
+                room_id,
+                StatusState::Working,
+                &format!("{text} · background work running"),
+            );
+        } else {
+            self.status.end(room_id, StatusState::Idle, text);
+        }
     }
 
     /// One structured line per turn, for grepping and for evals.
@@ -2425,6 +2524,10 @@ impl Shared {
                 eprintln!("[nubi-agent] {} left without an answer", room_id);
             }
         }
+        self.live_sent
+            .lock()
+            .unwrap()
+            .insert(room_id.to_string(), turn.sent_to.clone());
         let mut out = self.runtime.live_output(&turn.result);
         out.mandate_hash = mandate_hash;
         out.text.clear();
@@ -2443,12 +2546,15 @@ impl Shared {
         // Decide under the lock, start the process outside it: turns in
         // other rooms, the pruner and the heartbeat all take this lock.
         let mut stopping = Vec::new();
+        let mut made_room = Vec::new();
+        let mut restarted = false;
         {
             let mut live = self.live.lock().unwrap();
             if let Some(s) = live.get(room_id) {
                 if !s.ended() && (s.prompt_key == cmd.prompt_key || s.busy()) {
                     return Ok(Arc::clone(s));
                 }
+                restarted = !s.ended();
                 if let Some(old) = live.remove(room_id) {
                     eprintln!("[nubi-agent] Restarting the live session for {}", room_id);
                     stopping.push(old);
@@ -2468,11 +2574,19 @@ impl Shared {
                         room
                     );
                     stopping.push(s);
+                    made_room.push(room);
                 }
             }
         }
         for s in stopping {
             s.stop();
+        }
+        for room in made_room {
+            self.status.event(Status::new(
+                StatusState::Idle,
+                Some(&room),
+                "Claude session closed to make room",
+            ));
         }
 
         let (tx, mut rx) = mpsc::unbounded_channel();
@@ -2487,6 +2601,19 @@ impl Shared {
             }
         });
         eprintln!("[nubi-agent] Live session started for {}", room_id);
+        self.status.event(Status::new(
+            StatusState::Idle,
+            Some(room_id),
+            if restarted {
+                "Claude session restarted (prompt changed)"
+            } else {
+                "Claude session started"
+            },
+        ));
+        session.watch(live_status_watcher(
+            Arc::clone(&self.status),
+            room_id.to_string(),
+        ));
         // A room's turns run one at a time, so nothing started another
         // session for it meanwhile; if something did, keep the newer one.
         if let Some(other) = self
@@ -2526,6 +2653,11 @@ impl Shared {
             };
             eprintln!("[nubi-agent] {}: {}", room_id, summary);
             self.journal_append(&room_id, &summary);
+            if out.is_error {
+                self.status_end(&room_id, "on its own: failed");
+            } else {
+                self.status_end(&room_id, &summary);
+            }
             self.log_turn(
                 &room_id,
                 last,
@@ -2561,6 +2693,11 @@ impl Shared {
                         quiet.as_secs()
                     );
                     s.stop();
+                    self.status.event(Status::new(
+                        StatusState::Idle,
+                        Some(room),
+                        &format!("Claude session closed (idle {})", idle_label(quiet)),
+                    ));
                     return false;
                 }
                 true
@@ -2649,6 +2786,45 @@ impl Shared {
         }
 
         result
+    }
+}
+
+/// Status updates for what a room's live session does between our turns:
+/// background work starting and finishing, and the turns the CLI starts on
+/// its own when it does. Those turns end in [`Shared::live_turns`].
+fn live_status_watcher(
+    status: Arc<StatusReporter>,
+    room_id: String,
+) -> impl FnMut(Activity, Activity) + Send + 'static {
+    move |prev, next| {
+        let room = Some(room_id.as_str());
+        if next.ended {
+            // A turn of its own cut short never reaches `live_turns`.
+            if prev.spontaneous {
+                status.end(&room_id, StatusState::Idle, "Claude session closed");
+            }
+        } else if next.spontaneous && !prev.spontaneous {
+            status.begin(
+                &room_id,
+                if next.background_done > 0 {
+                    "on its own: background work finished"
+                } else {
+                    "working on its own"
+                },
+            );
+        } else if next.background > prev.background {
+            status.event(Status::new(
+                StatusState::Working,
+                room,
+                "background work running",
+            ));
+        } else if next.background == 0 && prev.background > 0 && !next.spontaneous {
+            status.event(Status::new(
+                StatusState::Idle,
+                room,
+                "background work finished",
+            ));
+        }
     }
 }
 
@@ -4176,10 +4352,10 @@ done
             )
             .await
             .unwrap();
-        // ...and one running right now in a DM.
+        // ...and one running right now in another room.
         let running = agent
             .shared
-            .start_in_flight("dm.manager.aprido", &[trigger_at(2, "aprido", "halo")]);
+            .start_in_flight("ops", &[trigger_at(2, "aprido", "halo")]);
 
         agent
             .shared
@@ -4193,9 +4369,7 @@ done
 
         let prompt = fake.prompts.lock().unwrap().last().unwrap().clone();
         assert!(
-            prompt.contains(
-                "elsewhere: running now in dm.manager.aprido, started now: #2 from aprido (halo)"
-            ),
+            prompt.contains("elsewhere: running now in ops, started now: #2 from aprido (halo)"),
             "{prompt}"
         );
         assert!(
@@ -4207,6 +4381,170 @@ done
         );
         assert!(agent.shared.in_flight.lock().unwrap().is_empty());
         assert!(agent.shared.elsewhere("dm.manager.aprido").len() == 2);
+    }
+
+    #[tokio::test]
+    async fn what_a_dm_says_stays_out_of_other_rooms() {
+        let engine = MockEngine::start(MockState::default()).await;
+        let (agent, _fake) = agent(&engine, AgentConfig::default()).await;
+        let rooms = agent.shared.workspace.as_ref().unwrap().join(".nubi/rooms");
+        for room in ["general", "dm.manager.aprido", "thread.dm.manager.aprido.7"] {
+            fs::write(
+                rooms.join(format!("{room}.log")),
+                format!(
+                    "{}\t#1 from aprido (secret in {room}): replied: ok\n",
+                    now_ms()
+                ),
+            )
+            .unwrap();
+        }
+        let _dm = agent
+            .shared
+            .start_in_flight("dm.boss.aprido", &[trigger_at(2, "aprido", "private")]);
+        let _thread = agent.shared.start_in_flight(
+            "thread.dm.boss.aprido.3",
+            &[trigger_at(4, "aprido", "private too")],
+        );
+        let _ops = agent
+            .shared
+            .start_in_flight("ops", &[trigger_at(5, "bob", "deploy")]);
+
+        // Another room sees neither DM, their threads nor what runs in them.
+        let lines = agent.shared.elsewhere("pr-review");
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert!(lines.iter().all(|l| !l.contains("dm.")), "{lines:?}");
+        assert!(lines.iter().any(|l| l.contains("running now in ops")));
+        assert!(lines.iter().any(|l| l.contains("in general:")));
+
+        // Nor does another DM.
+        let lines = agent.shared.elsewhere("dm.other.aprido");
+        assert!(lines.iter().all(|l| !l.contains("dm.")), "{lines:?}");
+
+        // A DM still sees other rooms, and its own threads.
+        let lines = agent.shared.elsewhere("dm.manager.aprido");
+        assert!(lines.iter().any(|l| l.contains("in general:")), "{lines:?}");
+        assert!(lines
+            .iter()
+            .any(|l| l.contains("in thread.dm.manager.aprido.7:")));
+        assert!(lines.iter().all(|l| !l.contains("dm.boss")), "{lines:?}");
+    }
+
+    /// Every status posted so far, as "state room text".
+    fn statuses(engine: &MockEngine) -> Vec<String> {
+        engine
+            .state()
+            .statuses
+            .iter()
+            .map(|(agent, body)| {
+                assert_eq!(agent, ME);
+                format!(
+                    "{} {} {}",
+                    body["state"].as_str().unwrap(),
+                    body["room_id"].as_str().unwrap_or("-"),
+                    body["text"].as_str().unwrap()
+                )
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_turn_posts_its_status_when_it_starts_and_ends() {
+        let engine = MockEngine::start(MockState::default()).await;
+        let (agent, fake) = agent(&engine, AgentConfig::default()).await;
+
+        agent.shared.reply("general", &[trigger()]).await.unwrap();
+        wait_until(|| statuses(&engine).len() == 2).await;
+        assert_eq!(
+            statuses(&engine),
+            ["working general answering alice", "idle general replied"]
+        );
+
+        // A GitHub event (only `system` asked) and a failed turn.
+        fake.fail_runs
+            .store(MAX_RUNS_PER_TURN as usize, Ordering::SeqCst);
+        agent
+            .shared
+            .reply(
+                "pr-review",
+                &[trigger_at(3, "system", "[GitHub] PR opened")],
+            )
+            .await
+            .unwrap();
+        wait_until(|| statuses(&engine).len() == 4).await;
+        let got = statuses(&engine);
+        assert_eq!(got[2], "working pr-review handling a GitHub event");
+        assert!(
+            got[3].starts_with("idle pr-review failed: claude failed"),
+            "{got:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_live_session_posts_its_lifecycle_and_its_idle_close() {
+        let engine = MockEngine::start(MockState::default()).await;
+        let (agent, fake) = agent(
+            &engine,
+            AgentConfig {
+                live_idle_secs: 1,
+                ..AgentConfig::default()
+            },
+        )
+        .await;
+        let dir = temp_workspace();
+        *fake.live_cmd.write().unwrap() = Some(fake_live_cli(&dir));
+        tokio::spawn(Arc::clone(&agent.shared).prune_live());
+
+        agent
+            .shared
+            .ingest(&sse("general", 1, "@support-bot hi"))
+            .await
+            .unwrap();
+        wait_until(|| {
+            statuses(&engine)
+                .last()
+                .is_some_and(|s| s.starts_with("idle general Claude session closed (idle "))
+        })
+        .await;
+        let got = statuses(&engine);
+        assert_eq!(
+            got[..4],
+            [
+                "working general answering aprido",
+                "idle general Claude session started",
+                "working general answering aprido",
+                "idle general replied",
+            ],
+            "{got:?}"
+        );
+        assert_eq!(got.len(), 5, "{got:?}");
+        assert!(agent.shared.live.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_turn_the_live_session_starts_itself_posts_its_status() {
+        let engine = MockEngine::start(MockState::default()).await;
+        let (agent, fake) = agent(&engine, AgentConfig::default()).await;
+        let dir = temp_workspace();
+        *fake.live_cmd.write().unwrap() = Some(fake_live_cli(&dir));
+        let rx = agent.shared.live_rx.lock().unwrap().take().unwrap();
+        tokio::spawn(Arc::clone(&agent.shared).live_turns(rx));
+
+        agent
+            .shared
+            .ingest(&sse("general", 1, "@support-bot start the bg check"))
+            .await
+            .unwrap();
+        wait_until(|| {
+            statuses(&engine)
+                .last()
+                .is_some_and(|s| s == "idle general on its own: sent to general")
+        })
+        .await;
+        let got = statuses(&engine);
+        assert!(
+            got.contains(&"working general on its own: background work finished".to_string()),
+            "{got:?}"
+        );
     }
 
     #[tokio::test]

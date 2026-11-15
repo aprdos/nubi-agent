@@ -8,6 +8,7 @@ mod mock_engine;
 pub mod nubi;
 pub mod runtime;
 pub mod skills;
+pub mod status;
 pub mod types;
 
 pub use agent::{Agent, AgentConfig};

@@ -633,6 +633,36 @@ impl NubiClient {
 
         Ok(())
     }
+
+    /// Tell the space what this agent is doing right now (`working` or
+    /// `idle`, optionally in a room). The engine forgets it 120 s after the
+    /// last post, so callers re-post it every minute.
+    pub async fn set_status(
+        &self,
+        state: &str,
+        room_id: Option<&str>,
+        text: &str,
+    ) -> anyhow::Result<()> {
+        let resp = self
+            .client
+            .post(format!(
+                "{}/v1/spaces/{}/agents/{}/status",
+                self.base_url, self.space, self.agent_id
+            ))
+            .header("Authorization", format!("Bearer {}", self.token))
+            .timeout(std::time::Duration::from_secs(10))
+            .json(&serde_json::json!({ "state": state, "room_id": room_id, "text": text }))
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            anyhow::bail!("Failed to set status: {} - {}", status, body);
+        }
+
+        Ok(())
+    }
 }
 
 #[cfg(test)]
