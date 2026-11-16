@@ -309,7 +309,7 @@ struct PromptResp {
 }
 
 /// Prefix of [`Skill::path`] for skills that came from a room.
-const ROOM_PATH_PREFIX: &str = "room://";
+pub(crate) const ROOM_PATH_PREFIX: &str = "room://";
 
 impl Skill {
     /// The skill room this came from, if it did not come from a file.

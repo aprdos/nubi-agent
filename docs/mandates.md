@@ -200,10 +200,18 @@ Owner/Admin attach, detach and reorder; `src/lib/sse-manager.tsx` consumes
 - **The hash is the contract.** Both sides implement the same canonical
   bytes independently and test them against fixed vectors. Keep it that way:
   any change to the canonical form has to land on both sides at once.
-- **Suggested skills are not hashed.** Strict mode therefore proves the
-  agent saw the *required* skills; a suggested skill can change without a
-  `mandate_update` being required for correctness (it is still announced
-  when attached sets change, via `force`).
+- **Suggested (on-demand) skills are not hashed.** Strict mode therefore
+  proves the agent saw the *required* (always-on) skills; a suggested skill
+  can change without a `mandate_update` being required for correctness (it
+  is still announced when attached sets change, via `force`).
+- **Required means always on; not required means on demand.** nubi-agent
+  inlines required skills in full under the mandate heading. Skills with
+  `required: false` are written to the workspace like ad-hoc skills
+  (`.claude/skills/nubi-<name>/SKILL.md` for Claude Code) and only listed
+  by name and `description` under "Skills you may load when relevant"; the
+  agent reads one when it decides it applies. A harness without a skills
+  directory still gets them inlined. When the engine sends no
+  `description`, the first non-heading line of the content stands in.
 - **The feature flag only gates creation.** Production and staging pass
   `NUBI_FEATURES_SKILL_SETS` from a repository variable defaulting to
   `false`; with it off nobody can create a set, but the resolve endpoint

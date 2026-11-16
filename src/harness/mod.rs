@@ -15,7 +15,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 
-use crate::mandate::{build_mandate_section, Mandate};
+use crate::mandate::{build_mandate_section, on_demand_skills, Mandate, OnDemand};
 use crate::runtime::{
     AgentRuntime, Attachment, RunOutput, Session, StructuredReply, TokenUsage, TurnInput,
 };
@@ -855,17 +855,13 @@ impl CliRuntime {
         self.harness.skills_dir(ws)
     }
 
-    /// Write the ad-hoc skills as `<skills dir>/nubi-<name>/SKILL.md` so the
-    /// CLI loads a skill's body only when it applies, and return the index
-    /// that goes into the system prompt. Directories from a previous set that
-    /// are no longer wanted are removed; the agent's own skills are not touched.
-    fn write_skill_files(&self, dir: &Path, skills: &[Skill]) -> anyhow::Result<String> {
+    /// Write skills as `<skills dir>/nubi-<name>/SKILL.md` so the CLI loads
+    /// a skill's body only when it applies. Directories from a previous set
+    /// that are no longer wanted are removed; the agent's own skills are not
+    /// touched.
+    fn write_skill_files(&self, dir: &Path, skills: &[Skill]) -> anyhow::Result<()> {
         std::fs::create_dir_all(dir)?;
         let mut wanted = std::collections::HashSet::new();
-        let mut index = String::from(
-            "\n\n## Skills\n\nThese are available to you as skills in your working directory; \
-             read one when its trigger applies.\n",
-        );
         for skill in skills.iter().filter(|s| s.meta.enabled) {
             let slug = format!("{SKILL_DIR_PREFIX}{}", slugify(&skill.meta.name));
             wanted.insert(slug.clone());
@@ -882,15 +878,6 @@ impl CliRuntime {
             file.push_str(&skill.content);
             file.push('\n');
             std::fs::write(skill_dir.join("SKILL.md"), file)?;
-
-            index.push_str(&format!("- {}", skill.meta.name));
-            if let Some(ref d) = skill.meta.description {
-                index.push_str(&format!(": {}", d.trim()));
-            }
-            if let Some(ref t) = skill.meta.trigger {
-                index.push_str(&format!(" (when: {})", t.trim()));
-            }
-            index.push('\n');
         }
         if let Ok(entries) = std::fs::read_dir(dir) {
             for entry in entries.flatten() {
@@ -900,11 +887,33 @@ impl CliRuntime {
                 }
             }
         }
-        Ok(if wanted.is_empty() {
-            String::new()
-        } else {
-            index
-        })
+        Ok(())
+    }
+}
+
+/// The index of the ad-hoc skills that live as files in the workspace, for
+/// the system prompt; empty when there are none.
+fn adhoc_skill_index(skills: &[Skill]) -> String {
+    let mut index = String::from(
+        "\n\n## Skills\n\nThese are available to you as skills in your working directory; \
+         read one when its trigger applies.\n",
+    );
+    let mut any = false;
+    for skill in skills.iter().filter(|s| s.meta.enabled) {
+        any = true;
+        index.push_str(&format!("- {}", skill.meta.name));
+        if let Some(ref d) = skill.meta.description {
+            index.push_str(&format!(": {}", d.trim()));
+        }
+        if let Some(ref t) = skill.meta.trigger {
+            index.push_str(&format!(" (when: {})", t.trim()));
+        }
+        index.push('\n');
+    }
+    if any {
+        index
+    } else {
+        String::new()
     }
 }
 
@@ -1466,22 +1475,39 @@ impl AgentRuntime for CliRuntime {
     fn inject_mandate(&self, mandate: Option<&Mandate>, adhoc: &[Skill]) -> anyhow::Result<()> {
         // Skills in files when the CLI loads them on demand from the
         // workspace; inline otherwise (a CLI without skill loading, no
-        // workspace, or a write failure).
-        let adhoc_section = match self.skills_dir() {
-            Some(dir) => match self.write_skill_files(&dir, adhoc) {
-                Ok(index) => index,
-                Err(e) => {
-                    eprintln!(
-                        "[nubi-agent] Cannot write skills to {:?} ({}); inlining them",
-                        dir, e
-                    );
-                    crate::skills::SkillLoader::build_prompt_section(adhoc)
+        // workspace, or a write failure). The mandate's on-demand skills
+        // take the same path, so a dropped one disappears with the others.
+        let on_demand = mandate.map(on_demand_skills).unwrap_or_default();
+        let as_files = match self.skills_dir() {
+            Some(dir) => {
+                let all: Vec<Skill> = on_demand.iter().chain(adhoc).cloned().collect();
+                match self.write_skill_files(&dir, &all) {
+                    Ok(()) => true,
+                    Err(e) => {
+                        eprintln!(
+                            "[nubi-agent] Cannot write skills to {:?} ({}); inlining them",
+                            dir, e
+                        );
+                        false
+                    }
                 }
-            },
-            None => crate::skills::SkillLoader::build_prompt_section(adhoc),
+            }
+            None => false,
+        };
+        let adhoc_section = if as_files {
+            adhoc_skill_index(adhoc)
+        } else {
+            crate::skills::SkillLoader::build_prompt_section(adhoc)
+        };
+        let on_demand_mode = if as_files {
+            OnDemand::Listed
+        } else {
+            OnDemand::Inline
         };
         let next = InjectedSkills {
-            mandate_section: mandate.map(build_mandate_section).unwrap_or_default(),
+            mandate_section: mandate
+                .map(|m| build_mandate_section(m, on_demand_mode))
+                .unwrap_or_default(),
             mandate: mandate.cloned(),
             adhoc_section,
         };
@@ -2556,6 +2582,86 @@ mod tests {
         rt.inject_mandate(None, &[]).unwrap();
         assert!(!rt.build_system_prompt().contains("## Skills"));
         assert!(!ws.join(".claude/skills/nubi-deploys").exists());
+        let _ = std::fs::remove_dir_all(ws);
+    }
+
+    #[test]
+    fn on_demand_mandate_skills_become_workspace_files_with_an_index() {
+        use crate::mandate::tests::{fixture, on_demand, resolve_body};
+        use crate::mandate::ON_DEMAND_HEADING;
+        let ws = std::env::temp_dir().join(format!("nubi-skills-{}", uuid::Uuid::new_v4()));
+        let rt = CliRuntime::new(HarnessKind::Claude, "bot").with_workspace(Some(ws.clone()));
+        let mut skills = fixture();
+        skills.push(on_demand(
+            "ideas-1",
+            "Ideas",
+            "Brainstorm product ideas",
+            "# Ideas\n\nStart with ten bad ones.\n",
+        ));
+        let m: Mandate = serde_json::from_value(resolve_body(&skills)).unwrap();
+
+        rt.inject_mandate(Some(&m), &[local("Code Review", "Look at every file.")])
+            .unwrap();
+        let sp = rt.build_system_prompt();
+        assert!(
+            sp.contains("Refund within 30 days."),
+            "always-on is inlined"
+        );
+        assert!(sp.contains(ON_DEMAND_HEADING));
+        assert!(sp.contains("- Ideas — Brainstorm product ideas\n"));
+        assert!(
+            !sp.contains("Start with ten bad ones."),
+            "on-demand body is not inlined"
+        );
+        // The on-demand index sits inside the mandate, ahead of the ad-hoc one.
+        assert!(sp.find(ON_DEMAND_HEADING).unwrap() < sp.find("## Skills").unwrap());
+        assert!(sp.contains("- Code Review: Code Review description"));
+        assert!(
+            !sp.contains("- Ideas: "),
+            "mandate skills are not in the ad-hoc index"
+        );
+        let file = std::fs::read_to_string(ws.join(".claude/skills/nubi-ideas/SKILL.md")).unwrap();
+        assert_eq!(
+            file,
+            "---\nname: \"Ideas\"\ndescription: \"Brainstorm product ideas\"\n---\n\n# Ideas\n\nStart with ten bad ones.\n\n"
+        );
+        assert!(ws.join(".claude/skills/nubi-code-review").exists());
+        assert!(
+            !ws.join(".claude/skills/nubi-refund-policy").exists(),
+            "always-on skills are never files"
+        );
+        // The hash still covers the always-on skills only.
+        assert_eq!(rt.mandate_hash(), Some(m.hash.clone()));
+        assert_eq!(m.hash, crate::mandate::mandate_hash(&fixture()));
+
+        // Dropping the on-demand skill from the mandate removes its file.
+        let m2: Mandate = serde_json::from_value(resolve_body(&fixture())).unwrap();
+        rt.inject_mandate(Some(&m2), &[]).unwrap();
+        assert!(!ws.join(".claude/skills/nubi-ideas").exists());
+        assert!(!ws.join(".claude/skills/nubi-code-review").exists());
+        assert!(!rt.build_system_prompt().contains(ON_DEMAND_HEADING));
+        let _ = std::fs::remove_dir_all(ws);
+    }
+
+    #[test]
+    fn harnesses_without_skill_loading_get_on_demand_mandate_skills_inlined() {
+        use crate::mandate::tests::{fixture, on_demand, resolve_body};
+        use crate::mandate::ON_DEMAND_HEADING;
+        let ws = std::env::temp_dir().join(format!("nubi-skills-{}", uuid::Uuid::new_v4()));
+        let rt = CliRuntime::new(HarnessKind::Gemini, "bot").with_workspace(Some(ws.clone()));
+        let mut skills = fixture();
+        skills.push(on_demand(
+            "ideas-1",
+            "Ideas",
+            "Brainstorm",
+            "Start with ten bad ones.\n",
+        ));
+        let m: Mandate = serde_json::from_value(resolve_body(&skills)).unwrap();
+        rt.inject_mandate(Some(&m), &[]).unwrap();
+        let sp = rt.build_system_prompt();
+        assert!(sp.contains("### Ideas\nStart with ten bad ones."));
+        assert!(!sp.contains(ON_DEMAND_HEADING));
+        assert!(!ws.join(".claude").exists());
         let _ = std::fs::remove_dir_all(ws);
     }
 
