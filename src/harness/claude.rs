@@ -57,6 +57,15 @@ impl Claude {
             // window; the default waits until the window is nearly full.
             inv.env("CLAUDE_AUTOCOMPACT_PCT_OVERRIDE", pct.to_string());
         }
+        if let Some(tokens) = settings.compact_window {
+            // Without an explicit window, Claude Code (2.1.3xx, outside its
+            // remote mode) skips threshold compaction, the percentage above
+            // included, and compacts only when the API answers "prompt is
+            // too long". A gateway like Kiro answers a full context with its
+            // own 400 instead, which Claude Code retries until the turn
+            // fails. Naming the window makes the threshold count again.
+            inv.env("CLAUDE_CODE_AUTO_COMPACT_WINDOW", tokens.to_string());
+        }
         if let Some(ref url) = settings.llm_base_url {
             inv.env("ANTHROPIC_BASE_URL", url);
             // Behind a custom base URL, Claude Code (2.1.247+) defers MCP tools

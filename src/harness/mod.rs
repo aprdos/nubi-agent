@@ -95,6 +95,9 @@ pub struct Settings {
     /// Compact the CLI's conversation once it fills this share of the
     /// context window, for CLIs that can.
     pub compact_at_pct: Option<u8>,
+    /// The context window, in tokens, compaction is measured against, for
+    /// CLIs that take one. Claude Code ignores `compact_at_pct` without it.
+    pub compact_window: Option<u32>,
     pub turn_timeout: Duration,
     pub context_chars: usize,
     /// A file of rules shared by every agent on this machine, included in
@@ -122,6 +125,7 @@ impl Default for Settings {
             fallback_model: None,
             effort: None,
             compact_at_pct: None,
+            compact_window: None,
             turn_timeout: DEFAULT_TURN_TIMEOUT,
             context_chars: DEFAULT_CONTEXT_CHARS,
             team_memory: None,
@@ -744,6 +748,11 @@ impl CliRuntime {
 
     pub fn with_compact_at_pct(mut self, pct: Option<u8>) -> Self {
         self.settings.compact_at_pct = pct;
+        self
+    }
+
+    pub fn with_compact_window(mut self, tokens: Option<u32>) -> Self {
+        self.settings.compact_window = tokens;
         self
     }
 
@@ -1897,6 +1906,7 @@ mod tests {
         s.effort = Some("high".into());
         s.fallback_model = Some("m2".into());
         s.compact_at_pct = Some(60);
+        s.compact_window = Some(200_000);
         let inv = claude::Claude.invocation(&s, "SYS", "hi", None);
         assert_eq!(&inv.args[..2], &["-p", "hi"]);
         assert!(has(&inv, "--append-system-prompt") && has(&inv, "SYS"));
@@ -1913,7 +1923,29 @@ mod tests {
         assert!(has(&inv, "--allowedTools=mcp__nubi"));
         assert!(!has(&inv, "--dangerously-skip-permissions"));
         assert_eq!(env(&inv, "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"), Some("60"));
+        assert_eq!(env(&inv, "CLAUDE_CODE_AUTO_COMPACT_WINDOW"), Some("200000"));
         assert!(!has(&inv, "--resume") && !has(&inv, "--session-id"));
+    }
+
+    #[test]
+    fn claude_compaction_window_reaches_live_sessions_too() {
+        // The percentage alone is ignored by Claude Code, so both go out
+        // together, on per-turn and live invocations alike.
+        let mut s = settings();
+        s.compact_at_pct = Some(60);
+        s.compact_window = Some(200_000);
+        let live = claude::Claude
+            .live_invocation(&s, "SYS", None)
+            .expect("claude has live sessions");
+        assert_eq!(env(&live, "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"), Some("60"));
+        assert_eq!(
+            env(&live, "CLAUDE_CODE_AUTO_COMPACT_WINDOW"),
+            Some("200000")
+        );
+        // Unset leaves Claude Code's own default.
+        let inv = claude::Claude.invocation(&settings(), "SYS", "hi", None);
+        assert_eq!(env(&inv, "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"), None);
+        assert_eq!(env(&inv, "CLAUDE_CODE_AUTO_COMPACT_WINDOW"), None);
     }
 
     #[test]

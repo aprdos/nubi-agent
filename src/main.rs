@@ -213,6 +213,19 @@ struct Args {
     )]
     compact_at_pct: u8,
 
+    /// The context window, in tokens, that compaction is measured against
+    /// (Claude Code only; 0 leaves the CLI's own). Recent Claude Code only
+    /// compacts at --compact-at-pct when a window is given; otherwise it
+    /// waits for the API to answer "prompt is too long", which a gateway
+    /// such as Kiro never sends. Claude Code clamps it to the model's window.
+    #[arg(
+        long,
+        env = "NUBI_COMPACT_WINDOW",
+        default_value = "200000",
+        help_heading = "Tuning"
+    )]
+    compact_window: u32,
+
     /// Kill a run that takes longer than this many seconds and tell the room
     #[arg(
         long,
@@ -337,6 +350,7 @@ async fn main() -> anyhow::Result<()> {
         llm_fallback_model: args.fallback_model,
         llm_effort: effort,
         compact_at_pct: (args.compact_at_pct > 0).then_some(args.compact_at_pct.min(100)),
+        compact_window: (args.compact_window > 0).then_some(args.compact_window),
         turn_timeout_secs: args.turn_timeout_secs,
         max_parallel_turns: args.max_parallel_turns,
         harness: args.harness,
