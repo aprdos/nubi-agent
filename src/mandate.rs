@@ -54,13 +54,58 @@ pub struct MandateSkill {
     pub version_index: u64,
     #[serde(default)]
     pub pinned: bool,
+    /// Always on (inlined in full and hashed) when true; on demand (listed
+    /// by name and description, loaded by the agent when relevant) when
+    /// false.
     #[serde(default = "default_required")]
     pub required: bool,
+    /// One line for the on-demand index. Older engines do not send it; see
+    /// [`MandateSkill::index_description`].
+    #[serde(default)]
+    pub description: String,
     pub content: String,
 }
 
 fn default_required() -> bool {
     true
+}
+
+/// Longest description line in the on-demand index and SKILL.md frontmatter.
+const DESCRIPTION_MAX_CHARS: usize = 160;
+
+impl MandateSkill {
+    /// The name shown to the agent: the skill's name, or its room id when
+    /// the engine sent none.
+    pub fn display_name(&self) -> &str {
+        if self.name.is_empty() {
+            &self.room_id
+        } else {
+            &self.name
+        }
+    }
+
+    /// The one-line description for the index: `description` when the engine
+    /// sent one, else the first line of the content that is not a heading, so
+    /// an older engine still produces a usable index. Collapsed to one line
+    /// and cut at [`DESCRIPTION_MAX_CHARS`].
+    pub fn index_description(&self) -> String {
+        let raw = if self.description.trim().is_empty() {
+            self.content
+                .lines()
+                .map(str::trim)
+                .find(|l| !l.is_empty() && !l.starts_with('#'))
+                .unwrap_or("")
+        } else {
+            self.description.as_str()
+        };
+        let one_line = raw.split_whitespace().collect::<Vec<_>>().join(" ");
+        if one_line.chars().count() <= DESCRIPTION_MAX_CHARS {
+            one_line
+        } else {
+            let cut: String = one_line.chars().take(DESCRIPTION_MAX_CHARS).collect();
+            format!("{}…", cut.trim_end())
+        }
+    }
 }
 
 /// The resolve body of `GET /agents/{agent}/mandate`.
@@ -137,10 +182,25 @@ fn sha256_hex(bytes: &[u8]) -> String {
 
 pub const MANDATE_HEADING: &str = "## Mandate — you must follow these";
 
-/// Render the mandate for the system prompt: required skills first, under a
-/// heading that states the obligation, then any suggested ones. No trigger
-/// hints: a mandated skill always applies.
-pub fn build_mandate_section(mandate: &Mandate) -> String {
+/// Heading of the on-demand index inside the mandate section.
+pub const ON_DEMAND_HEADING: &str = "### Skills you may load when relevant";
+
+/// How the on-demand (`required == false`) skills reach the agent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OnDemand {
+    /// Inlined in full after the always-on skills: for a harness that does
+    /// not load skills from the workspace.
+    Inline,
+    /// Written as skill files by the caller; the section only lists them by
+    /// name and description, and the agent reads one when it is relevant.
+    Listed,
+}
+
+/// Render the mandate for the system prompt: always-on skills first, in
+/// full, under a heading that states the obligation, then the on-demand
+/// ones, inlined or listed per `on_demand`. No trigger hints on the
+/// always-on ones: a mandated skill always applies.
+pub fn build_mandate_section(mandate: &Mandate, on_demand: OnDemand) -> String {
     let required: Vec<_> = mandate.skills.iter().filter(|s| s.required).collect();
     let suggested: Vec<_> = mandate.skills.iter().filter(|s| !s.required).collect();
     if required.is_empty() && suggested.is_empty() {
@@ -157,29 +217,65 @@ pub fn build_mandate_section(mandate: &Mandate) -> String {
     for skill in required {
         out.push_str(&format!(
             "\n### {}\n{}\n",
-            display_name(skill),
+            skill.display_name(),
             skill.content
         ));
     }
     if !suggested.is_empty() {
-        out.push_str("\nAlso part of your mandate, to use when relevant:\n");
-        for skill in suggested {
-            out.push_str(&format!(
-                "\n### {}\n{}\n",
-                display_name(skill),
-                skill.content
-            ));
+        match on_demand {
+            OnDemand::Inline => {
+                out.push_str("\nAlso part of your mandate, to use when relevant:\n");
+                for skill in suggested {
+                    out.push_str(&format!(
+                        "\n### {}\n{}\n",
+                        skill.display_name(),
+                        skill.content
+                    ));
+                }
+            }
+            OnDemand::Listed => {
+                out.push_str(&format!(
+                    "\n{ON_DEMAND_HEADING}\n\n\
+                     These are also part of your mandate. Each is a skill in your working \
+                     directory; read it and follow it when its description matches what \
+                     you are doing.\n"
+                ));
+                for skill in suggested {
+                    out.push_str(&format!(
+                        "- {} — {}\n",
+                        skill.display_name(),
+                        skill.index_description()
+                    ));
+                }
+            }
         }
     }
     out
 }
 
-fn display_name(skill: &MandateSkill) -> &str {
-    if skill.name.is_empty() {
-        &skill.room_id
-    } else {
-        &skill.name
-    }
+/// The on-demand skills as ad-hoc [`Skill`]s, so they can be written to the
+/// workspace with the same code path (and the same `nubi-` prefix cleanup)
+/// as the skills from room membership and files.
+pub fn on_demand_skills(mandate: &Mandate) -> Vec<crate::skills::Skill> {
+    mandate
+        .skills
+        .iter()
+        .filter(|s| !s.required)
+        .map(|s| crate::skills::Skill {
+            meta: crate::skills::SkillMeta {
+                name: s.display_name().to_string(),
+                description: Some(s.index_description()).filter(|d| !d.is_empty()),
+                trigger: None,
+                enabled: true,
+            },
+            content: s.content.clone(),
+            path: std::path::PathBuf::from(format!(
+                "{}{}",
+                crate::skills::ROOM_PATH_PREFIX,
+                s.room_id
+            )),
+        })
+        .collect()
 }
 
 /// What a fetch found.
@@ -336,7 +432,16 @@ pub(crate) mod tests {
             version_index: version,
             pinned: false,
             required: true,
+            description: String::new(),
             content: content.into(),
+        }
+    }
+
+    pub fn on_demand(room_id: &str, name: &str, description: &str, content: &str) -> MandateSkill {
+        MandateSkill {
+            required: false,
+            description: description.into(),
+            ..skill(room_id, name, 1, content)
         }
     }
 
@@ -423,7 +528,7 @@ pub(crate) mod tests {
         skills.push(extra);
         let mandate: Mandate = serde_json::from_value(resolve_body(&skills)).unwrap();
 
-        let section = build_mandate_section(&mandate);
+        let section = build_mandate_section(&mandate, OnDemand::Inline);
         assert!(section.starts_with(MANDATE_HEADING));
         let refund = section.find("### Refund policy").unwrap();
         let tone = section.find("### Tone").unwrap();
@@ -434,9 +539,90 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn listed_on_demand_skills_are_an_index_not_a_body() {
+        let mut skills = fixture();
+        skills.push(on_demand(
+            "ideas-1",
+            "Ideas",
+            "Brainstorm  product\nideas",
+            "# Ideas\n\nStart with ten bad ones.\n",
+        ));
+        let mandate: Mandate = serde_json::from_value(resolve_body(&skills)).unwrap();
+
+        let section = build_mandate_section(&mandate, OnDemand::Listed);
+        assert!(
+            section.contains("Refund within 30 days."),
+            "always-on stays inline"
+        );
+        assert!(section.contains(ON_DEMAND_HEADING));
+        assert!(section.contains("- Ideas — Brainstorm product ideas\n"));
+        assert!(!section.contains("### Ideas"));
+        assert!(
+            !section.contains("Start with ten bad ones."),
+            "body is not inlined"
+        );
+        // The always-on part is the same either way.
+        let inline = build_mandate_section(&mandate, OnDemand::Inline);
+        assert_eq!(
+            inline
+                .split(ON_DEMAND_HEADING)
+                .next()
+                .unwrap()
+                .split("Also part of")
+                .next(),
+            section.split(ON_DEMAND_HEADING).next()
+        );
+        assert!(inline.contains("Start with ten bad ones."));
+        assert!(!inline.contains(ON_DEMAND_HEADING));
+    }
+
+    #[test]
+    fn index_description_falls_back_to_the_first_non_heading_line() {
+        let s = on_demand(
+            "r",
+            "Refunds",
+            "",
+            "# Refunds\n\n  Refund within   30 days.\nMore.\n",
+        );
+        assert_eq!(s.index_description(), "Refund within 30 days.");
+        let s = on_demand("r", "Refunds", "", "# Only a heading\n");
+        assert_eq!(s.index_description(), "");
+        let long = "x".repeat(300);
+        let s = on_demand("r", "Long", &long, "");
+        assert_eq!(
+            s.index_description().chars().count(),
+            DESCRIPTION_MAX_CHARS + 1
+        );
+        assert!(s.index_description().ends_with('…'));
+        // An old engine sends no description at all.
+        let parsed: MandateSkill = serde_json::from_value(json!({
+            "room_id": "r", "version_index": 1, "required": false, "content": "Be kind.\n"
+        }))
+        .unwrap();
+        assert_eq!(parsed.description, "");
+        assert_eq!(parsed.index_description(), "Be kind.");
+        assert_eq!(parsed.display_name(), "r");
+    }
+
+    #[test]
+    fn on_demand_skills_convert_to_adhoc_skills() {
+        let mut skills = fixture();
+        skills.push(on_demand("ideas-1", "Ideas", "Brainstorm.", "Body.\n"));
+        let mandate: Mandate = serde_json::from_value(resolve_body(&skills)).unwrap();
+        let adhoc = on_demand_skills(&mandate);
+        assert_eq!(adhoc.len(), 1, "always-on skills never become files");
+        assert_eq!(adhoc[0].meta.name, "Ideas");
+        assert_eq!(adhoc[0].meta.description.as_deref(), Some("Brainstorm."));
+        assert_eq!(adhoc[0].room_id(), Some("ideas-1"));
+        assert_eq!(adhoc[0].content, "Body.\n");
+        assert!(adhoc[0].meta.enabled);
+    }
+
+    #[test]
     fn empty_mandate_renders_nothing() {
         let mandate: Mandate = serde_json::from_value(resolve_body(&[])).unwrap();
-        assert_eq!(build_mandate_section(&mandate), "");
+        assert_eq!(build_mandate_section(&mandate, OnDemand::Listed), "");
+        assert_eq!(build_mandate_section(&mandate, OnDemand::Inline), "");
     }
 
     #[tokio::test]

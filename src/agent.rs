@@ -3090,6 +3090,7 @@ mod tests {
             version_index: 4,
             pinned: true,
             required: true,
+            description: String::new(),
             content: "Escalate refunds over $500.".into(),
         });
         resolve_body(&skills)
