@@ -141,6 +141,7 @@ nubi-agent --url http://localhost:9099 --token nubi_xxx \
 | `--rate-limit-ms` | — | `5000` | Cooldown per room |
 | `--heartbeat-secs` | — | `5` | Typing-indicator refresh interval while a turn runs (0 = set once) |
 | `--compact-at-pct` | `NUBI_COMPACT_AT_PCT` | `60` | Compact the CLI's conversation at this share of the context window (Claude Code; 0 = CLI default) |
+| `--compact-window` | `NUBI_COMPACT_WINDOW` | `200000` | Context window, in tokens, that compaction is measured against; Claude Code ignores `--compact-at-pct` without one (Claude Code; 0 = CLI default) |
 | `--turn-timeout-secs` | `NUBI_TURN_TIMEOUT_SECS` | `900` | Kill a run that takes longer and tell the room |
 | `--max-parallel-turns` | `NUBI_MAX_PARALLEL_TURNS` | `1` | Turns running at once across rooms; 1 answers in arrival order |
 | `--pass-env` | `NUBI_PASS_ENV` | — | Extra env vars (comma-separated names) the CLI may see |

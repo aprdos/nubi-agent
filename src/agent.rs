@@ -121,6 +121,7 @@ pub struct AgentConfig {
     pub llm_fallback_model: Option<String>,
     pub llm_effort: Option<String>,
     pub compact_at_pct: Option<u8>,
+    pub compact_window: Option<u32>,
     pub turn_timeout_secs: u64,
     /// Turns that may run at once across all rooms. With 1 they run one
     /// after another in arrival order.
@@ -169,6 +170,7 @@ impl Default for AgentConfig {
             llm_fallback_model: None,
             llm_effort: None,
             compact_at_pct: None,
+            compact_window: None,
             turn_timeout_secs: crate::harness::DEFAULT_TURN_TIMEOUT.as_secs(),
             max_parallel_turns: 1,
             harness: HarnessKind::default(),
@@ -614,6 +616,7 @@ impl Agent {
             .with_fallback_model(config.llm_fallback_model.clone())
             .with_effort(config.llm_effort.clone())
             .with_compact_at_pct(config.compact_at_pct)
+            .with_compact_window(config.compact_window)
             .with_turn_timeout(Duration::from_secs(config.turn_timeout_secs.max(1)))
             .with_team_memory(team_memory)
             .with_live(config.live_sessions)

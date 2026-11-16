@@ -19,7 +19,10 @@ dotted ids too, but Claude Code hangs on `claude-opus-4.5` (verified; the new
 turn timeout kills it). `claude-sonnet-4-6` is the fallback model
 and `--effort high` as the new lever. Revisit when the gateway serves a newer
 Opus. Claude Code's auto-compaction is set to trigger at 60% of the context
-window via `CLAUDE_AUTOCOMPACT_PCT_OVERRIDE` (`--compact-at-pct`).
+window via `CLAUDE_AUTOCOMPACT_PCT_OVERRIDE` (`--compact-at-pct`), together
+with `CLAUDE_CODE_AUTO_COMPACT_WINDOW` (`--compact-window`, 200k): without a
+named window, Claude Code 2.1.3xx skips threshold compaction and waits for an
+Anthropic "prompt is too long", which Kiro never sends.
 
 ## TL;DR
 
