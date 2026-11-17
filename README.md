@@ -150,7 +150,7 @@ nubi-agent --url http://localhost:9099 --token nubi_xxx \
 | `--live-sessions` | `NUBI_LIVE_SESSIONS` | `true` | Keep one Claude Code session up per room: background work outlives the turn and wakes the agent when it finishes; answers go through `nubi_send` |
 | `--no-live-sessions` | `NUBI_NO_LIVE_SESSIONS` | `false` | One `claude -p` run per message instead; nothing the agent starts outlives its turn |
 | `--live-max` | `NUBI_LIVE_MAX` | `3` | Live sessions kept up at once; the one idle longest stops first |
-| `--live-idle-secs` | `NUBI_LIVE_IDLE_SECS` | `1800` | Stop a live session with nothing running after this long |
+| `--live-idle-secs` | `NUBI_LIVE_IDLE_SECS` | `900` | Stop a live session with nothing running after this long |
 | `--live-scope` | `NUBI_LIVE_SCOPE` | `room` | `room`: one live session per room and per thread. `family`: a room and its threads share one (a DM and its threads are their own family) |
 | `--send-lock` | `NUBI_SEND_LOCK` | `false` | Hold a live turn a person started to `nubi_send` within its room's family. Off: the agent may send anywhere; only what wakes it is guarded |
 | `--heartbeat-url` | `NUBI_HEARTBEAT_URL` | — | POSTed every minute while the agent works, for launchers that stop idle agents (`NUBI_HEARTBEAT_TOKEN` as bearer) |
