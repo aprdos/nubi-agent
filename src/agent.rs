@@ -1,7 +1,7 @@
 use eventsource_client::Client;
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -141,6 +141,8 @@ pub struct AgentConfig {
     pub live_max: usize,
     /// A live session with nothing running is stopped after this long.
     pub live_idle_secs: u64,
+    /// What one live session serves: a room, or a room with its threads.
+    pub live_scope: LiveScope,
     /// Told every minute while the agent is working (a turn, or background
     /// work in a live session), so a launcher that stops idle agents doesn't
     /// stop it mid-task. Sent with `heartbeat_token` as a bearer token.
@@ -179,10 +181,22 @@ impl Default for AgentConfig {
             live_sessions: false,
             live_max: 3,
             live_idle_secs: 900,
+            live_scope: LiveScope::Room,
             heartbeat_url: None,
             heartbeat_token: None,
         }
     }
+}
+
+/// What one live session serves (see [`crate::live`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, clap::ValueEnum)]
+pub enum LiveScope {
+    /// One session per room: a channel and each of its threads apart.
+    #[default]
+    Room,
+    /// One session per family: a room and its threads (a DM and its threads
+    /// are a family of their own).
+    Family,
 }
 
 /// Where the mandate stands, as far as the agent knows.
@@ -239,11 +253,16 @@ impl Drop for InFlightEntry<'_> {
 
 /// A room's turn that is running in a live session: messages for the room
 /// that arrive meanwhile are handed to it (see [`Shared::steer`]) instead of
-/// waiting for a turn of their own.
+/// waiting for a turn of their own. In family scope, so are messages for the
+/// other rooms of its family, which share the session.
 struct Steering {
+    /// The room the turn is for.
+    room_id: String,
     thread: Option<ThreadAnchor>,
-    /// Messages handed to the turn so far.
+    /// Messages for the turn's own room handed to it so far.
     joined: Vec<Trigger>,
+    /// Messages for other rooms of its family handed to it, with their room.
+    others: Vec<(String, Trigger)>,
 }
 
 /// Holds a room's [`Steering`] slot for its turn. Dropped without
@@ -255,24 +274,28 @@ struct Steering {
 /// looks again after every turn, so what goes back is picked up there.
 struct SteeringEntry<'a> {
     shared: &'a Shared,
+    /// The live session's key (see [`Shared::live_key`]).
+    key: String,
     room_id: String,
     answered: bool,
 }
 
 impl SteeringEntry<'_> {
-    /// Close the slot; the turn answered what it was handed.
-    fn answered(mut self) -> Vec<Trigger> {
+    /// Close the slot; the turn answered what it was handed: its own room's
+    /// messages, and those of other rooms of its family with their room.
+    fn answered(mut self) -> (Vec<Trigger>, Vec<(String, Trigger)>) {
         self.answered = true;
         self.take()
     }
 
-    /// What was handed to the turn so far, leaving the slot open.
+    /// What was handed to the turn for its own room so far, leaving the slot
+    /// open.
     fn drain(&self) -> Vec<Trigger> {
         self.shared
             .steering
             .lock()
             .map(|mut s| {
-                s.get_mut(&self.room_id)
+                s.get_mut(&self.key)
                     .map(|s| std::mem::take(&mut s.joined))
                     .unwrap_or_default()
             })
@@ -282,28 +305,38 @@ impl SteeringEntry<'_> {
     /// Put back messages taken with [`Self::drain`], ahead of the rest.
     fn give_back(&self, mut handed: Vec<Trigger>) {
         if let Ok(mut s) = self.shared.steering.lock() {
-            if let Some(slot) = s.get_mut(&self.room_id) {
+            if let Some(slot) = s.get_mut(&self.key) {
                 handed.append(&mut slot.joined);
                 slot.joined = handed;
             }
         }
     }
 
-    fn take(&self) -> Vec<Trigger> {
+    fn take(&self) -> (Vec<Trigger>, Vec<(String, Trigger)>) {
         self.shared
             .steering
             .lock()
-            .map(|mut s| s.remove(&self.room_id).map(|s| s.joined))
             .ok()
-            .flatten()
+            .and_then(|mut s| s.remove(&self.key))
+            .map(|s| (s.joined, s.others))
             .unwrap_or_default()
     }
 }
 
 impl Drop for SteeringEntry<'_> {
     fn drop(&mut self) {
-        let joined = self.take();
-        if self.answered || joined.is_empty() {
+        let (joined, others) = self.take();
+        if self.answered {
+            return;
+        }
+        // Other rooms' messages have no worker of this room to pick them
+        // up: their own worker is started for them (see `serve_room`).
+        if !others.is_empty() {
+            if let Ok(mut requeue) = self.shared.requeue.lock() {
+                requeue.extend(others);
+            }
+        }
+        if joined.is_empty() {
             return;
         }
         // Never panic in drop.
@@ -489,6 +522,17 @@ struct SessionRecord {
     /// Highest message index the session has already seen, so the next
     /// prompt only carries what came after.
     last_index: u64,
+    /// In family scope, the same for each other room of the family the
+    /// session has served (the record is keyed by the family's room).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    rooms: BTreeMap<String, RoomMark>,
+}
+
+/// Where a session stands in one room of its family.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+struct RoomMark {
+    last_index: u64,
+    last_used_ms: u64,
 }
 
 /// How a turn ended, for the journal and the log line.
@@ -545,11 +589,15 @@ struct Shared {
     families: Mutex<HashMap<String, Arc<TurnLock<()>>>>,
     /// Turns running right now, by room.
     in_flight: Mutex<HashMap<String, InFlight>>,
-    /// Live sessions by room (see [`crate::live`]).
+    /// Live sessions by their key (see [`Self::live_key`] and
+    /// [`crate::live`]).
     live: Mutex<HashMap<String, Arc<LiveSession>>>,
-    /// Turns running now that new messages can join, by room.
+    /// Turns running now that new messages can join, by live key.
     steering: Mutex<HashMap<String, Steering>>,
-    /// Turns live sessions started on their own, with their room.
+    /// Messages for another room handed to a turn that then failed: they go
+    /// back in their room's queue once that turn is over.
+    requeue: Mutex<Vec<(String, Trigger)>>,
+    /// Turns live sessions started on their own, with their live key.
     live_tx: mpsc::UnboundedSender<(String, LiveTurn)>,
     live_rx: Mutex<Option<mpsc::UnboundedReceiver<(String, LiveTurn)>>>,
     /// Where each room's last live turn sent messages, for its status.
@@ -677,6 +725,7 @@ impl Agent {
             in_flight: Mutex::new(HashMap::new()),
             live: Mutex::new(HashMap::new()),
             steering: Mutex::new(HashMap::new()),
+            requeue: Mutex::new(Vec::new()),
             live_tx,
             live_rx: Mutex::new(Some(live_rx)),
             live_sent: Mutex::new(HashMap::new()),
@@ -1625,7 +1674,13 @@ impl Shared {
         let family = family_of(room_id);
         // What a DM (or a thread of one) said stays there: only the DM's own
         // family sees it.
-        let visible = |room: &str| room != room_id && (!is_dm(room) || family_of(room) == family);
+        // In family scope, the family's rooms are in the session already.
+        let shared_session = self.family_scope();
+        let visible = |room: &str| {
+            room != room_id
+                && !(shared_session && family_of(room) == family)
+                && (!is_dm(room) || family_of(room) == family)
+        };
 
         let mut lines: Vec<String> = {
             let in_flight = self.in_flight.lock().unwrap();
@@ -1684,12 +1739,7 @@ impl Shared {
     ) -> Vec<BufferedMessage> {
         self.prime_buffer(&thread.parent_room).await;
         let since = if resumed {
-            self.sessions
-                .lock()
-                .unwrap()
-                .get(room_id)
-                .map(|r| r.last_used_ms)
-                .unwrap_or(0)
+            self.room_mark(room_id).map_or(0, |m| m.last_used_ms)
         } else {
             0
         };
@@ -1724,7 +1774,9 @@ impl Shared {
                 room_id, family
             )
         };
-        if parse_thread_room(room_id).is_some() {
+        // In family scope the whole family shares one session, which runs
+        // one turn at a time: sibling threads take turns too.
+        if parse_thread_room(room_id).is_some() && !self.family_scope() {
             let guard = match Arc::clone(&lock).try_read_owned() {
                 Ok(g) => g,
                 Err(_) => {
@@ -1863,7 +1915,12 @@ impl Shared {
             return None;
         }
         let now = now_ms();
-        let existing = self.sessions.lock().unwrap().get(room_id).cloned();
+        let existing = self
+            .sessions
+            .lock()
+            .unwrap()
+            .get(&self.live_key(room_id))
+            .cloned();
         match existing {
             Some(rec)
                 if now.saturating_sub(rec.last_used_ms) < SESSION_MAX_IDLE.as_millis() as u64 =>
@@ -1880,30 +1937,95 @@ impl Shared {
         }
     }
 
+    /// Where the room's session stands in the room: None when the session
+    /// has not served it yet (or there is none).
+    fn room_mark(&self, room_id: &str) -> Option<RoomMark> {
+        let key = self.live_key(room_id);
+        let sessions = self.sessions.lock().unwrap();
+        let rec = sessions.get(&key)?;
+        if key == room_id {
+            Some(RoomMark {
+                last_index: rec.last_index,
+                last_used_ms: rec.last_used_ms,
+            })
+        } else {
+            rec.rooms.get(room_id).copied()
+        }
+    }
+
     fn session_last_index(&self, room_id: &str) -> u64 {
+        self.room_mark(room_id).map_or(0, |m| m.last_index)
+    }
+
+    /// Forget the room's session (in family scope, the family's).
+    fn forget_session(&self, room_id: &str) {
         self.sessions
             .lock()
             .unwrap()
-            .get(room_id)
-            .map(|r| r.last_index)
-            .unwrap_or(0)
-    }
-
-    fn forget_session(&self, room_id: &str) {
-        self.sessions.lock().unwrap().remove(room_id);
+            .remove(&self.live_key(room_id));
         self.save_sessions();
     }
 
     fn record_session(&self, room_id: &str, id: String, last_index: u64) {
-        self.sessions.lock().unwrap().insert(
-            room_id.to_string(),
-            SessionRecord {
-                id,
-                last_used_ms: now_ms(),
-                last_index,
-            },
-        );
+        let key = self.live_key(room_id);
+        let now = now_ms();
+        {
+            let mut sessions = self.sessions.lock().unwrap();
+            let rec = sessions
+                .entry(key.clone())
+                .or_insert_with(|| SessionRecord {
+                    id: id.clone(),
+                    last_used_ms: now,
+                    last_index: 0,
+                    rooms: BTreeMap::new(),
+                });
+            if rec.id != id {
+                // Another conversation: what the old one had seen is moot.
+                rec.id = id;
+                rec.last_index = 0;
+                rec.rooms.clear();
+            }
+            rec.last_used_ms = now;
+            if key == room_id {
+                rec.last_index = last_index;
+            } else {
+                rec.rooms.insert(
+                    room_id.to_string(),
+                    RoomMark {
+                        last_index,
+                        last_used_ms: now,
+                    },
+                );
+            }
+        }
         self.save_sessions();
+    }
+
+    /// Whether a room and its threads share one live session.
+    fn family_scope(&self) -> bool {
+        self.config.live_scope == LiveScope::Family && self.runtime.live_enabled()
+    }
+
+    /// The live session (and saved conversation) a room is served in: the
+    /// room's own, or in family scope its family's.
+    fn live_key(&self, room_id: &str) -> String {
+        if self.family_scope() {
+            family_of(room_id)
+        } else {
+            room_id.to_string()
+        }
+    }
+
+    /// Write the send lock for the next turn of the live session `key`:
+    /// the room's family, or anywhere for a turn only `system` started.
+    fn write_send_scope(&self, key: &str, room_id: &str, expects_reply: bool) {
+        let Some(path) = self.runtime.send_scope_file(key) else {
+            return;
+        };
+        let scope = crate::send_guard::scope(room_id, &family_of(room_id), expects_reply);
+        if let Err(e) = crate::send_guard::write_scope(&path, &scope) {
+            eprintln!("[nubi-agent] Cannot write the send scope {:?}: {}", path, e);
+        }
     }
 
     fn save_sessions(&self) {
@@ -1925,12 +2047,30 @@ impl Shared {
     /// session, so the agent reads it at its next step instead of after the
     /// whole turn: a correction or a "stop" lands while it can still act on
     /// it. False when there is no such turn; the message is then queued.
+    ///
+    /// In family scope the turn may be another room's of the same family; a
+    /// message for a room that still has messages queued waits with them, so
+    /// they are answered in order.
     async fn steer(&self, room_id: &str, trigger: &Trigger) -> bool {
-        let thread = match self.steering.lock().unwrap().get(room_id) {
-            Some(s) => s.thread.clone(),
+        let key = self.live_key(room_id);
+        let (turn_room, mut thread) = match self.steering.lock().unwrap().get(&key) {
+            Some(s) => (s.room_id.clone(), s.thread.clone()),
             None => return false,
         };
-        let Some(live) = self.live.lock().unwrap().get(room_id).cloned() else {
+        if turn_room != room_id {
+            let queued = self
+                .dispatch
+                .lock()
+                .unwrap()
+                .pending
+                .get(room_id)
+                .is_some_and(|p| !p.is_empty());
+            if queued {
+                return false;
+            }
+            thread = self.thread_anchor(room_id).await;
+        }
+        let Some(live) = self.live.lock().unwrap().get(&key).cloned() else {
             return false;
         };
         let turn = TurnInput {
@@ -1949,13 +2089,18 @@ impl Shared {
         // taken up, and a turn that fails puts it back in the queue.
         {
             let mut steering = self.steering.lock().unwrap();
-            let Some(slot) = steering.get_mut(room_id) else {
+            // Still the turn looked at above (the anchor lookup awaited).
+            let Some(slot) = steering.get_mut(&key).filter(|s| s.room_id == turn_room) else {
                 return false;
             };
             if !live.reserve_steer() {
                 return false;
             }
-            slot.joined.push(trigger.clone());
+            if slot.room_id == room_id {
+                slot.joined.push(trigger.clone());
+            } else {
+                slot.others.push((room_id.to_string(), trigger.clone()));
+            }
         }
         if live.write_steered(&text).await {
             eprintln!(
@@ -1970,17 +2115,53 @@ impl Shared {
 
     /// Open the room's [`Steering`] slot for the turn about to run.
     fn start_steering(&self, room_id: &str, thread: Option<ThreadAnchor>) -> SteeringEntry<'_> {
+        let key = self.live_key(room_id);
         self.steering.lock().unwrap().insert(
-            room_id.to_string(),
+            key.clone(),
             Steering {
+                room_id: room_id.to_string(),
                 thread,
                 joined: Vec::new(),
+                others: Vec::new(),
             },
         );
         SteeringEntry {
             shared: self,
+            key,
             room_id: room_id.to_string(),
             answered: false,
+        }
+    }
+
+    /// Put messages back at the front of their room's queue, starting its
+    /// worker if none runs.
+    fn requeue_front(self: &Arc<Self>, room_id: &str, triggers: Vec<Trigger>) {
+        let mut dispatch = self.dispatch.lock().unwrap();
+        let pending = dispatch.pending.entry(room_id.to_string()).or_default();
+        let newer = std::mem::take(pending);
+        *pending = triggers;
+        pending.extend(newer);
+        if !dispatch.active.insert(room_id.to_string()) {
+            return;
+        }
+        drop(dispatch);
+        let shared = Arc::clone(self);
+        let room_id = room_id.to_string();
+        tokio::spawn(async move { shared.serve_room(room_id).await });
+    }
+
+    /// Requeue what failed turns were handed for other rooms.
+    fn flush_requeue(self: &Arc<Self>) {
+        let handed = std::mem::take(&mut *self.requeue.lock().unwrap());
+        let mut by_room: Vec<(String, Vec<Trigger>)> = Vec::new();
+        for (room, t) in handed {
+            match by_room.iter_mut().find(|(r, _)| *r == room) {
+                Some((_, ts)) => ts.push(t),
+                None => by_room.push((room, vec![t])),
+            }
+        }
+        for (room, triggers) in by_room {
+            self.requeue_front(&room, triggers);
         }
     }
 
@@ -2040,7 +2221,9 @@ impl Shared {
                 }
             };
 
-            match self.reply(&room_id, &triggers).await {
+            let replied = self.reply(&room_id, &triggers).await;
+            self.flush_requeue();
+            match replied {
                 Ok(TurnEnd::Answered) => {}
                 Ok(TurnEnd::Refused) => {
                     // Back at the front, ahead of anything newer, and tried
@@ -2128,7 +2311,10 @@ impl Shared {
                 indexes.extend(handed.iter().map(|t| t.index));
                 all.extend(handed);
             }
-            let resumed = session.as_ref().is_some_and(|s| s.resume);
+            // Resumed for this room: in family scope the session may be the
+            // family's and never have served this room yet.
+            let resumed =
+                session.as_ref().is_some_and(|s| s.resume) && self.room_mark(room_id).is_some();
             let mut context = self
                 .buffer
                 .lock()
@@ -2160,17 +2346,21 @@ impl Shared {
                 );
             }
 
-            let live_up = self.live.lock().unwrap().contains_key(room_id);
+            let live_up = self
+                .live
+                .lock()
+                .unwrap()
+                .contains_key(&self.live_key(room_id));
             eprintln!(
                 "[nubi-agent] Running {:?}{}...",
                 self.config.harness,
                 match &session {
                     _ if live_up => " (live session)",
-                    Some(s) if s.resume && self.runtime.live_command(None).is_some() => {
+                    Some(s) if s.resume && self.runtime.live_enabled() => {
                         " (live session, resuming the conversation)"
                     }
                     Some(s) if s.resume => " (resuming session)",
-                    Some(_) if self.runtime.live_command(None).is_some() => " (live session)",
+                    Some(_) if self.runtime.live_enabled() => " (live session)",
                     Some(_) => " (new session)",
                     None => "",
                 }
@@ -2286,12 +2476,15 @@ impl Shared {
 
         // Messages handed to the turn while it ran were answered with it.
         let mut joined = all.split_off(triggers.len());
-        joined.extend(steering.answered());
+        let (handed, others) = steering.answered();
+        joined.extend(handed);
         let _joined_answered = Answering {
             offsets: Arc::clone(&self.offsets),
             room_id: room_id.to_string(),
             indexes: joined.iter().map(|t| t.index).collect(),
         };
+        // Messages for the family's other rooms, answered in this turn.
+        let _others_answered = self.answered_elsewhere(room_id, &others);
         let last_index = joined.iter().map(|t| t.index).fold(newest.index, u64::max);
 
         // Remember the conversation for the room's next message.
@@ -2396,6 +2589,60 @@ impl Shared {
         Ok(TurnEnd::Answered)
     }
 
+    /// Close out messages for other rooms of the family that a turn in
+    /// `room_id` was handed and answered: their journal and cooldown here,
+    /// their read positions when the returned guards drop.
+    fn answered_elsewhere(&self, room_id: &str, others: &[(String, Trigger)]) -> Vec<Answering> {
+        let mut rooms: Vec<&str> = Vec::new();
+        for (room, _) in others {
+            if !rooms.contains(&room.as_str()) {
+                rooms.push(room);
+            }
+        }
+        let sent = self
+            .live_sent
+            .lock()
+            .unwrap()
+            .get(room_id)
+            .cloned()
+            .unwrap_or_default();
+        rooms
+            .into_iter()
+            .map(|room| {
+                let mine: Vec<&Trigger> = others
+                    .iter()
+                    .filter(|(r, _)| r == room)
+                    .map(|(_, t)| t)
+                    .collect();
+                if sent.iter().any(|r| r == room) {
+                    self.buffer.lock().unwrap().mark_responded(room);
+                }
+                if let Some(last) = mine.last() {
+                    self.journal_append(
+                        room,
+                        &format!(
+                            "#{} from {} ({}): answered in the turn for {}{}",
+                            last.index,
+                            last.sender,
+                            short(&last.text, 60),
+                            room_id,
+                            if sent.iter().any(|r| r == room) {
+                                ""
+                            } else {
+                                ", nothing sent here"
+                            }
+                        ),
+                    );
+                }
+                Answering {
+                    offsets: Arc::clone(&self.offsets),
+                    room_id: room.to_string(),
+                    indexes: mine.iter().map(|t| t.index).collect(),
+                }
+            })
+            .collect()
+    }
+
     /// A turn in the room ended with `text`. Background work its live
     /// session still runs keeps the agent working there.
     fn status_end(&self, room_id: &str, text: &str) {
@@ -2403,7 +2650,7 @@ impl Shared {
             .live
             .lock()
             .unwrap()
-            .get(room_id)
+            .get(&self.live_key(room_id))
             .map_or(0, |s| s.background());
         if background > 0 {
             self.status.end(
@@ -2475,12 +2722,14 @@ impl Shared {
         expects_reply: bool,
     ) -> anyhow::Result<RunOutput> {
         let mandate_hash = cmd.mandate_hash.clone();
-        let live = self.live_session(room_id, cmd)?;
+        let key = self.live_key(room_id);
+        let live = self.live_session(&key, cmd)?;
         let timeout = Duration::from_secs(self.config.turn_timeout_secs.max(1));
+        self.write_send_scope(&key, room_id, expects_reply);
         let mut turn = match live.turn(prompt, timeout).await {
             Ok(t) => t,
             Err(e) => {
-                self.drop_live(room_id);
+                self.drop_live(&key);
                 return Err(e);
             }
         };
@@ -2488,7 +2737,8 @@ impl Shared {
         // turn that sent them nothing is asked once more, even when it sent
         // elsewhere. A turn only `system` started (a GitHub event) is not:
         // it wants action, often in another room, and asking again made the
-        // agent post the same PR review request twice.
+        // agent post the same PR review request twice. Decided per room the
+        // turn was for, messages handed to it meanwhile included.
         if !turn.answered(room_id) && !turn.sent_to.is_empty() {
             eprintln!(
                 "[nubi-agent] {} answered elsewhere ({})",
@@ -2496,19 +2746,42 @@ impl Shared {
                 turn.sent_to.join(", ")
             );
         }
-        if !turn.answered(room_id)
-            && expects_reply
-            && !self.runtime.live_output(&turn.result).is_error
-        {
+        let owed = self.rooms_owed_a_reply(&key, room_id, expects_reply);
+        let missing: Vec<&String> = owed.iter().filter(|r| !turn.answered(r)).collect();
+        if !missing.is_empty() && !self.runtime.live_output(&turn.result).is_error {
+            let names = missing
+                .iter()
+                .map(|r| r.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
             eprintln!(
                 "[nubi-agent] Nothing sent to {} yet, asking once more",
-                room_id
+                names
             );
-            let nudge = format!(
-                "[Nothing reached {room_id} this turn. If the message needs an answer, send it \
-                 now with nubi_send (room_id \"{room_id}\"). If it needs none, end your turn \
-                 without sending anything.]"
-            );
+            let nudge = match missing.as_slice() {
+                [room] => format!(
+                    "[Nothing reached {room} this turn. If the message needs an answer, send it \
+                     now with nubi_send (room_id \"{room}\"). If it needs none, end your turn \
+                     without sending anything.]"
+                ),
+                rooms => format!(
+                    "[Nothing reached {} this turn. If a message there needs an answer, send it \
+                     now with nubi_send to its own room ({}). If none does, end your turn \
+                     without sending anything.]",
+                    rooms
+                        .iter()
+                        .map(|r| r.as_str())
+                        .collect::<Vec<_>>()
+                        .join(" or "),
+                    rooms
+                        .iter()
+                        .map(|r| format!("room_id \"{r}\""))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+            };
+            // The nudge is about these rooms only.
+            self.write_send_scope(&key, room_id, true);
             match live.turn(&nudge, timeout).await {
                 Ok(next) => {
                     let mut sent = std::mem::take(&mut turn.sent_to);
@@ -2519,12 +2792,12 @@ impl Shared {
                     };
                 }
                 Err(e) => {
-                    self.drop_live(room_id);
+                    self.drop_live(&key);
                     return Err(e);
                 }
             }
-            if !turn.answered(room_id) {
-                eprintln!("[nubi-agent] {} left without an answer", room_id);
+            for room in owed.iter().filter(|r| !turn.answered(r)) {
+                eprintln!("[nubi-agent] {} left without an answer", room);
             }
         }
         self.live_sent
@@ -2543,8 +2816,31 @@ impl Shared {
         Ok(out)
     }
 
-    /// The room's live session, started (or restarted, when the system
-    /// prompt changed and nothing is running in it) as needed.
+    /// The rooms a live turn for `room_id` owes a reply: its own when a
+    /// person started it, and those of people's messages handed to it since.
+    fn rooms_owed_a_reply(&self, key: &str, room_id: &str, expects_reply: bool) -> Vec<String> {
+        let mut owed: Vec<String> = Vec::new();
+        if expects_reply {
+            owed.push(room_id.to_string());
+        }
+        if let Some(slot) = self.steering.lock().unwrap().get(key) {
+            let handed = slot
+                .joined
+                .iter()
+                .map(|t| (slot.room_id.as_str(), t))
+                .chain(slot.others.iter().map(|(r, t)| (r.as_str(), t)));
+            for (room, t) in handed {
+                if t.sender != "system" && !owed.iter().any(|r| r == room) {
+                    owed.push(room.to_string());
+                }
+            }
+        }
+        owed
+    }
+
+    /// The live session `room_id` names (a room, or in family scope a
+    /// family; see [`Self::live_key`]), started (or restarted, when the
+    /// system prompt changed and nothing is running in it) as needed.
     fn live_session(&self, room_id: &str, cmd: LiveCommand) -> anyhow::Result<Arc<LiveSession>> {
         // Decide under the lock, start the process outside it: turns in
         // other rooms, the pruner and the heartbeat all take this lock.
@@ -2646,8 +2942,14 @@ impl Shared {
             if let Some(id) = out.session_id.clone() {
                 self.record_session(&room_id, id, last);
             }
-            if turn.answered(&room_id) {
-                self.buffer.lock().unwrap().mark_responded(&room_id);
+            // The session's rooms it sent to (in family scope, any of the
+            // family's).
+            let mut marked: Vec<&String> = Vec::new();
+            for room in &turn.sent_to {
+                if !marked.contains(&room) && self.live_key(room) == room_id {
+                    marked.push(room);
+                    self.buffer.lock().unwrap().mark_responded(room);
+                }
             }
             let summary = if turn.sent_to.is_empty() {
                 "on its own: nothing sent".to_string()
@@ -2772,7 +3074,8 @@ impl Shared {
         });
 
         // Run the harness CLI, or hand the message to the room's live session
-        let result = match self.runtime.live_command(session) {
+        let scope = self.runtime.send_scope_file(&self.live_key(room_id));
+        let result = match self.runtime.live_command(session, scope.as_deref()) {
             Some(cmd) => self.live_run(room_id, prompt, cmd, expects_reply).await,
             None => self.runtime.run(prompt, session).await,
         };
@@ -2909,6 +3212,8 @@ mod tests {
         overlaps: Mutex<Vec<(String, String)>>,
         /// Run turns in this live session command instead of `run`.
         live_cmd: RwLock<Option<LiveCommand>>,
+        /// Write live sessions' send scopes here, as `<key>.json`.
+        scope_dir: RwLock<Option<PathBuf>>,
     }
 
     impl FakeState {
@@ -3046,8 +3351,16 @@ mod tests {
         fn supports_sessions(&self) -> bool {
             self.0.sessions_supported.load(Ordering::SeqCst)
         }
-        fn live_command(&self, _session: Option<&Session>) -> Option<LiveCommand> {
+        fn live_command(
+            &self,
+            _session: Option<&Session>,
+            _send_scope: Option<&Path>,
+        ) -> Option<LiveCommand> {
             self.0.live_cmd.read().unwrap().clone()
+        }
+        fn send_scope_file(&self, live_key: &str) -> Option<PathBuf> {
+            let dir = self.0.scope_dir.read().unwrap().clone()?;
+            Some(dir.join(format!("{live_key}.json")))
         }
         fn live_output(&self, result: &serde_json::Value) -> RunOutput {
             RunOutput {
@@ -4102,6 +4415,268 @@ done
         .await;
         assert_eq!(live_inputs(&dir).len(), 1, "nobody wrote to it again");
         assert!(engine.state().posts.is_empty());
+    }
+
+    /// A stand-in `claude` that answers each message in the room its
+    /// trigger names (`to=<room>;`), logging `<pid> <line>` so tests can tell
+    /// processes apart. With `steered`, its first turn runs a tool call and
+    /// takes up the next message inside it before answering both.
+    fn fake_family_cli(dir: &Path, steered: bool) -> LiveCommand {
+        let script = dir.join(if steered {
+            "fake-family-steered.sh"
+        } else {
+            "fake-family.sh"
+        });
+        let send = r#"room=$(printf '%s' "$line" | sed -n 's/.*to=\([^;]*\);.*/\1/p')
+  if [ -n "$room" ]; then printf '{"type":"assistant","message":{"content":[{"type":"tool_use","name":"mcp__nubi__nubi_send","input":{"room_id":"%s","text":"hi"}}]}}\n' "$room"; fi"#;
+        let take = r#"printf '%s %s\n' "$$" "$line" >> "$LOG"
+  printf '%s\n' "$line" | sed 's/^{/{"isReplay":true,/'"#;
+        let result =
+            r#"printf '{"type":"result","subtype":"success","result":"ok","session_id":"s1"}\n'"#;
+        let first = if steered {
+            format!(
+                r#"IFS= read -r line
+  {take}
+  first="$line"
+  printf '{{"type":"assistant","message":{{"content":[{{"type":"tool_use","name":"Bash","input":{{"command":"make"}}}}]}}}}\n'
+  IFS= read -r line
+  {take}
+  {send}
+  line="$first"
+  {send}
+  {result}
+"#
+            )
+        } else {
+            String::new()
+        };
+        fs::write(
+            &script,
+            format!("{first}while IFS= read -r line; do\n  {take}\n  {send}\n  {result}\ndone\n"),
+        )
+        .unwrap();
+        LiveCommand {
+            args: vec![script.to_string_lossy().into_owned()],
+            ..fake_live_cli(dir)
+        }
+    }
+
+    /// (pid, line) for every message the fake family CLIs read.
+    fn family_inputs(dir: &Path) -> Vec<(String, String)> {
+        live_inputs(dir)
+            .into_iter()
+            .filter_map(|l| l.split_once(' ').map(|(p, l)| (p.into(), l.into())))
+            .collect()
+    }
+
+    async fn settled(shared: &Shared) {
+        wait_until(|| shared.offsets.lock().unwrap().unanswered.is_empty()).await;
+        wait_until(|| shared.dispatch.lock().unwrap().active.is_empty()).await;
+    }
+
+    fn family_config() -> AgentConfig {
+        AgentConfig {
+            live_scope: LiveScope::Family,
+            ..AgentConfig::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn in_family_scope_a_room_and_its_threads_share_one_session() {
+        let engine = MockEngine::start(MockState::default()).await;
+        let (agent, fake) = agent(&engine, family_config()).await;
+        fake.sessions_supported.store(true, Ordering::SeqCst);
+        let dir = temp_workspace();
+        *fake.live_cmd.write().unwrap() = Some(fake_family_cli(&dir, false));
+        let shared = &agent.shared;
+
+        for (room, i) in [
+            ("general", 1),
+            ("thread.general.1", 2),
+            ("dm.aprido.support-bot", 3),
+        ] {
+            shared
+                .ingest(&sse(room, i, &format!("@support-bot to={room}; hi")))
+                .await
+                .unwrap();
+            settled(shared).await;
+        }
+
+        let inputs = family_inputs(&dir);
+        assert_eq!(inputs.len(), 3, "answered, no nudges: {inputs:?}");
+        assert_eq!(
+            inputs[0].0, inputs[1].0,
+            "the thread in the channel's process"
+        );
+        assert_ne!(inputs[0].0, inputs[2].0, "a DM is a family of its own");
+        let mut keys: Vec<String> = shared.live.lock().unwrap().keys().cloned().collect();
+        keys.sort();
+        assert_eq!(keys, vec!["dm.aprido.support-bot", "general"]);
+        // One saved conversation for the family, read positions per room.
+        let sessions = shared.sessions.lock().unwrap();
+        assert!(!sessions.contains_key("thread.general.1"));
+        let general = &sessions["general"];
+        assert_eq!(general.id, "s1");
+        assert_eq!(general.last_index, 1);
+        assert_eq!(general.rooms["thread.general.1"].last_index, 2);
+    }
+
+    #[tokio::test]
+    async fn in_room_scope_each_thread_keeps_its_own_session() {
+        let engine = MockEngine::start(MockState::default()).await;
+        let (agent, fake) = agent(&engine, AgentConfig::default()).await;
+        fake.sessions_supported.store(true, Ordering::SeqCst);
+        let dir = temp_workspace();
+        *fake.live_cmd.write().unwrap() = Some(fake_family_cli(&dir, false));
+        let shared = &agent.shared;
+        for (room, i) in [("general", 1), ("thread.general.1", 2)] {
+            shared
+                .ingest(&sse(room, i, &format!("@support-bot to={room}; hi")))
+                .await
+                .unwrap();
+            settled(shared).await;
+        }
+        let inputs = family_inputs(&dir);
+        assert_eq!(inputs.len(), 2, "{inputs:?}");
+        assert_ne!(inputs[0].0, inputs[1].0);
+        assert_eq!(shared.live.lock().unwrap().len(), 2);
+        let sessions = shared.sessions.lock().unwrap();
+        assert_eq!(sessions["thread.general.1"].last_index, 2);
+        assert!(sessions["general"].rooms.is_empty());
+    }
+
+    #[tokio::test]
+    async fn in_family_scope_a_thread_s_message_joins_the_channel_s_running_turn() {
+        let engine = MockEngine::start(MockState::default()).await;
+        let (agent, fake) = agent(&engine, family_config()).await;
+        fake.sessions_supported.store(true, Ordering::SeqCst);
+        let dir = temp_workspace();
+        *fake.live_cmd.write().unwrap() = Some(fake_family_cli(&dir, true));
+        let shared = &agent.shared;
+
+        shared
+            .ingest(&sse("general", 1, "@support-bot to=general; run the build"))
+            .await
+            .unwrap();
+        wait_until(|| {
+            shared.steering.lock().unwrap().contains_key("general")
+                && shared
+                    .live
+                    .lock()
+                    .unwrap()
+                    .get("general")
+                    .is_some_and(|s| s.busy())
+                && family_inputs(&dir).len() == 1
+        })
+        .await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // Another family is never handed to it.
+        assert!(!shared.steer("other", &trigger_at(9, "aprido", "hi")).await);
+
+        shared
+            .ingest(&sse(
+                "thread.general.1",
+                2,
+                "@support-bot to=thread.general.1; and here?",
+            ))
+            .await
+            .unwrap();
+        settled(shared).await;
+
+        let inputs = family_inputs(&dir);
+        assert_eq!(inputs.len(), 2, "one turn, no nudge: {inputs:?}");
+        assert_eq!(inputs[0].0, inputs[1].0);
+        assert!(inputs[1].1.contains("arrived while you were working"));
+        assert!(
+            inputs[1].1.contains("room thread.general.1"),
+            "{}",
+            inputs[1].1
+        );
+        assert!(shared.steering.lock().unwrap().is_empty());
+        let journal = shared.journal_tail("thread.general.1").join("\n");
+        assert!(
+            journal.contains("answered in the turn for general"),
+            "{journal}"
+        );
+        assert!(!journal.contains("nothing sent"), "{journal}");
+    }
+
+    #[tokio::test]
+    async fn a_thread_s_message_handed_to_a_failed_turn_goes_back_to_its_room() {
+        let engine = MockEngine::start(MockState::default()).await;
+        let (agent, fake) = agent(&engine, family_config()).await;
+        *fake.live_cmd.write().unwrap() = Some(fake_live_cli(&temp_workspace()));
+        let shared = &agent.shared;
+        {
+            let _slot = shared.start_steering("general", None);
+            shared
+                .steering
+                .lock()
+                .unwrap()
+                .get_mut("general")
+                .unwrap()
+                .others
+                .push(("thread.general.1".into(), trigger_at(2, "aprido", "here?")));
+            // Dropped without answered(): the turn did not finish.
+        }
+        assert_eq!(shared.requeue.lock().unwrap().len(), 1);
+        // Held so the worker it starts leaves it queued for us to see.
+        let _family = shared.enter_family("general").await;
+        agent.shared.flush_requeue();
+        let pending: Vec<u64> = shared.dispatch.lock().unwrap().pending["thread.general.1"]
+            .iter()
+            .map(|t| t.index)
+            .collect();
+        assert_eq!(pending, vec![2]);
+        assert!(shared
+            .dispatch
+            .lock()
+            .unwrap()
+            .active
+            .contains("thread.general.1"));
+    }
+
+    #[tokio::test]
+    async fn the_send_scope_is_the_family_for_people_and_anywhere_for_system() {
+        let engine = MockEngine::start(MockState::default()).await;
+        let (agent, fake) = agent(&engine, family_config()).await;
+        let dir = temp_workspace();
+        *fake.live_cmd.write().unwrap() = Some(fake_family_cli(&dir, false));
+        *fake.scope_dir.write().unwrap() = Some(dir.clone());
+        let shared = &agent.shared;
+        let read = |key: &str| -> serde_json::Value {
+            serde_json::from_str(&fs::read_to_string(dir.join(format!("{key}.json"))).unwrap())
+                .unwrap()
+        };
+
+        shared
+            .ingest(&sse(
+                "thread.general.4",
+                5,
+                "@support-bot to=thread.general.4; hi",
+            ))
+            .await
+            .unwrap();
+        settled(shared).await;
+        // Named after the family's session, written before the turn.
+        assert_eq!(
+            read("general")["allow"],
+            json!(["thread.general.4", "general", "thread.general.*"])
+        );
+
+        shared
+            .ingest(&sse_from(
+                "github",
+                6,
+                "system",
+                now_ms(),
+                "[GitHub] CI passed @support-bot to=pr-review;",
+            ))
+            .await
+            .unwrap();
+        settled(shared).await;
+        assert_eq!(read("github")["allow"], "*");
     }
 
     #[tokio::test]

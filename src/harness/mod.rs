@@ -285,13 +285,23 @@ pub trait Harness: Send + Sync {
 
     /// Arguments and env for a session that stays up between messages
     /// (see [`crate::live`]), when the CLI can run one. None by default.
+    ///
+    /// `send_scope`, when given, is the file the turn's send lock is written
+    /// to (see [`crate::send_guard`]); only a harness that answers
+    /// [`Self::send_guard`] registers the hook that reads it.
     fn live_invocation(
         &self,
         _settings: &Settings,
         _system_prompt: &str,
         _session: Option<&Session>,
+        _send_scope: Option<&Path>,
     ) -> Option<Invocation> {
         None
+    }
+
+    /// Whether its live sessions can enforce the send lock with a hook.
+    fn send_guard(&self) -> bool {
+        false
     }
 
     /// Pull the final answer out of what the CLI printed.
@@ -788,7 +798,7 @@ impl CliRuntime {
             && self.settings.mcp.is_some()
             && self
                 .harness
-                .live_invocation(&self.settings, "", None)
+                .live_invocation(&self.settings, "", None, None)
                 .is_some()
     }
 
@@ -1444,14 +1454,19 @@ impl AgentRuntime for CliRuntime {
         }
     }
 
-    fn live_command(&self, session: Option<&Session>) -> Option<crate::live::LiveCommand> {
+    fn live_command(
+        &self,
+        session: Option<&Session>,
+        send_scope: Option<&Path>,
+    ) -> Option<crate::live::LiveCommand> {
         if !self.live_enabled() {
             return None;
         }
         let (system_prompt, mandate_hash) = self.system_prompt_and_hash();
-        let inv = self
-            .harness
-            .live_invocation(&self.settings, &system_prompt, session)?;
+        let send_scope = send_scope.filter(|_| self.harness.send_guard());
+        let inv =
+            self.harness
+                .live_invocation(&self.settings, &system_prompt, session, send_scope)?;
         let mut env = inherited_env(
             std::env::vars_os(),
             self.harness.as_ref(),
@@ -1466,6 +1481,22 @@ impl AgentRuntime for CliRuntime {
             prompt_key: crate::live::prompt_key(&system_prompt),
             mandate_hash,
         })
+    }
+
+    fn live_enabled(&self) -> bool {
+        CliRuntime::live_enabled(self)
+    }
+
+    fn send_scope_file(&self, live_key: &str) -> Option<PathBuf> {
+        if !self.live_enabled() || !self.harness.send_guard() {
+            return None;
+        }
+        let name = if crate::agent::is_safe_path_segment(live_key) {
+            format!("{live_key}.json")
+        } else {
+            format!("{:016x}.json", crate::live::prompt_key(live_key))
+        };
+        Some(self.settings.state_dir().join("send-scope").join(name))
     }
 
     fn supports_mcp(&self) -> bool {
@@ -1961,7 +1992,7 @@ mod tests {
         s.compact_at_pct = Some(60);
         s.compact_window = Some(200_000);
         let live = claude::Claude
-            .live_invocation(&s, "SYS", None)
+            .live_invocation(&s, "SYS", None, None)
             .expect("claude has live sessions");
         assert_eq!(env(&live, "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"), Some("60"));
         assert_eq!(
@@ -1986,7 +2017,9 @@ mod tests {
         let inv = claude::Claude.invocation(&s, "SYS", "hi", None);
         assert_eq!(env(&inv, "ENABLE_TOOL_SEARCH"), Some("false"));
         assert_eq!(env(&inv, "ANTHROPIC_BASE_URL"), Some("http://gateway/llm"));
-        let live = claude::Claude.live_invocation(&s, "SYS", None).unwrap();
+        let live = claude::Claude
+            .live_invocation(&s, "SYS", None, None)
+            .unwrap();
         assert_eq!(env(&live, "ENABLE_TOOL_SEARCH"), Some("false"));
     }
 
@@ -2771,6 +2804,49 @@ mod tests {
     }
 
     #[test]
+    fn a_claude_live_session_gets_the_send_lock_hook() {
+        let mcp = Some(McpServer {
+            url: "http://mcp".into(),
+            token: "t".into(),
+        });
+        let rt = CliRuntime::new(HarnessKind::Claude, "bot")
+            .with_mcp(mcp.clone())
+            .with_live(true);
+        let scope = rt
+            .send_scope_file("thread.general.4")
+            .expect("claude has one");
+        assert!(
+            scope.ends_with("send-scope/thread.general.4.json"),
+            "{scope:?}"
+        );
+        assert_eq!(
+            rt.send_scope_file("a/b").unwrap().parent(),
+            scope.parent(),
+            "an unsafe key stays in the directory"
+        );
+        let cmd = rt.live_command(None, Some(&scope)).unwrap();
+        let at = cmd
+            .args
+            .iter()
+            .position(|a| a == "--settings")
+            .expect("--settings");
+        let settings: serde_json::Value = serde_json::from_str(&cmd.args[at + 1]).unwrap();
+        let hook = &settings["hooks"]["PreToolUse"][0];
+        assert_eq!(hook["matcher"], "mcp__nubi__nubi_send");
+        let command = hook["hooks"][0]["command"].as_str().unwrap();
+        assert!(command.contains("hook pre-tool-use --scope"), "{command}");
+        assert!(command.contains(&*scope.to_string_lossy()), "{command}");
+        // Without a scope file, no hook.
+        let cmd = rt.live_command(None, None).unwrap();
+        assert!(!cmd.args.iter().any(|a| a == "--settings"));
+        // Other harnesses run no live session, so no lock either.
+        let codex = CliRuntime::new(HarnessKind::Codex, "bot")
+            .with_mcp(mcp)
+            .with_live(true);
+        assert!(codex.send_scope_file("general").is_none());
+    }
+
+    #[test]
     fn live_sessions_need_the_flag_and_an_mcp_server() {
         let mcp = || {
             Some(McpServer {
@@ -2784,7 +2860,7 @@ mod tests {
         let rt = CliRuntime::new(HarnessKind::Claude, "bot")
             .with_mcp(mcp())
             .with_live(true);
-        let cmd = rt.live_command(None).expect("live");
+        let cmd = rt.live_command(None, None).expect("live");
         assert_eq!(cmd.program, "claude");
         let args = cmd.args.join(" ");
         assert!(args.contains("--input-format stream-json"), "{args}");
@@ -2798,17 +2874,17 @@ mod tests {
 
         // No MCP server: nothing to answer with, so per-turn runs as before.
         let rt = CliRuntime::new(HarnessKind::Claude, "bot").with_live(true);
-        assert!(rt.live_command(None).is_none());
+        assert!(rt.live_command(None, None).is_none());
         assert!(!rt.build_system_prompt().contains("Waiting on something"));
         // Not asked for.
         let rt = CliRuntime::new(HarnessKind::Claude, "bot").with_mcp(mcp());
-        assert!(rt.live_command(None).is_none());
+        assert!(rt.live_command(None, None).is_none());
         assert!(rt.build_system_prompt().contains("set post to false"));
         // A harness without live sessions.
         let rt = CliRuntime::new(HarnessKind::Codex, "bot")
             .with_mcp(mcp())
             .with_live(true);
-        assert!(rt.live_command(None).is_none());
+        assert!(rt.live_command(None, None).is_none());
     }
 
     #[test]
