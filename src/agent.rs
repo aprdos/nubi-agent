@@ -143,6 +143,10 @@ pub struct AgentConfig {
     pub live_idle_secs: u64,
     /// What one live session serves: a room, or a room with its threads.
     pub live_scope: LiveScope,
+    /// Hold a person's turn to sending within its room's family (a Claude
+    /// Code hook on nubi_send). Off by default: which messages wake the
+    /// agent is guarded on the way in; where it sends is up to it.
+    pub send_lock: bool,
     /// Told every minute while the agent is working (a turn, or background
     /// work in a live session), so a launcher that stops idle agents doesn't
     /// stop it mid-task. Sent with `heartbeat_token` as a bearer token.
@@ -182,6 +186,7 @@ impl Default for AgentConfig {
             live_max: 3,
             live_idle_secs: 900,
             live_scope: LiveScope::Room,
+            send_lock: false,
             heartbeat_url: None,
             heartbeat_token: None,
         }
@@ -2016,10 +2021,19 @@ impl Shared {
         }
     }
 
+    /// Where the live session `key` keeps its send lock, when the lock is on
+    /// (`send_lock`) and the harness can enforce it.
+    fn send_scope_file(&self, key: &str) -> Option<std::path::PathBuf> {
+        if !self.config.send_lock {
+            return None;
+        }
+        self.runtime.send_scope_file(key)
+    }
+
     /// Write the send lock for the next turn of the live session `key`:
     /// the room's family, or anywhere for a turn only `system` started.
     fn write_send_scope(&self, key: &str, room_id: &str, expects_reply: bool) {
-        let Some(path) = self.runtime.send_scope_file(key) else {
+        let Some(path) = self.send_scope_file(key) else {
             return;
         };
         let scope = crate::send_guard::scope(room_id, &family_of(room_id), expects_reply);
@@ -3074,7 +3088,7 @@ impl Shared {
         });
 
         // Run the harness CLI, or hand the message to the room's live session
-        let scope = self.runtime.send_scope_file(&self.live_key(room_id));
+        let scope = self.send_scope_file(&self.live_key(room_id));
         let result = match self.runtime.live_command(session, scope.as_deref()) {
             Some(cmd) => self.live_run(room_id, prompt, cmd, expects_reply).await,
             None => self.runtime.run(prompt, session).await,
@@ -4640,7 +4654,11 @@ done
     #[tokio::test]
     async fn the_send_scope_is_the_family_for_people_and_anywhere_for_system() {
         let engine = MockEngine::start(MockState::default()).await;
-        let (agent, fake) = agent(&engine, family_config()).await;
+        let config = AgentConfig {
+            send_lock: true,
+            ..family_config()
+        };
+        let (agent, fake) = agent(&engine, config).await;
         let dir = temp_workspace();
         *fake.live_cmd.write().unwrap() = Some(fake_family_cli(&dir, false));
         *fake.scope_dir.write().unwrap() = Some(dir.clone());
@@ -4677,6 +4695,30 @@ done
             .unwrap();
         settled(shared).await;
         assert_eq!(read("github")["allow"], "*");
+    }
+
+    #[tokio::test]
+    async fn without_the_send_lock_no_scope_is_written_and_the_agent_sends_anywhere() {
+        let engine = MockEngine::start(MockState::default()).await;
+        let (agent, fake) = agent(&engine, family_config()).await;
+        let dir = temp_workspace();
+        *fake.live_cmd.write().unwrap() = Some(fake_family_cli(&dir, false));
+        *fake.scope_dir.write().unwrap() = Some(dir.clone());
+        let shared = &agent.shared;
+
+        shared
+            .ingest(&sse(
+                "thread.general.4",
+                5,
+                "@support-bot to=thread.general.4; hi",
+            ))
+            .await
+            .unwrap();
+        settled(shared).await;
+        assert!(
+            !dir.join("general.json").exists(),
+            "no send lock without --send-lock"
+        );
     }
 
     #[tokio::test]

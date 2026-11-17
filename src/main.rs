@@ -151,6 +151,12 @@ struct Args {
     )]
     live_scope: LiveScope,
 
+    /// Hold a turn a person started to sending within its room's family
+    /// (the room, its parent, their threads). Off by default: the agent may
+    /// send anywhere; only what wakes it is guarded
+    #[arg(long, env = "NUBI_SEND_LOCK", default_value_t = false, action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true", help_heading = "Tuning")]
+    send_lock: bool,
+
     /// POSTed every minute while the agent is working, for a launcher that
     /// stops idle agents
     #[arg(long, env = "NUBI_HEARTBEAT_URL", help_heading = "Agent")]
@@ -390,6 +396,7 @@ async fn main() -> anyhow::Result<()> {
         live_max: args.live_max,
         live_idle_secs: args.live_idle_secs,
         live_scope: args.live_scope,
+        send_lock: args.send_lock,
         heartbeat_url: args.heartbeat_url,
         heartbeat_token: args.heartbeat_token,
         context_size: args.context_size,
