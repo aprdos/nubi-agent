@@ -7,11 +7,12 @@ pub mod mandate;
 mod mock_engine;
 pub mod nubi;
 pub mod runtime;
+pub mod send_guard;
 pub mod skills;
 pub mod status;
 pub mod types;
 
-pub use agent::{Agent, AgentConfig};
+pub use agent::{Agent, AgentConfig, LiveScope};
 pub use buffer::{BufferedMessage, RoomBuffer};
 pub use mandate::{Mandate, MandateLoader, MandateSkill};
 pub use nubi::NubiClient;

@@ -1,6 +1,6 @@
 use clap::Parser;
 use nubi_agent::harness::HarnessKind;
-use nubi_agent::{Agent, AgentConfig, NubiClient};
+use nubi_agent::{Agent, AgentConfig, LiveScope, NubiClient};
 
 /// The hosted engine. A token from the nubi app belongs to it.
 const HOSTED_ENGINE: &str = "https://api.nubi.chat";
@@ -140,6 +140,17 @@ struct Args {
     )]
     live_idle_secs: u64,
 
+    /// What one live session serves: `room` (each room and each thread its
+    /// own) or `family` (a room and its threads share one)
+    #[arg(
+        long,
+        env = "NUBI_LIVE_SCOPE",
+        value_enum,
+        default_value_t = LiveScope::Room,
+        help_heading = "Tuning"
+    )]
+    live_scope: LiveScope,
+
     /// POSTed every minute while the agent is working, for a launcher that
     /// stops idle agents
     #[arg(long, env = "NUBI_HEARTBEAT_URL", help_heading = "Agent")]
@@ -274,8 +285,49 @@ fn default_mcp_url(engine_url: &str) -> String {
     format!("{scheme}://{host}:8089/mcp")
 }
 
+// `nubi-agent hook ...`: run by the coding CLI, not by people. Kept out of
+// `Args` so it never needs a token or touches the engine.
+#[derive(Parser)]
+#[command(
+    name = "nubi-agent hook",
+    bin_name = "nubi-agent hook",
+    about = "Hooks the coding CLI runs (registered by nubi-agent itself)"
+)]
+struct HookArgs {
+    #[command(subcommand)]
+    event: HookEvent,
+}
+
+#[derive(clap::Subcommand)]
+enum HookEvent {
+    /// Claude Code's PreToolUse hook: refuse a nubi_send to a room outside
+    /// the turn's scope (exit 2, the reason on stderr)
+    PreToolUse {
+        /// The scope file nubi-agent writes before each turn
+        #[arg(long)]
+        scope: std::path::PathBuf,
+    },
+}
+
+fn run_hook(argv: Vec<std::ffi::OsString>) -> i32 {
+    let args = HookArgs::parse_from(argv);
+    match args.event {
+        HookEvent::PreToolUse { scope } => {
+            let (code, msg) = nubi_agent::send_guard::pre_tool_use(&scope, std::io::stdin().lock());
+            if let Some(msg) = msg {
+                eprintln!("{msg}");
+            }
+            code
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    let argv: Vec<std::ffi::OsString> = std::env::args_os().collect();
+    if argv.get(1).is_some_and(|a| a == "hook") {
+        std::process::exit(run_hook(argv[1..].to_vec()));
+    }
     let args = Args::parse();
 
     let Some(token) = args.token.filter(|t| !t.trim().is_empty()) else {
@@ -337,6 +389,7 @@ async fn main() -> anyhow::Result<()> {
         live_sessions: args.live_sessions && !args.no_live_sessions,
         live_max: args.live_max,
         live_idle_secs: args.live_idle_secs,
+        live_scope: args.live_scope,
         heartbeat_url: args.heartbeat_url,
         heartbeat_token: args.heartbeat_token,
         context_size: args.context_size,

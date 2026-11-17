@@ -168,6 +168,7 @@ impl Harness for Claude {
         settings: &Settings,
         system_prompt: &str,
         session: Option<&Session>,
+        send_scope: Option<&Path>,
     ) -> Option<Invocation> {
         let mut inv = Invocation::default();
         inv.arg("-p");
@@ -178,7 +179,22 @@ impl Harness for Claude {
         // is how a turn we started is told from one it started itself.
         inv.arg("--replay-user-messages");
         Self::common(&mut inv, settings, system_prompt, session);
+        // The send lock: a PreToolUse hook (this binary) checks every
+        // nubi_send against the scope file written before each turn.
+        if let Some(scope) = send_scope {
+            match std::env::current_exe() {
+                Ok(exe) => {
+                    inv.arg("--settings")
+                        .arg(crate::send_guard::hook_settings(&exe, scope));
+                }
+                Err(e) => eprintln!("[nubi-agent] No send lock: cannot locate nubi-agent ({e})"),
+            }
+        }
         Some(inv)
+    }
+
+    fn send_guard(&self) -> bool {
+        true
     }
 
     fn watch(&self) -> Option<Box<dyn OutputWatch>> {

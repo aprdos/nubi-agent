@@ -164,7 +164,25 @@ pub trait AgentRuntime: Send + Sync {
 
     /// How to start a session that stays up for a room (see [`crate::live`]),
     /// when this runtime runs them. None: every turn is a [`Self::run`].
-    fn live_command(&self, _session: Option<&Session>) -> Option<crate::live::LiveCommand> {
+    ///
+    /// `send_scope` is the file the turn's send lock is written to (see
+    /// [`Self::send_scope_file`]).
+    fn live_command(
+        &self,
+        _session: Option<&Session>,
+        _send_scope: Option<&std::path::Path>,
+    ) -> Option<crate::live::LiveCommand> {
+        None
+    }
+
+    /// Whether turns run in live sessions at all.
+    fn live_enabled(&self) -> bool {
+        self.live_command(None, None).is_some()
+    }
+
+    /// Where the send lock of the live session `live_key` is written before
+    /// each turn (see [`crate::send_guard`]), when this runtime enforces one.
+    fn send_scope_file(&self, _live_key: &str) -> Option<std::path::PathBuf> {
         None
     }
 

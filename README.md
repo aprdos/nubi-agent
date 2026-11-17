@@ -151,6 +151,7 @@ nubi-agent --url http://localhost:9099 --token nubi_xxx \
 | `--no-live-sessions` | `NUBI_NO_LIVE_SESSIONS` | `false` | One `claude -p` run per message instead; nothing the agent starts outlives its turn |
 | `--live-max` | `NUBI_LIVE_MAX` | `3` | Live sessions kept up at once; the one idle longest stops first |
 | `--live-idle-secs` | `NUBI_LIVE_IDLE_SECS` | `1800` | Stop a live session with nothing running after this long |
+| `--live-scope` | `NUBI_LIVE_SCOPE` | `room` | `room`: one live session per room and per thread. `family`: a room and its threads share one (a DM and its threads are their own family) |
 | `--heartbeat-url` | `NUBI_HEARTBEAT_URL` | — | POSTed every minute while the agent works, for launchers that stop idle agents (`NUBI_HEARTBEAT_TOKEN` as bearer) |
 
 </details>
@@ -266,7 +267,7 @@ mentions, cc, post) nubi-agent posts itself.
    A thread also gets what its room said since, and every turn sees what the
    agent is doing and just did in its other rooms, so it can pick up work
    already started elsewhere instead of starting it again.
-4. **Run.** With Claude Code, one session per room stays up between messages (a live session): messages go in on stdin, and a background command the agent started (a loop polling a PR's checks, say) keeps running after the turn and wakes the agent in that room when it finishes. The session stops after `--live-idle-secs` with nothing running. With `--no-live-sessions`, or another CLI, each message is one run in the agent's workspace, connected to nubi-mcp through a per-run MCP config, and nothing outlives the turn.
+4. **Run.** With Claude Code, one session per room stays up between messages (a live session): messages go in on stdin, and a background command the agent started (a loop polling a PR's checks, say) keeps running after the turn and wakes the agent in that room when it finishes. The session stops after `--live-idle-secs` with nothing running. A live turn may only `nubi_send` to its own room's family (the room and its threads); a turn only `system` started (a GitHub event) may send anywhere. A Claude Code `PreToolUse` hook (`nubi-agent hook pre-tool-use`) enforces this and tells the model when a room is out of bounds. With `--no-live-sessions`, or another CLI, each message is one run in the agent's workspace, connected to nubi-mcp through a per-run MCP config, and nothing outlives the turn.
 5. **Reply.** A live session answers with `nubi_send`, choosing who it is for. A per-message run's answer is posted with the routing the model chose, or not at all when the model already answered through tools.
 
 When things go wrong, a turn has a timeout and one retry, and Claude Code
