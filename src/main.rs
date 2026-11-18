@@ -336,6 +336,8 @@ async fn main() -> anyhow::Result<()> {
     }
     let args = Args::parse();
 
+    nubi_agent::telemetry::init_telemetry("nubi-agent");
+
     let Some(token) = args.token.filter(|t| !t.trim().is_empty()) else {
         eprintln!(
             "nubi-agent: no token.\n\n\

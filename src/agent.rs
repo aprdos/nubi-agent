@@ -2717,6 +2717,12 @@ impl Shared {
         out: Option<&RunOutput>,
         session: &str,
     ) {
+        crate::telemetry::record_turn(
+            &format!("{:?}", self.config.harness).to_lowercase(),
+            outcome.as_str(),
+            Duration::from_millis(elapsed_ms),
+        );
+
         let mut line = format!(
             "[nubi-agent] turn room={} idx={} outcome={} runs={} elapsed_ms={} session={}",
             room_id,

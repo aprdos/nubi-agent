@@ -365,12 +365,14 @@ impl NubiClient {
                 Ok(resp) => {
                     let status = resp.status();
                     if status.is_success() {
+                        crate::telemetry::record_nubi_request("POST", &status.as_u16().to_string());
                         return Ok(());
                     }
                     wait = retry_after(&resp);
                     let body = short(&resp.text().await.unwrap_or_default());
                     last_err = format!("{} - {}", status, body);
                     if !retryable(status) {
+                        crate::telemetry::record_nubi_request("POST", &status.as_u16().to_string());
                         return Err(
                             Refused(format!("Post to {} refused: {}", room_id, last_err)).into(),
                         );
@@ -393,6 +395,7 @@ impl NubiClient {
             }
         }
 
+        crate::telemetry::record_nubi_request("POST", "error");
         anyhow::bail!("Failed to post message to {}: {}", room_id, last_err)
     }
 
