@@ -9,7 +9,7 @@
 use reqwest::{Client, StatusCode};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 /// Whether the agent may use skills outside its mandate.
@@ -322,7 +322,7 @@ pub struct MandateLoader {
     url: String,
     token: String,
     /// The last good body and the ETag it came with.
-    cached: Mutex<Option<(String, Mandate)>>,
+    cached: Mutex<Option<(String, Arc<Mandate>)>>,
 }
 
 impl MandateLoader {
@@ -346,7 +346,7 @@ impl MandateLoader {
     }
 
     /// The cached mandate, if the last fetch found one.
-    pub fn current(&self) -> Option<Mandate> {
+    pub fn current(&self) -> Option<Arc<Mandate>> {
         self.cached.lock().unwrap().as_ref().map(|(_, m)| m.clone())
     }
 
@@ -407,7 +407,7 @@ impl MandateLoader {
                     serde_json::from_str(&body).map_err(|e| FetchError::Parse(e.to_string()))?;
                 // Echo back whatever the server sent; quote the hash otherwise.
                 let etag = header_etag.unwrap_or_else(|| format!("\"{}\"", mandate.hash));
-                *self.cached.lock().unwrap() = Some((etag, mandate));
+                *self.cached.lock().unwrap() = Some((etag, Arc::new(mandate)));
                 Ok(Fetched::Updated)
             }
             status => {
