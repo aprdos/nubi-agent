@@ -2287,6 +2287,7 @@ impl Shared {
 
     /// One turn: run the harness for every pending message in the room, post
     /// what it says, and tell the room when that could not be done.
+    #[tracing::instrument(name = "agent.turn", skip_all, fields(room = %room_id, harness = ?self.config.harness))]
     async fn reply(&self, room_id: &str, triggers: &[Trigger]) -> anyhow::Result<TurnEnd> {
         let Some(newest) = triggers.last() else {
             return Ok(TurnEnd::Answered);

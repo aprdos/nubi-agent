@@ -345,6 +345,7 @@ impl NubiClient {
 
     /// Send a built message. Retried on transport failures, 5xx and 429
     /// (after `Retry-After` when given); any other refusal is a [`Refused`].
+    #[tracing::instrument(name = "agent.nubi.request", skip_all, fields(method = "POST", room = %room_id))]
     pub async fn send(&self, room_id: &str, msg: &SendMessage) -> anyhow::Result<()> {
         let url = format!(
             "{}/v1/spaces/{}/rooms/{}/messages",
@@ -473,10 +474,12 @@ impl NubiClient {
 
         if !resp.status().is_success() {
             let status = resp.status();
+            crate::telemetry::record_nubi_request("POST", &status.as_u16().to_string());
             let body = resp.text().await.unwrap_or_default();
             anyhow::bail!("Failed to commit offset: {} - {}", status, body);
         }
 
+        crate::telemetry::record_nubi_request("POST", &resp.status().as_u16().to_string());
         Ok(resp.json::<CommitResp>().await?.committed)
     }
 
@@ -638,10 +641,12 @@ impl NubiClient {
 
         if !resp.status().is_success() {
             let status = resp.status();
+            crate::telemetry::record_nubi_request("POST", &status.as_u16().to_string());
             let body = resp.text().await.unwrap_or_default();
             anyhow::bail!("Failed to set typing: {} - {}", status, body);
         }
 
+        crate::telemetry::record_nubi_request("POST", "200");
         Ok(())
     }
 
@@ -668,10 +673,12 @@ impl NubiClient {
 
         if !resp.status().is_success() {
             let status = resp.status();
+            crate::telemetry::record_nubi_request("POST", &status.as_u16().to_string());
             let body = resp.text().await.unwrap_or_default();
             anyhow::bail!("Failed to set status: {} - {}", status, body);
         }
 
+        crate::telemetry::record_nubi_request("POST", "200");
         Ok(())
     }
 }
