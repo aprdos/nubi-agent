@@ -2986,6 +2986,8 @@ impl Shared {
     /// What they had to say went out with nubi_send.
     async fn live_turns(self: Arc<Self>, mut rx: mpsc::UnboundedReceiver<(String, LiveTurn)>) {
         while let Some((room_id, turn)) = rx.recv().await {
+            let _span =
+                tracing::info_span!("agent.turn", room = %room_id, source = "live").entered();
             let out = self.runtime.live_output(&turn.result);
             let last = self.session_last_index(&room_id);
             if let Some(id) = out.session_id.clone() {
