@@ -23,7 +23,8 @@ pub fn init_telemetry(service_name: &str) {
             ]))
             .build();
 
-        let tracer = opentelemetry::trace::TracerProvider::tracer(&provider, service_name.to_string());
+        let tracer =
+            opentelemetry::trace::TracerProvider::tracer(&provider, service_name.to_string());
         let otel_layer = tracing_opentelemetry::OpenTelemetryLayer::new(tracer);
 
         registry.with(otel_layer).init();
@@ -38,8 +39,11 @@ pub fn record_turn(harness: &str, result: &str, duration: Duration) {
         ("result", result.to_string()),
     ];
     metrics::counter!("nubi_agent_turns_total", &labels).increment(1);
-    metrics::histogram!("nubi_agent_turn_duration_seconds", &[("harness", harness.to_string())])
-        .record(duration.as_secs_f64());
+    metrics::histogram!(
+        "nubi_agent_turn_duration_seconds",
+        &[("harness", harness.to_string())]
+    )
+    .record(duration.as_secs_f64());
 }
 
 pub fn record_nubi_request(method: &str, status: &str) {
