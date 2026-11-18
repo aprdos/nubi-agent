@@ -11,10 +11,17 @@ pub fn init_telemetry(service_name: &str) {
     let registry = tracing_subscriber::registry().with(filter).with(fmt_layer);
 
     if std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT").is_ok() {
-        let exporter = opentelemetry_otlp::SpanExporter::builder()
+        let exporter = match opentelemetry_otlp::SpanExporter::builder()
             .with_tonic()
             .build()
-            .expect("failed to create OTLP span exporter");
+        {
+            Ok(e) => e,
+            Err(e) => {
+                tracing::warn!("OTel span exporter failed to initialize, tracing disabled: {e}");
+                registry.init();
+                return;
+            }
+        };
 
         let provider = opentelemetry_sdk::trace::TracerProvider::builder()
             .with_batch_exporter(exporter, opentelemetry_sdk::runtime::Tokio)
@@ -25,6 +32,7 @@ pub fn init_telemetry(service_name: &str) {
 
         let tracer =
             opentelemetry::trace::TracerProvider::tracer(&provider, service_name.to_string());
+        opentelemetry::global::set_tracer_provider(provider);
         let otel_layer = tracing_opentelemetry::OpenTelemetryLayer::new(tracer);
 
         registry.with(otel_layer).init();
