@@ -352,6 +352,7 @@ impl NubiClient {
         );
 
         let mut last_err = String::new();
+        let mut last_status: Option<u16> = None;
         let mut wait: Option<Duration> = None;
         for attempt in 1..=POST_ATTEMPTS {
             match self
@@ -368,6 +369,7 @@ impl NubiClient {
                         crate::telemetry::record_nubi_request("POST", &status.as_u16().to_string());
                         return Ok(());
                     }
+                    last_status = Some(status.as_u16());
                     wait = retry_after(&resp);
                     let body = short(&resp.text().await.unwrap_or_default());
                     last_err = format!("{} - {}", status, body);
@@ -378,7 +380,10 @@ impl NubiClient {
                         );
                     }
                 }
-                Err(e) => last_err = e.to_string(),
+                Err(e) => {
+                    last_status = None;
+                    last_err = e.to_string();
+                }
             }
 
             if attempt < POST_ATTEMPTS {
@@ -395,7 +400,10 @@ impl NubiClient {
             }
         }
 
-        crate::telemetry::record_nubi_request("POST", "error");
+        let status_label = last_status
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| "transport_error".to_string());
+        crate::telemetry::record_nubi_request("POST", &status_label);
         anyhow::bail!("Failed to post message to {}: {}", room_id, last_err)
     }
 
