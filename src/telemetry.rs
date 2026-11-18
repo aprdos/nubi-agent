@@ -134,7 +134,10 @@ mod tests {
     }
 
     fn find_field<'a>(fields: &'a [(String, String)], name: &str) -> Option<&'a str> {
-        fields.iter().find(|(k, _)| k == name).map(|(_, v)| v.as_str())
+        fields
+            .iter()
+            .find(|(k, _)| k == name)
+            .map(|(_, v)| v.as_str())
     }
 
     #[test]
