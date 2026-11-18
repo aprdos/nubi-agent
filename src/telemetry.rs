@@ -64,16 +64,117 @@ pub fn record_nubi_request(method: &str, status: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Arc, Mutex};
+    use tracing::subscriber::with_default;
+    use tracing_subscriber::layer::SubscriberExt;
 
-    #[test]
-    fn record_turn_does_not_panic() {
-        record_turn("claude", "posted", Duration::from_millis(500));
-        record_turn("codex", "failed", Duration::from_millis(100));
+    #[derive(Clone, Default)]
+    struct CapturedEvent {
+        message: String,
+        fields: Vec<(String, String)>,
+    }
+
+    struct CaptureLayer {
+        events: Arc<Mutex<Vec<CapturedEvent>>>,
+    }
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for CaptureLayer {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            let mut visitor = FieldVisitor::default();
+            event.record(&mut visitor);
+            self.events.lock().unwrap().push(CapturedEvent {
+                message: visitor.message,
+                fields: visitor.fields,
+            });
+        }
+    }
+
+    #[derive(Default)]
+    struct FieldVisitor {
+        message: String,
+        fields: Vec<(String, String)>,
+    }
+
+    impl tracing::field::Visit for FieldVisitor {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            if field.name() == "message" {
+                self.message = format!("{:?}", value);
+            } else {
+                self.fields
+                    .push((field.name().to_string(), format!("{:?}", value)));
+            }
+        }
+
+        fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
+            self.fields
+                .push((field.name().to_string(), value.to_string()));
+        }
+
+        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+            if field.name() == "message" {
+                self.message = value.to_string();
+            } else {
+                self.fields
+                    .push((field.name().to_string(), value.to_string()));
+            }
+        }
+    }
+
+    fn capture_subscriber() -> (impl tracing::Subscriber, Arc<Mutex<Vec<CapturedEvent>>>) {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let layer = CaptureLayer {
+            events: events.clone(),
+        };
+        let subscriber = tracing_subscriber::registry().with(layer);
+        (subscriber, events)
+    }
+
+    fn find_field<'a>(fields: &'a [(String, String)], name: &str) -> Option<&'a str> {
+        fields.iter().find(|(k, _)| k == name).map(|(_, v)| v.as_str())
     }
 
     #[test]
-    fn record_nubi_request_does_not_panic() {
-        record_nubi_request("POST", "200");
-        record_nubi_request("GET", "500");
+    fn record_turn_emits_harness_result_and_elapsed() {
+        let (sub, events) = capture_subscriber();
+        with_default(sub, || {
+            record_turn("claude", "posted", Duration::from_millis(500));
+        });
+        let captured = events.lock().unwrap();
+        assert_eq!(captured.len(), 1);
+        assert_eq!(captured[0].message, "turn.complete");
+        assert_eq!(find_field(&captured[0].fields, "harness"), Some("claude"));
+        assert_eq!(find_field(&captured[0].fields, "result"), Some("posted"));
+        assert_eq!(find_field(&captured[0].fields, "elapsed_ms"), Some("500"));
+    }
+
+    #[test]
+    fn record_nubi_request_emits_method_and_status() {
+        let (sub, events) = capture_subscriber();
+        with_default(sub, || {
+            record_nubi_request("POST", "503");
+        });
+        let captured = events.lock().unwrap();
+        assert_eq!(captured.len(), 1);
+        assert_eq!(captured[0].message, "nubi.request");
+        assert_eq!(find_field(&captured[0].fields, "method"), Some("POST"));
+        assert_eq!(find_field(&captured[0].fields, "status"), Some("503"));
+    }
+
+    #[test]
+    fn record_nubi_request_transport_error_label() {
+        let (sub, events) = capture_subscriber();
+        with_default(sub, || {
+            record_nubi_request("POST", "transport_error");
+        });
+        let captured = events.lock().unwrap();
+        assert_eq!(captured.len(), 1);
+        assert_eq!(
+            find_field(&captured[0].fields, "status"),
+            Some("transport_error")
+        );
     }
 }

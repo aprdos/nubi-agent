@@ -461,7 +461,7 @@ impl NubiClient {
     /// The server clamps monotonically, so committing 0 reads back the current
     /// offset without moving it — that is how a cold room is detected.
     pub async fn commit_offset(&self, room_id: &str, index: u64) -> anyhow::Result<u64> {
-        let resp = self
+        let resp = match self
             .client
             .post(format!(
                 "{}/v1/spaces/{}/rooms/{}/offset",
@@ -470,7 +470,14 @@ impl NubiClient {
             .header("Authorization", format!("Bearer {}", self.token))
             .json(&serde_json::json!({ "index": index }))
             .send()
-            .await?;
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                crate::telemetry::record_nubi_request("POST", "transport_error");
+                return Err(e.into());
+            }
+        };
 
         if !resp.status().is_success() {
             let status = resp.status();
@@ -628,7 +635,7 @@ impl NubiClient {
 
     /// Set typing status in a room
     pub async fn set_typing(&self, room_id: &str, typing: bool) -> anyhow::Result<()> {
-        let resp = self
+        let resp = match self
             .client
             .post(format!(
                 "{}/v1/spaces/{}/rooms/{}/typing",
@@ -637,7 +644,14 @@ impl NubiClient {
             .header("Authorization", format!("Bearer {}", self.token))
             .json(&serde_json::json!({ "typing": typing }))
             .send()
-            .await?;
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                crate::telemetry::record_nubi_request("POST", "transport_error");
+                return Err(e.into());
+            }
+        };
 
         if !resp.status().is_success() {
             let status = resp.status();
@@ -659,7 +673,7 @@ impl NubiClient {
         room_id: Option<&str>,
         text: &str,
     ) -> anyhow::Result<()> {
-        let resp = self
+        let resp = match self
             .client
             .post(format!(
                 "{}/v1/spaces/{}/agents/{}/status",
@@ -669,7 +683,14 @@ impl NubiClient {
             .timeout(std::time::Duration::from_secs(10))
             .json(&serde_json::json!({ "state": state, "room_id": room_id, "text": text }))
             .send()
-            .await?;
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                crate::telemetry::record_nubi_request("POST", "transport_error");
+                return Err(e.into());
+            }
+        };
 
         if !resp.status().is_success() {
             let status = resp.status();
