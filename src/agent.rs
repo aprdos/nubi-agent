@@ -1112,10 +1112,11 @@ impl Shared {
     /// Inject the cached mandate and the ad-hoc skills that survive it.
     fn apply_mandate(&self) -> anyhow::Result<()> {
         let mandate = self.mandate.as_ref().and_then(MandateLoader::current);
+        let mandate_ref = mandate.as_deref();
         let allow_local =
-            !self.config.no_local_skills && !mandate.as_ref().is_some_and(Mandate::is_mandate_only);
-        let adhoc = adhoc_skills(&self.adhoc_skills, mandate.as_ref(), allow_local);
-        self.runtime.inject_mandate(mandate.as_ref(), &adhoc)
+            !self.config.no_local_skills && !mandate_ref.is_some_and(Mandate::is_mandate_only);
+        let adhoc = adhoc_skills(&self.adhoc_skills, mandate_ref, allow_local);
+        self.runtime.inject_mandate(mandate_ref, &adhoc)
     }
 
     /// Fetch the mandate and re-inject it when needed. `conditional` sends
