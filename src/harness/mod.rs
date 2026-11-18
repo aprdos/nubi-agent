@@ -2422,6 +2422,51 @@ mod tests {
     }
 
     #[test]
+    fn opencode_reads_its_session_and_usage() {
+        let out = concat!(
+            r#"{"type":"step_start","sessionID":"ses_a","part":{}}"#,
+            "\n",
+            r#"{"type":"step_finish","sessionID":"ses_a","part":{"tokens":{"input":100,"output":5,"cache":{"read":40,"write":0}},"cost":0.01}}"#,
+            "\n",
+            r#"{"type":"text","sessionID":"ses_a","part":{"text":"done"}}"#,
+            "\n",
+            r#"{"type":"step_finish","sessionID":"ses_a","part":{"tokens":{"input":200,"output":10,"cache":{"read":0,"write":7}},"cost":0.02}}"#,
+            "\n",
+        );
+        let p = opencode::OpenCode.parse_output(out).unwrap();
+        assert_eq!(p.text, "done");
+        assert_eq!(p.session_id.as_deref(), Some("ses_a"));
+        assert_eq!(p.num_turns, Some(2));
+        assert_eq!(p.usage.input, Some(300));
+        assert_eq!(p.usage.output, Some(15));
+        assert_eq!(p.usage.cache_read, Some(40));
+        assert_eq!(p.usage.cache_write, Some(7));
+        assert!((p.cost_usd.unwrap() - 0.03).abs() < 1e-9);
+    }
+
+    #[test]
+    fn opencode_resumes_only_a_session_it_named() {
+        let s = settings();
+        assert!(opencode::OpenCode.supports_sessions());
+        // OpenCode picks the id of a new session itself.
+        let fresh = Session {
+            id: "uuid-1".into(),
+            resume: false,
+        };
+        let inv = opencode::OpenCode.invocation(&s, "SYS", "hi", Some(&fresh));
+        assert!(!has(&inv, "--session"));
+        assert!(!has(&inv, "uuid-1"));
+
+        let resume = Session {
+            id: "ses_a".into(),
+            resume: true,
+        };
+        let inv = opencode::OpenCode.invocation(&s, "SYS", "hi", Some(&resume));
+        let at = inv.args.iter().position(|a| a == "--session").unwrap();
+        assert_eq!(inv.args[at + 1], "ses_a");
+    }
+
+    #[test]
     fn amp_reads_the_result_event() {
         let out = concat!(
             r#"{"type":"assistant","message":{}}"#,

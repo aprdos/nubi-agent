@@ -1,7 +1,8 @@
 use std::path::PathBuf;
 
+use super::claude::add_usage;
 use super::{pass_mcp_token, write_private, Harness, Invocation, Parsed, Settings, MCP_TOKEN_ENV};
-use crate::runtime::Session;
+use crate::runtime::{Session, TokenUsage};
 
 /// OpenCode: `opencode run`.
 pub struct OpenCode;
@@ -78,6 +79,14 @@ impl Harness for OpenCode {
         "AGENTS.md"
     }
 
+    /// OpenCode names its sessions itself (`ses_...`), so a new one runs
+    /// without an id and the one it reports is kept for the room; a resume
+    /// passes it back with `--session`. A session it no longer has fails
+    /// the run, and the agent starts that room fresh.
+    fn supports_sessions(&self) -> bool {
+        true
+    }
+
     fn prepare(&self, settings: &Settings, system_prompt: &str) -> anyhow::Result<()> {
         let has_provider = settings.model.as_deref().is_some_and(|m| m.contains('/'));
         if (settings.llm_base_url.is_some() || settings.llm_api_key.is_some()) && !has_provider {
@@ -93,10 +102,13 @@ impl Harness for OpenCode {
         settings: &Settings,
         _system_prompt: &str,
         prompt: &str,
-        _session: Option<&Session>,
+        session: Option<&Session>,
     ) -> Invocation {
         let mut inv = Invocation::default();
         inv.arg("run").arg("--format").arg("json");
+        if let Some(s) = session.filter(|s| s.resume) {
+            inv.arg("--session").arg(&s.id);
+        }
         if settings.skip_permissions {
             inv.arg("--auto");
         }
@@ -114,19 +126,46 @@ impl Harness for OpenCode {
     }
 
     /// JSON lines; the answer is the text of the last `text` event. Earlier
-    /// ones are what the model said between tool calls.
+    /// ones are what the model said between tool calls. Every event names
+    /// the session, and each `step_finish` (one per model call) carries its
+    /// tokens and cost.
     fn parse_output(&self, stdout: &str) -> anyhow::Result<Parsed> {
+        let mut parsed = Parsed::default();
         let mut answer = None;
+        let mut steps = 0;
+        let mut cost = None;
         for line in stdout.lines().filter(|l| !l.trim().is_empty()) {
             let Ok(event) = serde_json::from_str::<serde_json::Value>(line) else {
                 continue;
             };
+            if let Some(id) = event["sessionID"].as_str() {
+                parsed.session_id = Some(id.to_string());
+            }
             match event["type"].as_str() {
                 Some("text") => answer = event["part"]["text"].as_str().map(str::to_string),
+                Some("step_finish") => {
+                    steps += 1;
+                    let tokens = &event["part"]["tokens"];
+                    add_usage(
+                        &mut parsed.usage,
+                        &TokenUsage {
+                            input: tokens["input"].as_u64(),
+                            output: tokens["output"].as_u64(),
+                            cache_read: tokens["cache"]["read"].as_u64(),
+                            cache_write: tokens["cache"]["write"].as_u64(),
+                        },
+                    );
+                    if let Some(c) = event["part"]["cost"].as_f64() {
+                        cost = Some(cost.unwrap_or(0.0) + c);
+                    }
+                }
                 Some("error") => anyhow::bail!("opencode reported an error: {}", event),
                 _ => {}
             }
         }
-        Ok(Parsed::text(&answer.unwrap_or_default()))
+        parsed.text = answer.unwrap_or_default();
+        parsed.num_turns = (steps > 0).then_some(steps);
+        parsed.cost_usd = cost;
+        Ok(parsed)
     }
 }
