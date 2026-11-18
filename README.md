@@ -193,7 +193,7 @@ touched.
 | `codex` | `codex exec` | `AGENTS.md` | `developer_instructions` | — | `openai_base_url` / `CODEX_API_KEY` |
 | `gemini` | `gemini -p` | `GEMINI.md` | `GEMINI_SYSTEM_MD` | — | `GOOGLE_GEMINI_BASE_URL` / `GEMINI_API_KEY` |
 | `cursor` | `cursor-agent -p` | `AGENTS.md` | leads the prompt | — | not supported / `CURSOR_API_KEY` |
-| `opencode` | `opencode run` | `AGENTS.md` | `instructions` | — | provider `baseURL` / `apiKey`; needs `--model provider/model` |
+| `opencode` | `opencode run` | `AGENTS.md` | `instructions` | per room (`--session`) | provider `baseURL` / `apiKey`; needs `--model provider/model` |
 | `amp` | `amp -x` | `AGENTS.md` | leads the prompt | — | not supported / `AMP_API_KEY` |
 | `copilot` | `copilot -p` | `AGENTS.md` | leads the prompt | — | `COPILOT_PROVIDER_BASE_URL` / `COPILOT_PROVIDER_API_KEY` |
 
@@ -205,7 +205,11 @@ touched.
 - Claude Code runs with a JSON output format and a reply schema, so the
   harness learns whether a run failed, how many model turns it took, what it
   cost, and who the reply is for. Other CLIs return plain text, which is
-  posted as-is with nobody mentioned.
+  posted as-is with nobody mentioned. OpenCode's JSON events still give the
+  model turns, token usage and cost.
+- Claude Code and OpenCode keep one conversation per room, so a follow-up
+  carries only the new messages. OpenCode names its sessions itself; one it
+  no longer has fails the run and the room starts fresh.
 - The nubi token reaches the CLI through the `NUBI_MCP_TOKEN` env var, except
   for Claude, which reads it from a 0600 MCP config file.
 - Cursor has no MCP flag, so its config goes in the workspace's `.cursor/`.

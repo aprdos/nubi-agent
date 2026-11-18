@@ -433,7 +433,7 @@ fn usage(u: &serde_json::Value) -> TokenUsage {
     }
 }
 
-fn add_usage(total: &mut TokenUsage, u: &TokenUsage) {
+pub(super) fn add_usage(total: &mut TokenUsage, u: &TokenUsage) {
     let add = |a: &mut Option<u64>, b: Option<u64>| {
         if let Some(b) = b {
             *a = Some(a.unwrap_or(0) + b);
