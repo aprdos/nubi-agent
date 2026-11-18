@@ -29,7 +29,6 @@ tracing-opentelemetry = "0.28"
 opentelemetry = "0.27"
 opentelemetry_sdk = { version = "0.27", features = ["rt-tokio"] }
 opentelemetry-otlp = { version = "0.27", features = ["tonic"] }
-metrics = "0.24"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

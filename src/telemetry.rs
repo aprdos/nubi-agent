@@ -17,7 +17,10 @@ pub fn init_telemetry(service_name: &str) {
         {
             Ok(e) => e,
             Err(e) => {
-                tracing::warn!("OTel span exporter failed to initialize, tracing disabled: {e}");
+                // Subscriber not installed yet — eprintln is the only output path.
+                eprintln!(
+                    "[nubi-agent] OTel span exporter failed to initialize, tracing disabled: {e}"
+                );
                 registry.init();
                 return;
             }
@@ -41,25 +44,21 @@ pub fn init_telemetry(service_name: &str) {
     }
 }
 
+pub fn shutdown_telemetry() {
+    opentelemetry::global::shutdown_tracer_provider();
+}
+
 pub fn record_turn(harness: &str, result: &str, duration: Duration) {
-    let labels = [
-        ("harness", harness.to_string()),
-        ("result", result.to_string()),
-    ];
-    metrics::counter!("nubi_agent_turns_total", &labels).increment(1);
-    metrics::histogram!(
-        "nubi_agent_turn_duration_seconds",
-        &[("harness", harness.to_string())]
-    )
-    .record(duration.as_secs_f64());
+    tracing::info!(
+        harness,
+        result,
+        elapsed_ms = duration.as_millis() as u64,
+        "turn.complete"
+    );
 }
 
 pub fn record_nubi_request(method: &str, status: &str) {
-    let labels = [
-        ("method", method.to_string()),
-        ("status", status.to_string()),
-    ];
-    metrics::counter!("nubi_agent_nubi_requests_total", &labels).increment(1);
+    tracing::info!(method, status, "nubi.request");
 }
 
 #[cfg(test)]

@@ -421,7 +421,9 @@ async fn main() -> anyhow::Result<()> {
     };
 
     let mut agent = Agent::connect(nubi, config).await;
-    agent.run().await
+    let result = agent.run().await;
+    nubi_agent::telemetry::shutdown_telemetry();
+    result
 }
 
 /// The provider behind an LLM base URL. Without one, the harness's own
