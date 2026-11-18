@@ -428,6 +428,32 @@ fn sent_status(room_id: &str, sent_to: &[String], expects_reply: bool) -> String
     }
 }
 
+/// Most rooms a tools-only turn's journal line names.
+const SUMMARY_ROOMS: usize = 5;
+
+/// The journal line for a turn that answered with tools: the rooms it
+/// posted to, in order. Other rooms' sessions read this line under [Your
+/// other conversations], and without the rooms they can't tell a turn
+/// already posted to a channel (a PR announced for review) and post it again.
+fn tools_summary(sent_to: &[String]) -> String {
+    let mut rooms: Vec<&str> = Vec::new();
+    for r in sent_to {
+        if !rooms.contains(&r.as_str()) {
+            rooms.push(r);
+        }
+    }
+    if rooms.is_empty() {
+        return "answered via tools".into();
+    }
+    let more = rooms.len().saturating_sub(SUMMARY_ROOMS);
+    rooms.truncate(SUMMARY_ROOMS);
+    let mut out = format!("answered via tools, sent to {}", rooms.join(", "));
+    if more > 0 {
+        out.push_str(&format!(" and {more} more"));
+    }
+    out
+}
+
 /// Which rooms have pending messages and which already have a worker running.
 #[derive(Default)]
 struct Dispatch {
@@ -2523,11 +2549,12 @@ impl Shared {
             Outcome::Tools => {
                 eprintln!("[nubi-agent] Answered via tools, nothing to post");
                 let expects_reply = all.iter().any(|t| t.sender != "system");
-                status = match self.live_sent.lock().unwrap().remove(room_id) {
-                    Some(sent) => sent_status(room_id, &sent, expects_reply),
+                let sent = self.live_sent.lock().unwrap().remove(room_id);
+                status = match &sent {
+                    Some(sent) => sent_status(room_id, sent, expects_reply),
                     None => "answered via tools".into(),
                 };
-                "answered via tools".to_string()
+                tools_summary(sent.as_deref().unwrap_or_default())
             }
             _ => {
                 eprintln!(
@@ -4342,6 +4369,65 @@ done
             .unwrap();
         wait_until(|| live_inputs(&dir).len() == 2).await;
         assert!(live_inputs(&dir)[1].contains("Nothing reached docs"));
+    }
+
+    #[test]
+    fn a_tools_summary_names_each_room_once() {
+        let rooms = |r: &[&str]| r.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(tools_summary(&[]), "answered via tools");
+        assert_eq!(
+            tools_summary(&rooms(&[
+                "thread.sprint.5",
+                "pr-review",
+                "thread.pr-review.421",
+                "pr-review"
+            ])),
+            "answered via tools, sent to thread.sprint.5, pr-review, thread.pr-review.421"
+        );
+        assert_eq!(
+            tools_summary(&rooms(&["a", "b", "c", "d", "e", "f", "g"])),
+            "answered via tools, sent to a, b, c, d, e and 2 more"
+        );
+    }
+
+    #[tokio::test]
+    async fn other_rooms_see_where_a_tools_turn_posted() {
+        // pear announced a PR in pr-review from its workflow thread; the
+        // review event's turn in the GitHub room saw only "answered via
+        // tools" there and announced the PR again.
+        let engine = MockEngine::start(MockState::default()).await;
+        let (agent, fake) = agent(&engine, AgentConfig::default()).await;
+        let dir = temp_workspace();
+        *fake.live_cmd.write().unwrap() = Some(fake_live_cli(&dir));
+        agent
+            .shared
+            .ingest(&sse_from(
+                "github",
+                1,
+                "system",
+                now_ms(),
+                "[GitHub] CI passed @support-bot, post it elsewhere",
+            ))
+            .await
+            .unwrap();
+        wait_until(|| agent.shared.offsets.lock().unwrap().unanswered.is_empty()).await;
+        wait_until(|| !agent.shared.journal_tail("github").is_empty()).await;
+
+        let journal = agent.shared.journal_tail("github");
+        assert!(
+            journal
+                .last()
+                .unwrap()
+                .ends_with("answered via tools, sent to pr-review"),
+            "{journal:?}"
+        );
+        let lines = agent.shared.elsewhere("ops");
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("in github:") && l.ends_with("sent to pr-review")),
+            "{lines:?}"
+        );
     }
 
     #[tokio::test]
