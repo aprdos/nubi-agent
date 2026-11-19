@@ -367,7 +367,11 @@ impl NubiClient {
                 Ok(resp) => {
                     let status = resp.status();
                     if status.is_success() {
-                        crate::telemetry::record_nubi_request("POST", &status.as_u16().to_string());
+                        crate::telemetry::record_nubi_request(
+                            "POST",
+                            &status.as_u16().to_string(),
+                            "send",
+                        );
                         return Ok(());
                     }
                     last_status = Some(status.as_u16());
@@ -375,7 +379,11 @@ impl NubiClient {
                     let body = short(&resp.text().await.unwrap_or_default());
                     last_err = format!("{} - {}", status, body);
                     if !retryable(status) {
-                        crate::telemetry::record_nubi_request("POST", &status.as_u16().to_string());
+                        crate::telemetry::record_nubi_request(
+                            "POST",
+                            &status.as_u16().to_string(),
+                            "send",
+                        );
                         return Err(
                             Refused(format!("Post to {} refused: {}", room_id, last_err)).into(),
                         );
@@ -404,7 +412,7 @@ impl NubiClient {
         let status_label = last_status
             .map(|s| s.to_string())
             .unwrap_or_else(|| "transport_error".to_string());
-        crate::telemetry::record_nubi_request("POST", &status_label);
+        crate::telemetry::record_nubi_request("POST", &status_label, "send");
         anyhow::bail!("Failed to post message to {}: {}", room_id, last_err)
     }
 
@@ -474,19 +482,23 @@ impl NubiClient {
         {
             Ok(r) => r,
             Err(e) => {
-                crate::telemetry::record_nubi_request("POST", "transport_error");
+                crate::telemetry::record_nubi_request("POST", "transport_error", "offset");
                 return Err(e.into());
             }
         };
 
         if !resp.status().is_success() {
             let status = resp.status();
-            crate::telemetry::record_nubi_request("POST", &status.as_u16().to_string());
+            crate::telemetry::record_nubi_request("POST", &status.as_u16().to_string(), "offset");
             let body = resp.text().await.unwrap_or_default();
             anyhow::bail!("Failed to commit offset: {} - {}", status, body);
         }
 
-        crate::telemetry::record_nubi_request("POST", &resp.status().as_u16().to_string());
+        crate::telemetry::record_nubi_request(
+            "POST",
+            &resp.status().as_u16().to_string(),
+            "offset",
+        );
         Ok(resp.json::<CommitResp>().await?.committed)
     }
 
@@ -648,19 +660,23 @@ impl NubiClient {
         {
             Ok(r) => r,
             Err(e) => {
-                crate::telemetry::record_nubi_request("POST", "transport_error");
+                crate::telemetry::record_nubi_request("POST", "transport_error", "typing");
                 return Err(e.into());
             }
         };
 
         if !resp.status().is_success() {
             let status = resp.status();
-            crate::telemetry::record_nubi_request("POST", &status.as_u16().to_string());
+            crate::telemetry::record_nubi_request("POST", &status.as_u16().to_string(), "typing");
             let body = resp.text().await.unwrap_or_default();
             anyhow::bail!("Failed to set typing: {} - {}", status, body);
         }
 
-        crate::telemetry::record_nubi_request("POST", "200");
+        crate::telemetry::record_nubi_request(
+            "POST",
+            &resp.status().as_u16().to_string(),
+            "typing",
+        );
         Ok(())
     }
 
@@ -687,19 +703,23 @@ impl NubiClient {
         {
             Ok(r) => r,
             Err(e) => {
-                crate::telemetry::record_nubi_request("POST", "transport_error");
+                crate::telemetry::record_nubi_request("POST", "transport_error", "status");
                 return Err(e.into());
             }
         };
 
         if !resp.status().is_success() {
             let status = resp.status();
-            crate::telemetry::record_nubi_request("POST", &status.as_u16().to_string());
+            crate::telemetry::record_nubi_request("POST", &status.as_u16().to_string(), "status");
             let body = resp.text().await.unwrap_or_default();
             anyhow::bail!("Failed to set status: {} - {}", status, body);
         }
 
-        crate::telemetry::record_nubi_request("POST", "200");
+        crate::telemetry::record_nubi_request(
+            "POST",
+            &resp.status().as_u16().to_string(),
+            "status",
+        );
         Ok(())
     }
 }

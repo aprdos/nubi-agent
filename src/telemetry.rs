@@ -57,8 +57,8 @@ pub fn record_turn(harness: &str, result: &str, duration: Duration) {
     );
 }
 
-pub fn record_nubi_request(method: &str, status: &str) {
-    tracing::info!(method, status, "nubi.request");
+pub fn record_nubi_request(method: &str, status: &str, endpoint: &str) {
+    tracing::info!(method, status, endpoint, "nubi.request");
 }
 
 #[cfg(test)]
@@ -158,20 +158,21 @@ mod tests {
     fn record_nubi_request_emits_method_and_status() {
         let (sub, events) = capture_subscriber();
         with_default(sub, || {
-            record_nubi_request("POST", "503");
+            record_nubi_request("POST", "503", "send");
         });
         let captured = events.lock().unwrap();
         assert_eq!(captured.len(), 1);
         assert_eq!(captured[0].message, "nubi.request");
         assert_eq!(find_field(&captured[0].fields, "method"), Some("POST"));
         assert_eq!(find_field(&captured[0].fields, "status"), Some("503"));
+        assert_eq!(find_field(&captured[0].fields, "endpoint"), Some("send"));
     }
 
     #[test]
     fn record_nubi_request_transport_error_label() {
         let (sub, events) = capture_subscriber();
         with_default(sub, || {
-            record_nubi_request("POST", "transport_error");
+            record_nubi_request("POST", "transport_error", "send");
         });
         let captured = events.lock().unwrap();
         assert_eq!(captured.len(), 1);
