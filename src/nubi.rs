@@ -345,6 +345,7 @@ impl NubiClient {
 
     /// Send a built message. Retried on transport failures, 5xx and 429
     /// (after `Retry-After` when given); any other refusal is a [`Refused`].
+    #[tracing::instrument(name = "agent.nubi.request", skip_all, fields(method = "POST", room = %room_id))]
     pub async fn send(&self, room_id: &str, msg: &SendMessage) -> anyhow::Result<()> {
         let url = format!(
             "{}/v1/spaces/{}/rooms/{}/messages",
@@ -352,6 +353,7 @@ impl NubiClient {
         );
 
         let mut last_err = String::new();
+        let mut last_status: Option<u16> = None;
         let mut wait: Option<Duration> = None;
         for attempt in 1..=POST_ATTEMPTS {
             match self
@@ -365,18 +367,32 @@ impl NubiClient {
                 Ok(resp) => {
                     let status = resp.status();
                     if status.is_success() {
+                        crate::telemetry::record_nubi_request(
+                            "POST",
+                            &status.as_u16().to_string(),
+                            "send",
+                        );
                         return Ok(());
                     }
+                    last_status = Some(status.as_u16());
                     wait = retry_after(&resp);
                     let body = short(&resp.text().await.unwrap_or_default());
                     last_err = format!("{} - {}", status, body);
                     if !retryable(status) {
+                        crate::telemetry::record_nubi_request(
+                            "POST",
+                            &status.as_u16().to_string(),
+                            "send",
+                        );
                         return Err(
                             Refused(format!("Post to {} refused: {}", room_id, last_err)).into(),
                         );
                     }
                 }
-                Err(e) => last_err = e.to_string(),
+                Err(e) => {
+                    last_status = None;
+                    last_err = e.to_string();
+                }
             }
 
             if attempt < POST_ATTEMPTS {
@@ -393,6 +409,10 @@ impl NubiClient {
             }
         }
 
+        let status_label = last_status
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| "transport_error".to_string());
+        crate::telemetry::record_nubi_request("POST", &status_label, "send");
         anyhow::bail!("Failed to post message to {}: {}", room_id, last_err)
     }
 
@@ -449,7 +469,7 @@ impl NubiClient {
     /// The server clamps monotonically, so committing 0 reads back the current
     /// offset without moving it — that is how a cold room is detected.
     pub async fn commit_offset(&self, room_id: &str, index: u64) -> anyhow::Result<u64> {
-        let resp = self
+        let resp = match self
             .client
             .post(format!(
                 "{}/v1/spaces/{}/rooms/{}/offset",
@@ -458,14 +478,27 @@ impl NubiClient {
             .header("Authorization", format!("Bearer {}", self.token))
             .json(&serde_json::json!({ "index": index }))
             .send()
-            .await?;
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                crate::telemetry::record_nubi_request("POST", "transport_error", "offset");
+                return Err(e.into());
+            }
+        };
 
         if !resp.status().is_success() {
             let status = resp.status();
+            crate::telemetry::record_nubi_request("POST", &status.as_u16().to_string(), "offset");
             let body = resp.text().await.unwrap_or_default();
             anyhow::bail!("Failed to commit offset: {} - {}", status, body);
         }
 
+        crate::telemetry::record_nubi_request(
+            "POST",
+            &resp.status().as_u16().to_string(),
+            "offset",
+        );
         Ok(resp.json::<CommitResp>().await?.committed)
     }
 
@@ -614,7 +647,7 @@ impl NubiClient {
 
     /// Set typing status in a room
     pub async fn set_typing(&self, room_id: &str, typing: bool) -> anyhow::Result<()> {
-        let resp = self
+        let resp = match self
             .client
             .post(format!(
                 "{}/v1/spaces/{}/rooms/{}/typing",
@@ -623,14 +656,27 @@ impl NubiClient {
             .header("Authorization", format!("Bearer {}", self.token))
             .json(&serde_json::json!({ "typing": typing }))
             .send()
-            .await?;
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                crate::telemetry::record_nubi_request("POST", "transport_error", "typing");
+                return Err(e.into());
+            }
+        };
 
         if !resp.status().is_success() {
             let status = resp.status();
+            crate::telemetry::record_nubi_request("POST", &status.as_u16().to_string(), "typing");
             let body = resp.text().await.unwrap_or_default();
             anyhow::bail!("Failed to set typing: {} - {}", status, body);
         }
 
+        crate::telemetry::record_nubi_request(
+            "POST",
+            &resp.status().as_u16().to_string(),
+            "typing",
+        );
         Ok(())
     }
 
@@ -643,7 +689,7 @@ impl NubiClient {
         room_id: Option<&str>,
         text: &str,
     ) -> anyhow::Result<()> {
-        let resp = self
+        let resp = match self
             .client
             .post(format!(
                 "{}/v1/spaces/{}/agents/{}/status",
@@ -653,14 +699,27 @@ impl NubiClient {
             .timeout(std::time::Duration::from_secs(10))
             .json(&serde_json::json!({ "state": state, "room_id": room_id, "text": text }))
             .send()
-            .await?;
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                crate::telemetry::record_nubi_request("POST", "transport_error", "status");
+                return Err(e.into());
+            }
+        };
 
         if !resp.status().is_success() {
             let status = resp.status();
+            crate::telemetry::record_nubi_request("POST", &status.as_u16().to_string(), "status");
             let body = resp.text().await.unwrap_or_default();
             anyhow::bail!("Failed to set status: {} - {}", status, body);
         }
 
+        crate::telemetry::record_nubi_request(
+            "POST",
+            &resp.status().as_u16().to_string(),
+            "status",
+        );
         Ok(())
     }
 }

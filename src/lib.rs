@@ -10,6 +10,7 @@ pub mod runtime;
 pub mod send_guard;
 pub mod skills;
 pub mod status;
+pub mod telemetry;
 pub mod types;
 
 pub use agent::{Agent, AgentConfig, LiveScope};

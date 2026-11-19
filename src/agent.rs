@@ -2287,6 +2287,7 @@ impl Shared {
 
     /// One turn: run the harness for every pending message in the room, post
     /// what it says, and tell the room when that could not be done.
+    #[tracing::instrument(name = "agent.turn", skip_all, fields(room = %room_id, harness = ?self.config.harness))]
     async fn reply(&self, room_id: &str, triggers: &[Trigger]) -> anyhow::Result<TurnEnd> {
         let Some(newest) = triggers.last() else {
             return Ok(TurnEnd::Answered);
@@ -2717,6 +2718,12 @@ impl Shared {
         out: Option<&RunOutput>,
         session: &str,
     ) {
+        crate::telemetry::record_turn(
+            &format!("{:?}", self.config.harness).to_lowercase(),
+            outcome.as_str(),
+            Duration::from_millis(elapsed_ms),
+        );
+
         let mut line = format!(
             "[nubi-agent] turn room={} idx={} outcome={} runs={} elapsed_ms={} session={}",
             room_id,
@@ -2979,45 +2986,47 @@ impl Shared {
     /// What they had to say went out with nubi_send.
     async fn live_turns(self: Arc<Self>, mut rx: mpsc::UnboundedReceiver<(String, LiveTurn)>) {
         while let Some((room_id, turn)) = rx.recv().await {
-            let out = self.runtime.live_output(&turn.result);
-            let last = self.session_last_index(&room_id);
-            if let Some(id) = out.session_id.clone() {
-                self.record_session(&room_id, id, last);
-            }
-            // The session's rooms it sent to (in family scope, any of the
-            // family's).
-            let mut marked: Vec<&String> = Vec::new();
-            for room in &turn.sent_to {
-                if !marked.contains(&room) && self.live_key(room) == room_id {
-                    marked.push(room);
-                    self.buffer.lock().unwrap().mark_responded(room);
+            tracing::info_span!("agent.turn", room = %room_id, source = "live").in_scope(|| {
+                let out = self.runtime.live_output(&turn.result);
+                let last = self.session_last_index(&room_id);
+                if let Some(id) = out.session_id.clone() {
+                    self.record_session(&room_id, id, last);
                 }
-            }
-            let summary = if turn.sent_to.is_empty() {
-                "on its own: nothing sent".to_string()
-            } else {
-                format!("on its own: sent to {}", turn.sent_to.join(", "))
-            };
-            eprintln!("[nubi-agent] {}: {}", room_id, summary);
-            self.journal_append(&room_id, &summary);
-            if out.is_error {
-                self.status_end(&room_id, "on its own: failed");
-            } else {
-                self.status_end(&room_id, &summary);
-            }
-            self.log_turn(
-                &room_id,
-                last,
-                if out.is_error {
-                    Outcome::Failed
+                // The session's rooms it sent to (in family scope, any of the
+                // family's).
+                let mut marked: Vec<&String> = Vec::new();
+                for room in &turn.sent_to {
+                    if !marked.contains(&room) && self.live_key(room) == room_id {
+                        marked.push(room);
+                        self.buffer.lock().unwrap().mark_responded(room);
+                    }
+                }
+                let summary = if turn.sent_to.is_empty() {
+                    "on its own: nothing sent".to_string()
                 } else {
-                    Outcome::Tools
-                },
-                1,
-                out.duration_ms.unwrap_or(0),
-                Some(&out),
-                "live",
-            );
+                    format!("on its own: sent to {}", turn.sent_to.join(", "))
+                };
+                eprintln!("[nubi-agent] {}: {}", room_id, summary);
+                self.journal_append(&room_id, &summary);
+                if out.is_error {
+                    self.status_end(&room_id, "on its own: failed");
+                } else {
+                    self.status_end(&room_id, &summary);
+                }
+                self.log_turn(
+                    &room_id,
+                    last,
+                    if out.is_error {
+                        Outcome::Failed
+                    } else {
+                        Outcome::Tools
+                    },
+                    1,
+                    out.duration_ms.unwrap_or(0),
+                    Some(&out),
+                    "live",
+                );
+            });
         }
     }
 

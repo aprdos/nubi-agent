@@ -336,6 +336,8 @@ async fn main() -> anyhow::Result<()> {
     }
     let args = Args::parse();
 
+    nubi_agent::telemetry::init_telemetry("nubi-agent");
+
     let Some(token) = args.token.filter(|t| !t.trim().is_empty()) else {
         eprintln!(
             "nubi-agent: no token.\n\n\
@@ -419,7 +421,33 @@ async fn main() -> anyhow::Result<()> {
     };
 
     let mut agent = Agent::connect(nubi, config).await;
-    agent.run().await
+    let result = tokio::select! {
+        r = agent.run() => r,
+        _ = shutdown_signal() => {
+            eprintln!("[nubi-agent] Received shutdown signal");
+            Ok(())
+        }
+    };
+    nubi_agent::telemetry::shutdown_telemetry();
+    result
+}
+
+async fn shutdown_signal() {
+    use tokio::signal;
+    let ctrl_c = signal::ctrl_c();
+    #[cfg(unix)]
+    {
+        let mut sigterm = signal::unix::signal(signal::unix::SignalKind::terminate())
+            .expect("failed to register SIGTERM handler");
+        tokio::select! {
+            _ = ctrl_c => {}
+            _ = sigterm.recv() => {}
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        ctrl_c.await.ok();
+    }
 }
 
 /// The provider behind an LLM base URL. Without one, the harness's own
