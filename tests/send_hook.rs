@@ -5,9 +5,20 @@ use std::io::Write;
 use std::process::{Command, Stdio};
 
 fn run(scope: &std::path::Path, input: &str) -> (i32, String) {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_nubi-agent"))
-        .args(["hook", "pre-tool-use", "--scope"])
-        .arg(scope)
+    run_with_dedup(scope, None, input)
+}
+
+fn run_with_dedup(
+    scope: &std::path::Path,
+    dedup: Option<&std::path::Path>,
+    input: &str,
+) -> (i32, String) {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_nubi-agent"));
+    cmd.args(["hook", "pre-tool-use", "--scope"]).arg(scope);
+    if let Some(dp) = dedup {
+        cmd.arg("--dedup").arg(dp);
+    }
+    let mut child = cmd
         .env_clear()
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
@@ -64,4 +75,90 @@ fn the_hook_denies_a_room_outside_the_scope_and_allows_the_rest() {
     let (code, err) = run(&dir.join("missing.json"), &send("pr-review"));
     assert_eq!(code, 0);
     assert!(err.contains("no scope"), "{err}");
+}
+
+#[test]
+fn dedup_blocks_same_content_from_different_turn_via_binary() {
+    let dir = std::env::temp_dir().join(format!("nubi-dedup-hook-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let dedup = dir.join("dedup.json");
+
+    // Scope: system turn (allow *), turn-a.
+    let scope_a = dir.join("scope-a.json");
+    std::fs::write(
+        &scope_a,
+        r#"{"allow":"*","room":"github","family":"github","turn_id":"turn-a"}"#,
+    )
+    .unwrap();
+
+    // First send to room-k from turn-a: allowed.
+    let (code, err) = run_with_dedup(&scope_a, Some(&dedup), &send("room-k"));
+    assert_eq!(code, 0, "first send should pass: {err}");
+
+    // Second send to room-k from turn-b, same content ("hi"): denied.
+    let scope_b = dir.join("scope-b.json");
+    std::fs::write(
+        &scope_b,
+        r#"{"allow":"*","room":"github","family":"github","turn_id":"turn-b"}"#,
+    )
+    .unwrap();
+    let (code, err) = run_with_dedup(&scope_b, Some(&dedup), &send("room-k"));
+    assert_eq!(
+        code, 2,
+        "same content from second turn should be denied: {err}"
+    );
+    assert!(
+        err.contains("another turn already sent"),
+        "reason should mention dedup: {err}"
+    );
+
+    // Same turn-a to room-k again: still allowed (same turn_id).
+    let (code, err) = run_with_dedup(&scope_a, Some(&dedup), &send("room-k"));
+    assert_eq!(code, 0, "same turn should still pass: {err}");
+
+    // turn-b to a different room: allowed.
+    let (code, err) = run_with_dedup(&scope_b, Some(&dedup), &send("room-m"));
+    assert_eq!(code, 0, "different room should pass: {err}");
+
+    // turn-b to room-k with different content: allowed.
+    let different = serde_json::json!({
+        "session_id": "s1",
+        "hook_event_name": "PreToolUse",
+        "tool_name": "mcp__nubi__nubi_send",
+        "tool_input": { "room_id": "room-k", "text": "completely different message" }
+    })
+    .to_string();
+    let (code, err) = run_with_dedup(&scope_b, Some(&dedup), &different);
+    assert_eq!(code, 0, "different content should pass: {err}");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn dedup_allows_own_family_via_binary() {
+    let dir = std::env::temp_dir().join(format!("nubi-dedup-hook-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let dedup = dir.join("dedup.json");
+
+    // Turn-a in room general, sends to general.
+    let scope_a = dir.join("scope-a.json");
+    std::fs::write(
+        &scope_a,
+        r#"{"allow":["general","thread.general.*"],"room":"general","family":"general","turn_id":"turn-a"}"#,
+    )
+    .unwrap();
+    let (code, err) = run_with_dedup(&scope_a, Some(&dedup), &send("general"));
+    assert_eq!(code, 0, "own family should pass: {err}");
+
+    // Turn-b also in general, sends same content to general: allowed (own family bypass).
+    let scope_b = dir.join("scope-b.json");
+    std::fs::write(
+        &scope_b,
+        r#"{"allow":["general","thread.general.*"],"room":"general","family":"general","turn_id":"turn-b"}"#,
+    )
+    .unwrap();
+    let (code, err) = run_with_dedup(&scope_b, Some(&dedup), &send("general"));
+    assert_eq!(code, 0, "own family from second turn should pass: {err}");
+
+    let _ = std::fs::remove_dir_all(&dir);
 }

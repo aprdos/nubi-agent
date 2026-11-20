@@ -179,15 +179,20 @@ impl Harness for Claude {
         // is how a turn we started is told from one it started itself.
         inv.arg("--replay-user-messages");
         Self::common(&mut inv, settings, system_prompt, session);
-        // The send lock: a PreToolUse hook (this binary) checks every
-        // nubi_send against the scope file written before each turn.
+        // The send guard: a PreToolUse hook (this binary) checks every
+        // nubi_send against the scope file (family lock) and the shared dedup
+        // file (cross-turn destination dedup).
         if let Some(scope) = send_scope {
             match std::env::current_exe() {
                 Ok(exe) => {
-                    inv.arg("--settings")
-                        .arg(crate::send_guard::hook_settings(&exe, scope));
+                    let dedup = settings.state_dir().join("send-dedup.json");
+                    inv.arg("--settings").arg(crate::send_guard::hook_settings(
+                        &exe,
+                        scope,
+                        Some(&dedup),
+                    ));
                 }
-                Err(e) => eprintln!("[nubi-agent] No send lock: cannot locate nubi-agent ({e})"),
+                Err(e) => eprintln!("[nubi-agent] No send guard: cannot locate nubi-agent ({e})"),
             }
         }
         Some(inv)

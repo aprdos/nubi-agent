@@ -307,19 +307,27 @@ struct HookArgs {
 #[derive(clap::Subcommand)]
 enum HookEvent {
     /// Claude Code's PreToolUse hook: refuse a nubi_send to a room outside
-    /// the turn's scope (exit 2, the reason on stderr)
+    /// the turn's scope or to a room another turn just sent to (exit 2,
+    /// the reason on stderr)
     PreToolUse {
         /// The scope file nubi-agent writes before each turn
         #[arg(long)]
         scope: std::path::PathBuf,
+        /// Shared dedup file for cross-turn destination dedup
+        #[arg(long)]
+        dedup: Option<std::path::PathBuf>,
     },
 }
 
 fn run_hook(argv: Vec<std::ffi::OsString>) -> i32 {
     let args = HookArgs::parse_from(argv);
     match args.event {
-        HookEvent::PreToolUse { scope } => {
-            let (code, msg) = nubi_agent::send_guard::pre_tool_use(&scope, std::io::stdin().lock());
+        HookEvent::PreToolUse { scope, dedup } => {
+            let (code, msg) = nubi_agent::send_guard::pre_tool_use(
+                &scope,
+                dedup.as_deref(),
+                std::io::stdin().lock(),
+            );
             if let Some(msg) = msg {
                 eprintln!("{msg}");
             }
