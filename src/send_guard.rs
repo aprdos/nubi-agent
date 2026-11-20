@@ -152,8 +152,10 @@ fn dedup_check(
     }
 
     let mut map = read_dedup(dedup_path);
-    if let Some(entry) = map.get(target_room) {
-        if entry.turn_id != turn_id && entry.content_hash == content_hash {
+    // Key on (room, content_hash) so entries with different content coexist.
+    let key = format!("{target_room}\0{content_hash:016x}");
+    if let Some(entry) = map.get(&key) {
+        if entry.turn_id != turn_id {
             let reason = format!(
                 "another turn already sent the same message to \"{target_room}\" in the last {} s; \
                  skip this send to avoid a double reply",
@@ -163,7 +165,7 @@ fn dedup_check(
         }
     }
     map.insert(
-        target_room.to_string(),
+        key,
         DedupEntry {
             turn_id: turn_id.to_string(),
             ts_ms: now_ms(),
@@ -187,6 +189,8 @@ fn is_in_family(room: &str, family: &str) -> bool {
     false
 }
 
+// DefaultHasher is not stable across Rust releases, but here every hook
+// invocation within the 30 s TTL window uses the same binary.
 fn hash_text(text: &str) -> u64 {
     let normalized = text.split_whitespace().collect::<Vec<_>>().join(" ");
     let mut h = DefaultHasher::new();
@@ -525,6 +529,24 @@ mod tests {
         assert!(dedup_check(&dedup, "pr-review", "turn-a", h1, "other").is_none());
         // Second turn posts different review for PR #2: allowed.
         assert!(dedup_check(&dedup, "pr-review", "turn-b", h2, "other").is_none());
+    }
+
+    #[test]
+    fn dedup_interleaving_does_not_defeat_check() {
+        let dir = dedup_dir();
+        let dedup = dir.join("dedup.json");
+        let hx = hash_text("review PR #1");
+        let hy = hash_text("review PR #2");
+        // Turn A posts X to pr-review.
+        assert!(dedup_check(&dedup, "pr-review", "turn-a", hx, "other").is_none());
+        // Turn C posts Y to pr-review (different content, allowed).
+        assert!(dedup_check(&dedup, "pr-review", "turn-c", hy, "other").is_none());
+        // Turn B posts X to pr-review — same content as A, must be denied.
+        let reason = dedup_check(&dedup, "pr-review", "turn-b", hx, "other");
+        assert!(
+            reason.is_some(),
+            "interleaved same-content send should be denied"
+        );
     }
 
     #[test]

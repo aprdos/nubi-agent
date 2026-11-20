@@ -134,6 +134,59 @@ fn dedup_blocks_same_content_from_different_turn_via_binary() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+fn send_text(room: &str, text: &str) -> String {
+    serde_json::json!({
+        "session_id": "s1",
+        "hook_event_name": "PreToolUse",
+        "tool_name": "mcp__nubi__nubi_send",
+        "tool_input": { "room_id": room, "text": text }
+    })
+    .to_string()
+}
+
+#[test]
+fn dedup_interleaving_via_binary() {
+    let dir = std::env::temp_dir().join(format!("nubi-dedup-hook-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let dedup = dir.join("dedup.json");
+
+    let scope_a = dir.join("scope-a.json");
+    std::fs::write(
+        &scope_a,
+        r#"{"allow":"*","room":"github","family":"github","turn_id":"turn-a"}"#,
+    )
+    .unwrap();
+    let scope_b = dir.join("scope-b.json");
+    std::fs::write(
+        &scope_b,
+        r#"{"allow":"*","room":"github","family":"github","turn_id":"turn-b"}"#,
+    )
+    .unwrap();
+    let scope_c = dir.join("scope-c.json");
+    std::fs::write(
+        &scope_c,
+        r#"{"allow":"*","room":"github","family":"github","turn_id":"turn-c"}"#,
+    )
+    .unwrap();
+
+    // A posts X to pr-review.
+    let (code, err) = run_with_dedup(&scope_a, Some(&dedup), &send_text("pr-review", "review X"));
+    assert_eq!(code, 0, "turn-a first send should pass: {err}");
+
+    // C posts Y to pr-review (different content, allowed).
+    let (code, err) = run_with_dedup(&scope_c, Some(&dedup), &send_text("pr-review", "review Y"));
+    assert_eq!(code, 0, "turn-c different content should pass: {err}");
+
+    // B posts X to pr-review — same content as A, must be denied.
+    let (code, err) = run_with_dedup(&scope_b, Some(&dedup), &send_text("pr-review", "review X"));
+    assert_eq!(
+        code, 2,
+        "turn-b same content as A after interleave should be denied: {err}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn dedup_allows_own_family_via_binary() {
     let dir = std::env::temp_dir().join(format!("nubi-dedup-hook-{}", uuid::Uuid::new_v4()));
