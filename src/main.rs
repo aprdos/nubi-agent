@@ -180,8 +180,11 @@ struct Args {
     #[arg(long, env = "NUBI_LLM_FALLBACK_MODEL", help_heading = "Model")]
     fallback_model: Option<String>,
 
-    /// Reasoning effort: low, medium, high, xhigh or max. Defaults to high
-    /// with Claude Code; other CLIs get none
+    /// Reasoning effort: low, medium, high, xhigh or max. Defaults to
+    /// medium with Claude Code; other CLIs get none. Effort decides how many
+    /// model calls a turn takes, and every call reads the whole conversation
+    /// again, so it is the main cost lever: raise it for agents that write
+    /// or review code, lower it for ones that coordinate
     #[arg(long, env = "NUBI_LLM_EFFORT", help_heading = "Model")]
     effort: Option<String>,
 
@@ -225,7 +228,7 @@ struct Args {
     #[arg(
         long,
         env = "NUBI_COMPACT_AT_PCT",
-        default_value = "60",
+        default_value = "50",
         help_heading = "Tuning"
     )]
     compact_at_pct: u8,
@@ -242,6 +245,14 @@ struct Args {
         help_heading = "Tuning"
     )]
     compact_window: u32,
+
+    /// Keep Claude Code's tool search on behind --llm-base-url, so tool
+    /// definitions load when needed instead of with every model call. Only
+    /// for a gateway that passes `tool_reference` blocks through unchanged
+    /// (the Anthropic API does; a Kiro gateway does not, and the session
+    /// gets stuck)
+    #[arg(long, env = "NUBI_TOOL_SEARCH", help_heading = "Tuning")]
+    tool_search: bool,
 
     /// Kill a run that takes longer than this many seconds and tell the room
     #[arg(
@@ -389,7 +400,7 @@ async fn main() -> anyhow::Result<()> {
     // Claude Code gets an effort level by default; everything else about the
     // model is the CLI's own unless set, so a logged-in CLI just works.
     let effort = match args.harness {
-        HarnessKind::Claude => Some(args.effort.unwrap_or_else(|| "high".to_string())),
+        HarnessKind::Claude => Some(args.effort.unwrap_or_else(|| "medium".to_string())),
         _ => args.effort,
     };
 
@@ -421,6 +432,7 @@ async fn main() -> anyhow::Result<()> {
         llm_effort: effort,
         compact_at_pct: (args.compact_at_pct > 0).then_some(args.compact_at_pct.min(100)),
         compact_window: (args.compact_window > 0).then_some(args.compact_window),
+        tool_search: args.tool_search,
         turn_timeout_secs: args.turn_timeout_secs,
         max_parallel_turns: args.max_parallel_turns,
         harness: args.harness,

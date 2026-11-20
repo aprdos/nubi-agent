@@ -37,8 +37,11 @@ const MAX_RUNS_PER_TURN: u32 = 3;
 const RETRY_BACKOFF: Duration = Duration::from_secs(2);
 
 /// A room's harness session is continued for this long after its last turn;
-/// after that the next message starts a fresh one.
-const SESSION_MAX_IDLE: Duration = Duration::from_secs(6 * 3600);
+/// after that the next message starts a fresh one. Kept short on purpose: an
+/// old conversation is read again in full by every model call of the turn
+/// that resumes it, long after the provider's prompt cache forgot it, while a
+/// fresh session starts from the room's recent messages and the journal.
+const SESSION_MAX_IDLE: Duration = Duration::from_secs(2 * 3600);
 
 /// How many of the agent's own recent turns in a room go into the prompt.
 const JOURNAL_LINES: usize = 5;
@@ -122,6 +125,7 @@ pub struct AgentConfig {
     pub llm_effort: Option<String>,
     pub compact_at_pct: Option<u8>,
     pub compact_window: Option<u32>,
+    pub tool_search: bool,
     pub turn_timeout_secs: u64,
     /// Turns that may run at once across all rooms. With 1 they run one
     /// after another in arrival order.
@@ -177,6 +181,7 @@ impl Default for AgentConfig {
             llm_effort: None,
             compact_at_pct: None,
             compact_window: None,
+            tool_search: false,
             turn_timeout_secs: crate::harness::DEFAULT_TURN_TIMEOUT.as_secs(),
             max_parallel_turns: 1,
             harness: HarnessKind::default(),
@@ -696,6 +701,7 @@ impl Agent {
             .with_effort(config.llm_effort.clone())
             .with_compact_at_pct(config.compact_at_pct)
             .with_compact_window(config.compact_window)
+            .with_tool_search(config.tool_search)
             .with_turn_timeout(Duration::from_secs(config.turn_timeout_secs.max(1)))
             .with_team_memory(team_memory)
             .with_live(config.live_sessions)
