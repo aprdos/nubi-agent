@@ -13,10 +13,17 @@
 //!
 //! **Dedup check:** when a shared dedup file is configured, the hook also
 //! refuses a send to a room that another turn already sent to within a short
-//! window. This prevents the cross-room double-post bug where two parallel
-//! turns independently post to the same destination.
+//! window, *and* with the same content. This prevents the cross-room
+//! double-post bug where two parallel turns independently post the same
+//! message to the same destination.
+//!
+//! The check only applies to rooms outside the turn's own family: a reply
+//! to the triggering room (or its parent/siblings) is never deduped, since
+//! consecutive turns answering the same room is normal behavior.
 
+use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
 use std::io::Read;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -66,11 +73,13 @@ fn allows(pattern: &str, room: &str) -> bool {
 
 // ── Dedup state ──────────────────────────────────────────────────────────
 
-/// One entry in the dedup file: who sent here and when.
+/// One entry in the dedup file: who sent here, when, and what (hashed).
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct DedupEntry {
     turn_id: String,
     ts_ms: u64,
+    #[serde(default)]
+    content_hash: u64,
 }
 
 /// Read the dedup file, pruning expired entries.
@@ -101,10 +110,25 @@ fn write_dedup(path: &Path, map: &HashMap<String, DedupEntry>) -> std::io::Resul
 }
 
 /// Check and record a send in the dedup file. Returns `None` if allowed, or
-/// a denial reason if another turn already sent to this room recently.
+/// a denial reason if another turn already sent the same content to this room
+/// recently.
+///
+/// Sends to the turn's own family (`scope_family`) are never deduped — a turn
+/// replying to its triggering room is normal, even if another turn just did
+/// too.
 ///
 /// Uses an exclusive file lock so two parallel hooks never race.
-fn dedup_check(dedup_path: &Path, target_room: &str, turn_id: &str) -> Option<String> {
+fn dedup_check(
+    dedup_path: &Path,
+    target_room: &str,
+    turn_id: &str,
+    content_hash: u64,
+    scope_family: &str,
+) -> Option<String> {
+    if is_in_family(target_room, scope_family) {
+        return None;
+    }
+
     let lock_path = dedup_path.with_extension("lock");
     let dir = lock_path.parent().unwrap_or(Path::new("."));
     let _ = std::fs::create_dir_all(dir);
@@ -129,13 +153,12 @@ fn dedup_check(dedup_path: &Path, target_room: &str, turn_id: &str) -> Option<St
 
     let mut map = read_dedup(dedup_path);
     if let Some(entry) = map.get(target_room) {
-        if entry.turn_id != turn_id {
+        if entry.turn_id != turn_id && entry.content_hash == content_hash {
             let reason = format!(
-                "another turn already sent to \"{target_room}\" in the last {} s; \
+                "another turn already sent the same message to \"{target_room}\" in the last {} s; \
                  skip this send to avoid a double reply",
                 DEDUP_TTL_MS / 1000
             );
-            // lock dropped on return
             return Some(reason);
         }
     }
@@ -144,11 +167,31 @@ fn dedup_check(dedup_path: &Path, target_room: &str, turn_id: &str) -> Option<St
         DedupEntry {
             turn_id: turn_id.to_string(),
             ts_ms: now_ms(),
+            content_hash,
         },
     );
     let _ = write_dedup(dedup_path, &map);
     None
-    // lock dropped here
+}
+
+/// Whether `room` belongs to the family rooted at `family`: the room itself,
+/// the parent, or any thread of the parent.
+fn is_in_family(room: &str, family: &str) -> bool {
+    if room == family {
+        return true;
+    }
+    let prefix = format!("thread.{family}.");
+    if let Some(rest) = room.strip_prefix(&prefix) {
+        return !rest.is_empty() && !rest.contains('.');
+    }
+    false
+}
+
+fn hash_text(text: &str) -> u64 {
+    let normalized = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut h = DefaultHasher::new();
+    normalized.hash(&mut h);
+    h.finish()
 }
 
 fn now_ms() -> u64 {
@@ -250,11 +293,15 @@ pub fn pre_tool_use(
         Decision::Deny(reason) => return (2, Some(reason)),
     }
 
-    // Dedup check (new): refuse if another turn just sent here.
+    // Dedup check: refuse if another turn just sent the same content here.
+    // Sends to the turn's own family are skipped (normal reply behavior).
     if let (Some(dp), Some(target)) = (dedup_path, input["tool_input"]["room_id"].as_str()) {
         let turn_id = scope["turn_id"].as_str().unwrap_or("");
+        let family = scope["family"].as_str().unwrap_or("");
         if !turn_id.is_empty() {
-            if let Some(reason) = dedup_check(dp, target, turn_id) {
+            let text = input["tool_input"]["text"].as_str().unwrap_or("");
+            let ch = hash_text(text);
+            if let Some(reason) = dedup_check(dp, target, turn_id, ch, family) {
                 return (2, Some(reason));
             }
         }
@@ -449,19 +496,49 @@ mod tests {
     }
 
     #[test]
-    fn dedup_allows_first_send_and_blocks_second_from_different_turn() {
+    fn dedup_allows_first_send_and_blocks_same_content_from_different_turn() {
         let dir = dedup_dir();
         let dedup = dir.join("dedup.json");
+        let h = hash_text("hi");
         // First turn sends to room-k: allowed.
-        assert!(dedup_check(&dedup, "room-k", "turn-a").is_none());
+        assert!(dedup_check(&dedup, "room-k", "turn-a", h, "other").is_none());
         // Same turn sends again: allowed (same turn_id).
-        assert!(dedup_check(&dedup, "room-k", "turn-a").is_none());
-        // Different turn sends to room-k: denied.
-        let reason = dedup_check(&dedup, "room-k", "turn-b");
-        assert!(reason.is_some(), "second turn should be denied");
+        assert!(dedup_check(&dedup, "room-k", "turn-a", h, "other").is_none());
+        // Different turn, same content to room-k: denied.
+        let reason = dedup_check(&dedup, "room-k", "turn-b", h, "other");
+        assert!(
+            reason.is_some(),
+            "same content from second turn should be denied"
+        );
         assert!(reason.unwrap().contains("another turn already sent"));
         // Different room from second turn: allowed.
-        assert!(dedup_check(&dedup, "room-m", "turn-b").is_none());
+        assert!(dedup_check(&dedup, "room-m", "turn-b", h, "other").is_none());
+    }
+
+    #[test]
+    fn dedup_allows_different_content_to_same_room() {
+        let dir = dedup_dir();
+        let dedup = dir.join("dedup.json");
+        let h1 = hash_text("review PR #1");
+        let h2 = hash_text("review PR #2");
+        // First turn posts review for PR #1.
+        assert!(dedup_check(&dedup, "pr-review", "turn-a", h1, "other").is_none());
+        // Second turn posts different review for PR #2: allowed.
+        assert!(dedup_check(&dedup, "pr-review", "turn-b", h2, "other").is_none());
+    }
+
+    #[test]
+    fn dedup_skips_own_family() {
+        let dir = dedup_dir();
+        let dedup = dir.join("dedup.json");
+        let h = hash_text("hi");
+        // Turn-a sends to general (its own family room): recorded.
+        assert!(dedup_check(&dedup, "general", "turn-a", h, "general").is_none());
+        // Turn-b also sends to general with same content, its family too: allowed.
+        assert!(dedup_check(&dedup, "general", "turn-b", h, "general").is_none());
+        // Thread of the family: also skipped.
+        assert!(dedup_check(&dedup, "thread.general.7", "turn-a", h, "general").is_none());
+        assert!(dedup_check(&dedup, "thread.general.7", "turn-b", h, "general").is_none());
     }
 
     #[test]
@@ -473,7 +550,7 @@ mod tests {
         let input = call("room-k").to_string();
         let (code, _) = pre_tool_use(&scope_path, Some(&dedup), input.as_bytes());
         assert_eq!(code, 0);
-        // Second send from different turn to same room: denied.
+        // Second send from different turn, same content to same room: denied.
         let scope_b = scope_file(&scope("github", "github", false, "turn-b"));
         let (code, msg) = pre_tool_use(&scope_b, Some(&dedup), input.as_bytes());
         assert_eq!(code, 2);
@@ -481,28 +558,52 @@ mod tests {
     }
 
     #[test]
+    fn dedup_integrates_own_family_bypass() {
+        let dir = dedup_dir();
+        let dedup = dir.join("dedup.json");
+        // Turn-a is in room general, sends to general.
+        let scope_a = scope_file(&scope("general", "general", true, "turn-a"));
+        let input = call("general").to_string();
+        let (code, _) = pre_tool_use(&scope_a, Some(&dedup), input.as_bytes());
+        assert_eq!(code, 0);
+        // Turn-b is also in general, sends same content to general: allowed (own family).
+        let scope_b = scope_file(&scope("general", "general", true, "turn-b"));
+        let (code, _) = pre_tool_use(&scope_b, Some(&dedup), input.as_bytes());
+        assert_eq!(code, 0);
+    }
+
+    #[test]
     fn dedup_entries_expire_after_ttl() {
         let dir = dedup_dir();
         let dedup = dir.join("dedup.json");
-        // Write an entry with a timestamp in the past (beyond TTL).
         let mut map = HashMap::new();
         map.insert(
             "room-old".to_string(),
             DedupEntry {
                 turn_id: "turn-old".to_string(),
                 ts_ms: now_ms().saturating_sub(DEDUP_TTL_MS + 1000),
+                content_hash: hash_text("old"),
             },
         );
         write_dedup(&dedup, &map).unwrap();
-        // A new turn should be allowed — the old entry expired.
-        assert!(dedup_check(&dedup, "room-old", "turn-new").is_none());
+        assert!(dedup_check(&dedup, "room-old", "turn-new", hash_text("old"), "other").is_none());
     }
 
     #[test]
     fn dedup_without_file_fails_open() {
         let dir = dedup_dir();
         let dedup = dir.join("nonexistent-subdir").join("dedup.json");
-        // No file yet: should allow (fail open).
-        assert!(dedup_check(&dedup, "room-k", "turn-a").is_none());
+        assert!(dedup_check(&dedup, "room-k", "turn-a", hash_text("hi"), "other").is_none());
+    }
+
+    #[test]
+    fn is_in_family_checks() {
+        assert!(is_in_family("general", "general"));
+        assert!(is_in_family("thread.general.7", "general"));
+        assert!(!is_in_family("thread.general.7.sub", "general"));
+        assert!(!is_in_family("pr-review", "general"));
+        assert!(!is_in_family("thread.other.7", "general"));
+        assert!(is_in_family("dm.a.b", "dm.a.b"));
+        assert!(is_in_family("thread.dm.a.b.3", "dm.a.b"));
     }
 }

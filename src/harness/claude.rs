@@ -185,14 +185,11 @@ impl Harness for Claude {
         if let Some(scope) = send_scope {
             match std::env::current_exe() {
                 Ok(exe) => {
-                    let dedup = scope
-                        .parent()
-                        .and_then(|p| p.parent())
-                        .map(|state_dir| state_dir.join("send-dedup.json"));
+                    let dedup = settings.state_dir().join("send-dedup.json");
                     inv.arg("--settings").arg(crate::send_guard::hook_settings(
                         &exe,
                         scope,
-                        dedup.as_deref(),
+                        Some(&dedup),
                     ));
                 }
                 Err(e) => eprintln!("[nubi-agent] No send guard: cannot locate nubi-agent ({e})"),
