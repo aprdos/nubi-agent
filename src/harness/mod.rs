@@ -98,6 +98,10 @@ pub struct Settings {
     /// The context window, in tokens, compaction is measured against, for
     /// CLIs that take one. Claude Code ignores `compact_at_pct` without it.
     pub compact_window: Option<u32>,
+    /// Leave the CLI's own tool search on behind a custom LLM base URL, for
+    /// CLIs that have one. Off, every tool definition is sent with every
+    /// model call.
+    pub tool_search: bool,
     pub turn_timeout: Duration,
     pub context_chars: usize,
     /// A file of rules shared by every agent on this machine, included in
@@ -126,6 +130,7 @@ impl Default for Settings {
             effort: None,
             compact_at_pct: None,
             compact_window: None,
+            tool_search: false,
             turn_timeout: DEFAULT_TURN_TIMEOUT,
             context_chars: DEFAULT_CONTEXT_CHARS,
             team_memory: None,
@@ -766,6 +771,11 @@ impl CliRuntime {
         self
     }
 
+    pub fn with_tool_search(mut self, on: bool) -> Self {
+        self.settings.tool_search = on;
+        self
+    }
+
     pub fn with_turn_timeout(mut self, timeout: Duration) -> Self {
         self.settings.turn_timeout = timeout;
         self
@@ -1376,7 +1386,7 @@ impl AgentRuntime for CliRuntime {
         let parsed = match (stopped, watch) {
             // Killed on purpose, so the exit status says nothing.
             (Some(reason), Some(w)) => {
-                eprintln!("[nubi-agent] Stopped {bin} early: {reason}");
+                eprintln!("[nubi-agent] Stopped {bin}: {reason}");
                 w.parsed()
             }
             _ => {
@@ -2021,6 +2031,11 @@ mod tests {
             .live_invocation(&s, "SYS", None, None)
             .unwrap();
         assert_eq!(env(&live, "ENABLE_TOOL_SEARCH"), Some("false"));
+
+        // A gateway that passes `tool_reference` through can keep the search.
+        s.tool_search = true;
+        let inv = claude::Claude.invocation(&s, "sys", "hi", None);
+        assert_eq!(env(&inv, "ENABLE_TOOL_SEARCH"), None);
     }
 
     #[test]
@@ -2127,10 +2142,11 @@ mod tests {
     }
 
     #[test]
-    fn claude_watch_stops_a_reply_repeated_after_it_was_accepted() {
-        // The loop from the CTF demo: report via nubi_send, reply post:false,
-        // then the same empty reply again and again.
-        let lines = vec![
+    fn claude_watch_stops_the_run_once_its_reply_is_accepted() {
+        // Without the stop, Claude Code calls the model once more for a
+        // closing line; through some gateways that call loops (the CTF demo:
+        // the same empty reply again and again).
+        let lines = [
             stream::init("s-9"),
             stream::tool_use(
                 "m1",
@@ -2142,35 +2158,37 @@ mod tests {
             stream::text("m2", "<thinking>reported, done</thinking>"),
             stream::tool_use("m2", "t2", "StructuredOutput", stream::SENT),
             stream::tool_result("t2", false),
-            stream::text(
-                "m3",
-                "<thinking>The user sent an empty placeholder message.</thinking>",
-            ),
-            stream::tool_use("m3", "t3", "StructuredOutput", stream::SENT),
-            stream::tool_result("t3", false),
+            stream::text("m3", "done"),
         ];
-        let (stop, p) = watch_lines(&lines);
-        assert_eq!(stop, Some(7));
+        let mut w = claude::Claude.watch().unwrap();
+        let (stop, reason) = lines
+            .iter()
+            .enumerate()
+            .find_map(|(i, l)| w.line(l).map(|r| (i, r)))
+            .unwrap();
+        assert_eq!(stop, 5);
+        assert!(reason.contains("reply was accepted"), "{reason}");
+        let p = w.parsed();
+        assert!(!p.is_error);
         let reply = structured_reply(p.structured.as_ref().unwrap()).unwrap();
         assert!(!reply.post);
         assert_eq!(p.session_id.as_deref(), Some("s-9"));
-        // m2 streamed twice (text, then tool_use) but is billed once.
-        assert_eq!(p.num_turns, Some(3));
-        assert_eq!(p.usage.input, Some(300));
+        // m2 streamed twice (text, then tool_use) but is billed once, and
+        // the closing call never happens.
+        assert_eq!(p.num_turns, Some(2));
+        assert_eq!(p.usage.input, Some(200));
         assert_eq!(p.usage.cache_write, None);
-        assert_eq!(p.model_usage["claude-opus-4-5"].output, Some(30));
+        assert_eq!(p.model_usage["claude-opus-4-5"].output, Some(20));
     }
 
     #[test]
-    fn claude_watch_lets_a_healthy_run_finish() {
+    fn claude_watch_lets_a_run_without_a_reply_finish() {
         let lines = vec![
             stream::init("s-1"),
             stream::tool_use("m1", "t1", "Bash", r#"{"command":"ls"}"#),
             stream::tool_result("t1", false),
-            stream::tool_use("m2", "t2", "StructuredOutput", stream::SENT),
-            stream::tool_result("t2", false),
-            stream::text("m3", "done"),
-            r#"{"type":"result","subtype":"success","is_error":false,"num_turns":3,"result":"done","session_id":"s-1"}"#.into(),
+            stream::text("m2", "done"),
+            r#"{"type":"result","subtype":"success","is_error":false,"num_turns":2,"result":"done","session_id":"s-1"}"#.into(),
         ];
         assert_eq!(watch_lines(&lines).0, None);
     }
@@ -2185,50 +2203,8 @@ mod tests {
             stream::text("m3", "done"),
         ];
         let (stop, p) = watch_lines(&lines);
-        assert_eq!(stop, None);
+        assert_eq!(stop, Some(3));
         assert_eq!(p.structured.unwrap()["post"], false);
-    }
-
-    #[test]
-    fn claude_watch_stops_a_run_that_keeps_polling_after_its_reply() {
-        let mut lines = vec![
-            stream::tool_use("m0", "t0", "StructuredOutput", stream::SENT),
-            stream::tool_result("t0", false),
-        ];
-        for i in 1..=10 {
-            lines.push(stream::tool_use(
-                &format!("m{i}"),
-                &format!("t{i}"),
-                "mcp__nubi__nubi_poll",
-                "{}",
-            ));
-            lines.push(stream::tool_result(&format!("t{i}"), false));
-        }
-        let (stop, p) = watch_lines(&lines);
-        // STEPS_AFTER_REPLY steps are allowed; the fourth is stopped.
-        assert_eq!(stop, Some(8));
-        assert!(p.structured.is_some());
-    }
-
-    #[test]
-    fn claude_watch_names_a_repeated_reply_over_the_step_limit() {
-        let mut lines = vec![
-            stream::tool_use("m0", "t0", "StructuredOutput", stream::SENT),
-            stream::tool_result("t0", false),
-        ];
-        for i in 1..=3 {
-            lines.push(stream::text(&format!("m{i}"), "waiting"));
-        }
-        // The fourth step is over the limit and is also a repeated reply.
-        lines.push(stream::tool_use(
-            "m4",
-            "t4",
-            "StructuredOutput",
-            stream::SENT,
-        ));
-        let mut w = claude::Claude.watch().unwrap();
-        let reason = lines.iter().find_map(|l| w.line(l)).unwrap();
-        assert!(reason.contains("StructuredOutput again"), "{reason}");
     }
 
     #[test]
@@ -2242,17 +2218,15 @@ mod tests {
     }
 
     #[test]
-    fn claude_watch_does_not_count_a_call_streamed_twice() {
-        let call = stream::tool_use("m1", "t1", "StructuredOutput", stream::SENT);
+    fn claude_watch_does_not_take_a_result_for_a_call_it_never_saw() {
         let lines = vec![
-            call.clone(),
+            stream::tool_use("m1", "t1", "Bash", r#"{"command":"ls"}"#),
             stream::tool_result("t1", false),
-            call,
-            stream::text("m2", "done"),
+            stream::tool_result("t-unknown", false),
         ];
         let (stop, p) = watch_lines(&lines);
         assert_eq!(stop, None);
-        assert!(p.structured.is_some());
+        assert!(p.structured.is_none());
     }
 
     #[test]
@@ -2261,13 +2235,20 @@ mod tests {
             r#""parent_tool_use_id":null"#,
             r#""parent_tool_use_id":"task-1""#,
         );
+        let sub_result = stream::tool_result("t9", false).replace(
+            r#""parent_tool_use_id":null"#,
+            r#""parent_tool_use_id":"task-1""#,
+        );
         let lines = vec![
-            stream::tool_use("m1", "t1", "StructuredOutput", stream::SENT),
-            stream::tool_result("t1", false),
+            stream::tool_use("m1", "t1", "Bash", r#"{"command":"ls"}"#),
             sub,
+            sub_result,
+            stream::tool_result("t1", false),
             stream::text("m2", "done"),
         ];
-        assert_eq!(watch_lines(&lines).0, None);
+        let (stop, p) = watch_lines(&lines);
+        assert_eq!(stop, None);
+        assert!(p.structured.is_none());
     }
 
     #[test]

@@ -72,8 +72,12 @@ impl Claude {
             // behind ToolSearch and `tool_reference` blocks. Through a Kiro
             // gateway the model then calls tools by mangled names (XML in the
             // name), the upstream refuses every later request carrying that
-            // call, and the session is stuck. Load the tools up front instead.
-            inv.env("ENABLE_TOOL_SEARCH", "false");
+            // call, and the session is stuck. Load the tools up front instead,
+            // unless the operator says this gateway handles the search: up
+            // front, every tool definition is paid for on every model call.
+            if !settings.tool_search {
+                inv.env("ENABLE_TOOL_SEARCH", "false");
+            }
         }
         if let Some(ref key) = settings.llm_api_key {
             inv.env("ANTHROPIC_API_KEY", key);
@@ -150,8 +154,8 @@ impl Harness for Claude {
         inv.arg("-p").arg(prompt);
         // JSON carries is_error, num_turns, session_id, cost and the
         // structured reply; plain text carries none of them. Streamed, so
-        // [`ReplyWatch`] can stop a run that loops after it has its reply;
-        // the last event is the same result object `json` prints.
+        // [`ReplyWatch`] can stop the run once it has its reply; the last
+        // event is the same result object `json` prints.
         inv.arg("--output-format").arg("stream-json");
         inv.arg("--verbose");
         inv.arg("--json-schema").arg(REPLY_SCHEMA.to_string());
@@ -277,16 +281,14 @@ impl Harness for Claude {
     }
 }
 
-/// Assistant messages a run may send after its reply was accepted; the next
-/// one stops it. A healthy run sends one, a short closing line.
-const STEPS_AFTER_REPLY: u64 = 3;
-
-/// Stops a Claude run that keeps going after its structured reply was
-/// accepted. Claude Code ends a run only when the model answers without a
-/// tool call; a model that reads the tool result of its own StructuredOutput
-/// as a new, empty message (a gateway that turns a tool-result-only turn
-/// into "(empty placeholder)" does that) calls StructuredOutput again and
-/// again until the turn timeout.
+/// Stops a Claude run as soon as its structured reply is accepted. Claude
+/// Code ends a run only when the model answers without a tool call, so after
+/// the reply it calls the model once more, with the whole conversation as
+/// input, for a closing line nobody reads. On a short turn that call is half
+/// the tokens. It can also loop there: a model that reads the tool result of
+/// its own StructuredOutput as a new, empty message (a gateway that turns a
+/// tool-result-only turn into "(empty placeholder)" does that) replies again
+/// and again until the turn timeout.
 #[derive(Default)]
 struct ReplyWatch {
     session_id: Option<String>,
@@ -298,8 +300,6 @@ struct ReplyWatch {
     /// the input of the call it accepted, so this is the same object the
     /// result event would carry.
     reply: Option<serde_json::Value>,
-    /// Assistant messages since `reply` was accepted.
-    steps_after_reply: u64,
     /// Usage per assistant message: the stream repeats a message once per
     /// content block, with the same id and usage each time.
     messages: HashMap<String, (String, TokenUsage)>,
@@ -309,6 +309,9 @@ struct ReplyWatch {
     /// than after a reply.
     failure: Option<String>,
 }
+
+/// Why [`ReplyWatch`] stops a run that went well.
+const REPLY_ACCEPTED: &str = "its reply was accepted";
 
 impl ReplyWatch {
     /// An event's id, or a fresh one when it has none, so events without
@@ -357,9 +360,6 @@ impl OutputWatch for ReplyWatch {
                 if let std::collections::hash_map::Entry::Vacant(e) = self.messages.entry(id) {
                     let model = message["model"].as_str().unwrap_or_default().to_string();
                     e.insert((model, usage(&message["usage"])));
-                    if self.reply.is_some() {
-                        self.steps_after_reply += 1;
-                    }
                 }
                 for block in message["content"].as_array().into_iter().flatten() {
                     if block["type"] != "tool_use" || block["name"] != "StructuredOutput" {
@@ -370,18 +370,7 @@ impl OutputWatch for ReplyWatch {
                     if !self.calls.insert(call.clone()) {
                         continue;
                     }
-                    if self.reply.is_some() {
-                        return Some(
-                            "it called StructuredOutput again after its reply was accepted".into(),
-                        );
-                    }
                     self.pending.insert(call, block["input"].clone());
-                }
-                if self.steps_after_reply > STEPS_AFTER_REPLY {
-                    return Some(format!(
-                        "it kept going for {} steps after its reply was accepted",
-                        self.steps_after_reply
-                    ));
                 }
             }
             Some("user") => {
@@ -398,6 +387,7 @@ impl OutputWatch for ReplyWatch {
                     // A reply that failed the schema is asked for again.
                     if block["is_error"] != true {
                         self.reply = Some(input);
+                        return Some(REPLY_ACCEPTED.into());
                     }
                 }
             }
