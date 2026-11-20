@@ -2057,13 +2057,14 @@ impl Shared {
         self.runtime.send_scope_file(key)
     }
 
-    /// Write the send lock for the next turn of the live session `key`:
+    /// Write the send guard scope for the next turn of the live session `key`:
     /// the room's family, or anywhere for a turn only `system` started.
-    fn write_send_scope(&self, key: &str, room_id: &str, expects_reply: bool) {
+    /// `turn_id` distinguishes this turn from others for destination dedup.
+    fn write_send_scope(&self, key: &str, room_id: &str, expects_reply: bool, turn_id: &str) {
         let Some(path) = self.send_scope_file(key) else {
             return;
         };
-        let scope = crate::send_guard::scope(room_id, &family_of(room_id), expects_reply);
+        let scope = crate::send_guard::scope(room_id, &family_of(room_id), expects_reply, turn_id);
         if let Err(e) = crate::send_guard::write_scope(&path, &scope) {
             eprintln!("[nubi-agent] Cannot write the send scope {:?}: {}", path, e);
         }
@@ -2774,7 +2775,8 @@ impl Shared {
         let key = self.live_key(room_id);
         let live = self.live_session(&key, cmd)?;
         let timeout = Duration::from_secs(self.config.turn_timeout_secs.max(1));
-        self.write_send_scope(&key, room_id, expects_reply);
+        let turn_id = uuid::Uuid::new_v4().to_string();
+        self.write_send_scope(&key, room_id, expects_reply, &turn_id);
         let mut turn = match live.turn(prompt, timeout).await {
             Ok(t) => t,
             Err(e) => {
@@ -2829,8 +2831,9 @@ impl Shared {
                         .join(", ")
                 ),
             };
-            // The nudge is about these rooms only.
-            self.write_send_scope(&key, room_id, true);
+            // The nudge is about these rooms only. Same turn_id: it is a
+            // continuation, not a new turn.
+            self.write_send_scope(&key, room_id, true, &turn_id);
             match live.turn(&nudge, timeout).await {
                 Ok(next) => {
                     let mut sent = std::mem::take(&mut turn.sent_to);
