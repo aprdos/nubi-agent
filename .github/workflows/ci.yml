@@ -18,6 +18,11 @@ env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
 
+# A new push to the same PR or branch cancels the run it supersedes
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 jobs:
   # Falls back to GitHub-hosted whenever USE_SELF_HOSTED is unset; without the
   # fallback the job queues forever if no self-hosted runner is registered.
