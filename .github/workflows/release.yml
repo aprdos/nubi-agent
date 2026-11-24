@@ -104,6 +104,10 @@ jobs:
         if: contains(matrix.target, 'linux-musl')
         run: sudo apt-get update -qq && sudo apt-get install -y -qq musl-tools
       - name: Build
+        # Windows: link the C runtime in, so nubi-agent.exe runs on a PC
+        # without the Visual C++ redistributable (no VCRUNTIME140.dll)
+        env:
+          RUSTFLAGS: ${{ contains(matrix.target, 'windows') && '-C target-feature=+crt-static' || '' }}
         run: cargo build --release --locked --target ${{ matrix.target }} --bin nubi-agent
       - name: Package
         id: pkg
