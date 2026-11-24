@@ -1,0 +1,150 @@
+name: Release
+
+# Builds nubi-agent for every platform the one-line installers support and
+# publishes them as a GitHub release, which the installers download:
+#
+#   curl -fsSL https://nubi.chat/agent/install.sh | sh     (macOS, Linux)
+#   irm https://nubi.chat/agent/install.ps1 | iex          (Windows)
+#
+# Push a tag (git tag v0.1.0 && git push origin v0.1.0), or run it by hand with
+# one. The release stays a draft until every build and SHA256SUMS are up, so
+# "latest" never points at a release missing a platform. If a build fails,
+# re-run the failed jobs (the draft picks up where it was), or delete the draft.
+# A published release is never rebuilt: that would swap its files under people
+# installing it; release a new tag instead.
+#
+# GitHub-hosted runners on purpose: this repo is public, so they cost nothing,
+# and they are the only way to build natively for macOS, Linux arm64 and
+# Windows. Each build uploads straight to the release; no workflow artifacts.
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Tag to release (made on the commit the workflow runs from, if it doesn't exist yet)
+        required: true
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  TAG: ${{ github.event.inputs.tag || github.ref_name }}
+
+concurrency:
+  group: release-${{ github.event.inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  draft:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Create the draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            if [ "$(gh release view "$TAG" --json isDraft -q .isDraft)" != true ]; then
+              echo "::error::$TAG is already published; release a new tag instead"
+              exit 1
+            fi
+            echo "Draft $TAG exists; builds will replace its files."
+          else
+            gh release create "$TAG" --draft --target "$GITHUB_SHA" --title "nubi-agent $TAG" --generate-notes
+          fi
+
+  build:
+    needs: draft
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            os: macos-latest
+          - target: x86_64-apple-darwin
+            os: macos-latest
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-24.04-arm
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+    env:
+      # cc-rs would fall back to the glibc gcc for aarch64 musl; use musl's
+      CC_aarch64_unknown_linux_musl: musl-gcc
+      CC_x86_64_unknown_linux_musl: musl-gcc
+    steps:
+      # The tag's commit: a run started by hand for an existing tag would
+      # otherwise build the branch it was started from. A new tag doesn't exist
+      # yet, so that builds the commit the draft will tag.
+      - name: Which commit
+        id: src
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if git ls-remote --exit-code --tags "https://github.com/${{ github.repository }}.git" "refs/tags/$TAG" >/dev/null 2>&1; then
+            echo "ref=refs/tags/$TAG" >> "$GITHUB_OUTPUT"
+          else
+            echo "ref=$GITHUB_SHA" >> "$GITHUB_OUTPUT"
+          fi
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.src.outputs.ref }}
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - name: musl toolchain
+        if: contains(matrix.target, 'linux-musl')
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq musl-tools
+      - name: Build
+        # Windows: link the C runtime in, so nubi-agent.exe runs on a PC
+        # without the Visual C++ redistributable (no VCRUNTIME140.dll)
+        env:
+          RUSTFLAGS: ${{ contains(matrix.target, 'windows') && '-C target-feature=+crt-static' || '' }}
+        run: cargo build --release --locked --target ${{ matrix.target }} --bin nubi-agent
+      - name: Package
+        id: pkg
+        run: |
+          dir=target/${{ matrix.target }}/release
+          name=nubi-agent-${{ matrix.target }}
+          if [[ "${{ matrix.target }}" == *windows* ]]; then
+            7z a -tzip "$name.zip" "./$dir/nubi-agent.exe" >/dev/null
+            echo "file=$name.zip" >> "$GITHUB_OUTPUT"
+          else
+            tar -C "$dir" -czf "$name.tar.gz" nubi-agent
+            echo "file=$name.tar.gz" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Check it runs
+        if: "!contains(matrix.target, 'x86_64-apple-darwin')"
+        run: |
+          bin=target/${{ matrix.target }}/release/nubi-agent
+          [[ "${{ matrix.target }}" == *windows* ]] && bin="$bin.exe"
+          "$bin" --version
+      - name: Upload to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "$TAG" "${{ steps.pkg.outputs.file }}" --clobber
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Checksums, then publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir dist && cd dist
+          gh release download "$TAG" --pattern 'nubi-agent-*'
+          sha256sum nubi-agent-* > SHA256SUMS
+          cat SHA256SUMS
+          [ "$(wc -l < SHA256SUMS)" -eq 5 ] || { echo "::error::expected 5 builds"; exit 1; }
+          gh release upload "$TAG" SHA256SUMS --clobber
+          gh release edit "$TAG" --draft=false --latest
