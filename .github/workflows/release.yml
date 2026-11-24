@@ -8,7 +8,10 @@ name: Release
 #
 # Push a tag (git tag v0.1.0 && git push origin v0.1.0), or run it by hand with
 # one. The release stays a draft until every build and SHA256SUMS are up, so
-# "latest" never points at a release missing a platform.
+# "latest" never points at a release missing a platform. If a build fails,
+# re-run the failed jobs (the draft picks up where it was), or delete the draft.
+# A published release is never rebuilt: that would swap its files under people
+# installing it; release a new tag instead.
 #
 # GitHub-hosted runners on purpose: this repo is public, so they cost nothing,
 # and they are the only way to build natively for macOS, Linux arm64 and
@@ -20,7 +23,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: Tag to release (created on main if it doesn't exist)
+        description: Tag to release (made on the commit the workflow runs from, if it doesn't exist yet)
         required: true
 
 permissions:
@@ -44,7 +47,11 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           if gh release view "$TAG" >/dev/null 2>&1; then
-            echo "Release $TAG exists; builds will replace its files."
+            if [ "$(gh release view "$TAG" --json isDraft -q .isDraft)" != true ]; then
+              echo "::error::$TAG is already published; release a new tag instead"
+              exit 1
+            fi
+            echo "Draft $TAG exists; builds will replace its files."
           else
             gh release create "$TAG" --draft --target "$GITHUB_SHA" --title "nubi-agent $TAG" --generate-notes
           fi
@@ -69,8 +76,27 @@ jobs:
     defaults:
       run:
         shell: bash
+    env:
+      # cc-rs would fall back to the glibc gcc for aarch64 musl; use musl's
+      CC_aarch64_unknown_linux_musl: musl-gcc
+      CC_x86_64_unknown_linux_musl: musl-gcc
     steps:
+      # The tag's commit: a run started by hand for an existing tag would
+      # otherwise build the branch it was started from. A new tag doesn't exist
+      # yet, so that builds the commit the draft will tag.
+      - name: Which commit
+        id: src
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if git ls-remote --exit-code --tags "https://github.com/${{ github.repository }}.git" "refs/tags/$TAG" >/dev/null 2>&1; then
+            echo "ref=refs/tags/$TAG" >> "$GITHUB_OUTPUT"
+          else
+            echo "ref=$GITHUB_SHA" >> "$GITHUB_OUTPUT"
+          fi
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.src.outputs.ref }}
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}

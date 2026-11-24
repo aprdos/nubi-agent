@@ -41,7 +41,7 @@ It downloads the build for your machine from the latest
 [release](https://github.com/aprdos/nubi-agent/releases), checks it against the
 release's `SHA256SUMS`, and installs `nubi-agent` (into `~/.local/bin` on macOS
 and Linux; onto your PATH on Windows). Run it again to update. Or build it from
-source with Rust 1.80+:
+source with Rust:
 
 ```bash
 cargo install --locked --git https://github.com/aprdos/nubi-agent
