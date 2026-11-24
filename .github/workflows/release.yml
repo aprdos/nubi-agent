@@ -1,0 +1,120 @@
+name: Release
+
+# Builds nubi-agent for every platform the one-line installers support and
+# publishes them as a GitHub release, which the installers download:
+#
+#   curl -fsSL https://nubi.chat/agent/install.sh | sh     (macOS, Linux)
+#   irm https://nubi.chat/agent/install.ps1 | iex          (Windows)
+#
+# Push a tag (git tag v0.1.0 && git push origin v0.1.0), or run it by hand with
+# one. The release stays a draft until every build and SHA256SUMS are up, so
+# "latest" never points at a release missing a platform.
+#
+# GitHub-hosted runners on purpose: this repo is public, so they cost nothing,
+# and they are the only way to build natively for macOS, Linux arm64 and
+# Windows. Each build uploads straight to the release; no workflow artifacts.
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Tag to release (created on main if it doesn't exist)
+        required: true
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  TAG: ${{ github.event.inputs.tag || github.ref_name }}
+
+concurrency:
+  group: release-${{ github.event.inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  draft:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Create the draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release $TAG exists; builds will replace its files."
+          else
+            gh release create "$TAG" --draft --target "$GITHUB_SHA" --title "nubi-agent $TAG" --generate-notes
+          fi
+
+  build:
+    needs: draft
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            os: macos-latest
+          - target: x86_64-apple-darwin
+            os: macos-latest
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-24.04-arm
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - name: musl toolchain
+        if: contains(matrix.target, 'linux-musl')
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq musl-tools
+      - name: Build
+        run: cargo build --release --locked --target ${{ matrix.target }} --bin nubi-agent
+      - name: Package
+        id: pkg
+        run: |
+          dir=target/${{ matrix.target }}/release
+          name=nubi-agent-${{ matrix.target }}
+          if [[ "${{ matrix.target }}" == *windows* ]]; then
+            7z a -tzip "$name.zip" "./$dir/nubi-agent.exe" >/dev/null
+            echo "file=$name.zip" >> "$GITHUB_OUTPUT"
+          else
+            tar -C "$dir" -czf "$name.tar.gz" nubi-agent
+            echo "file=$name.tar.gz" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Check it runs
+        if: "!contains(matrix.target, 'x86_64-apple-darwin')"
+        run: |
+          bin=target/${{ matrix.target }}/release/nubi-agent
+          [[ "${{ matrix.target }}" == *windows* ]] && bin="$bin.exe"
+          "$bin" --version
+      - name: Upload to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "$TAG" "${{ steps.pkg.outputs.file }}" --clobber
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Checksums, then publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir dist && cd dist
+          gh release download "$TAG" --pattern 'nubi-agent-*'
+          sha256sum nubi-agent-* > SHA256SUMS
+          cat SHA256SUMS
+          [ "$(wc -l < SHA256SUMS)" -eq 5 ] || { echo "::error::expected 5 builds"; exit 1; }
+          gh release upload "$TAG" SHA256SUMS --clobber
+          gh release edit "$TAG" --draft=false --latest

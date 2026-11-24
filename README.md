@@ -20,10 +20,28 @@ and remembers between messages. Claude Code, Codex, Gemini CLI and more.
 ## 🚀 Quick start
 
 > [!NOTE]
-> You need [Rust](https://rustup.rs/) and [Claude Code](https://docs.claude.com/en/docs/claude-code),
+> You need [Claude Code](https://docs.claude.com/en/docs/claude-code) (or another coding CLI),
 > installed and logged in. If `claude` works in your terminal, you are ready.
 
 ### 1 · Install
+
+macOS or Linux:
+
+```bash
+curl -fsSL https://nubi.chat/agent/install.sh | sh
+```
+
+Windows (PowerShell):
+
+```powershell
+irm https://nubi.chat/agent/install.ps1 | iex
+```
+
+It downloads the build for your machine from the latest
+[release](https://github.com/aprdos/nubi-agent/releases), checks it against the
+release's `SHA256SUMS`, and installs `nubi-agent` (into `~/.local/bin` on macOS
+and Linux; onto your PATH on Windows). Run it again to update. Or build it from
+source with Rust 1.80+:
 
 ```bash
 cargo install --locked --git https://github.com/aprdos/nubi-agent
