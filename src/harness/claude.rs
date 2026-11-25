@@ -4,6 +4,14 @@ use std::path::{Path, PathBuf};
 use super::{write_private, Harness, Invocation, OutputWatch, Parsed, Settings, REPLY_SCHEMA};
 use crate::runtime::{Session, TokenUsage};
 
+/// Tools the agent must never call: they are either host-only (the agent
+/// runtime manages them) or cannot work inside a headless `-p` run.
+const DISALLOWED_TOOLS: &str = "\
+    SendMessage,ListAgents,Workflow,ScheduleWakeup,\
+    CronCreate,CronDelete,CronList,\
+    EnterWorktree,ExitWorktree,\
+    ReportFindings,NotebookEdit";
+
 /// Anthropic Claude Code: `claude -p`.
 pub struct Claude;
 
@@ -52,6 +60,7 @@ impl Claude {
                 // variadic flag from swallowing the next argument.
                 .arg("--allowedTools=mcp__nubi");
         }
+        inv.arg(format!("--disallowedTools={DISALLOWED_TOOLS}"));
         if let Some(pct) = settings.compact_at_pct {
             // Claude Code's own auto-compaction, as a share of the context
             // window; the default waits until the window is nearly full.

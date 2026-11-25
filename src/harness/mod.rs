@@ -76,7 +76,7 @@ pub const DEFAULT_TURN_TIMEOUT: Duration = Duration::from_secs(900);
 
 /// Roughly how much room history goes into a prompt, in characters (about
 /// four per token). The newest messages win.
-pub const DEFAULT_CONTEXT_CHARS: usize = 24_000;
+pub const DEFAULT_CONTEXT_CHARS: usize = 16_000;
 
 /// Run settings shared by every harness.
 #[derive(Debug, Clone)]
