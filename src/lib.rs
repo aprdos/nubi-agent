@@ -1,5 +1,6 @@
 pub mod agent;
 pub mod buffer;
+pub mod hardening;
 pub mod harness;
 pub mod live;
 pub mod mandate;
