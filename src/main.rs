@@ -665,7 +665,7 @@ mod tests {
     async fn mock_models_api(max_input: Option<u64>) -> String {
         use axum::{routing::get, Json, Router};
         let app = Router::new().route(
-            "/v1/models/*rest",
+            "/v1/models/{*rest}",
             get(move || async move {
                 match max_input {
                     Some(n) => Json(serde_json::json!({
