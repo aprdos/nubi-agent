@@ -349,6 +349,7 @@ fn run_hook(argv: Vec<std::ffi::OsString>) -> i32 {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    nubi_agent::hardening::deny_same_user_inspection();
     let argv: Vec<std::ffi::OsString> = std::env::args_os().collect();
     if argv.get(1).is_some_and(|a| a == "hook") {
         std::process::exit(run_hook(argv[1..].to_vec()));
