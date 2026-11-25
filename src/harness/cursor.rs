@@ -24,7 +24,12 @@ impl Harness for Cursor {
         "AGENTS.md"
     }
 
-    fn prepare(&self, settings: &Settings, _system_prompt: &str, _mandate_hash: Option<&str>) -> anyhow::Result<()> {
+    fn prepare(
+        &self,
+        settings: &Settings,
+        _system_prompt: &str,
+        _mandate_hash: Option<&str>,
+    ) -> anyhow::Result<()> {
         warn_unsupported(self.binary(), "an LLM base URL", &settings.llm_base_url);
 
         let Some(ref mcp) = settings.mcp else {

@@ -2838,7 +2838,12 @@ mod tests {
         fn memory_file(&self) -> &'static str {
             "MEMORY.md"
         }
-        fn prepare(&self, _settings: &Settings, system_prompt: &str, _mandate_hash: Option<&str>) -> anyhow::Result<()> {
+        fn prepare(
+            &self,
+            _settings: &Settings,
+            system_prompt: &str,
+            _mandate_hash: Option<&str>,
+        ) -> anyhow::Result<()> {
             if self.fail.load(Ordering::SeqCst) {
                 anyhow::bail!("disk full");
             }

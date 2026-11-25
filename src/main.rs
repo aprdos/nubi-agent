@@ -344,17 +344,23 @@ const COMPACT_WINDOW_FALLBACK: u32 = 200_000;
 // Temporary until WS-M re-measure; explicit env bypasses.
 const COMPACT_WINDOW_CAP: u32 = 200_000;
 
-async fn lookup_model_window(base_url: &str, model: &str) -> Option<u32> {
+async fn lookup_model_window(base_url: &str, model: &str, api_key: Option<&str>) -> Option<u32> {
     let url = format!("{}/v1/models/{}", base_url.trim_end_matches('/'), model);
-    let resp = reqwest::Client::builder()
+    let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(5))
         .build()
-        .ok()?
-        .get(&url)
-        .send()
-        .await
         .ok()?;
+    let mut req = client.get(&url).header("anthropic-version", "2023-06-01");
+    if let Some(key) = api_key {
+        req = req.header("x-api-key", key);
+    }
+    let resp = req.send().await.ok()?;
     if !resp.status().is_success() {
+        eprintln!(
+            "[nubi-agent] Models API {} returned {}",
+            model,
+            resp.status()
+        );
         return None;
     }
     let body: serde_json::Value = resp.json().await.ok()?;
@@ -370,17 +376,23 @@ async fn resolve_compact_window(args: &Args) -> Option<u32> {
     if !matches!(args.harness, HarnessKind::Claude) {
         return None;
     }
+    let model = match args.model.as_deref() {
+        Some(m) => m,
+        None => {
+            eprintln!(
+                "[nubi-agent] compact window: {COMPACT_WINDOW_FALLBACK} (no --model, using fallback)"
+            );
+            return Some(COMPACT_WINDOW_FALLBACK);
+        }
+    };
     let base = args
         .llm_base_url
         .as_deref()
         .unwrap_or("https://api.anthropic.com");
-    let model = args
-        .model
-        .as_deref()
-        .unwrap_or("claude-sonnet-4-20250514");
-    let primary = lookup_model_window(base, model).await;
+    let api_key = args.llm_key.as_deref();
+    let primary = lookup_model_window(base, model, api_key).await;
     let window = if let Some(ref fb) = args.fallback_model {
-        let fb_window = lookup_model_window(base, fb).await;
+        let fb_window = lookup_model_window(base, fb, api_key).await;
         match (primary, fb_window) {
             (Some(p), Some(f)) => Some(p.min(f)),
             (Some(p), None) => Some(p),
@@ -448,6 +460,8 @@ async fn main() -> anyhow::Result<()> {
         .llm_provider
         .clone()
         .unwrap_or_else(|| infer_provider(args.llm_base_url.as_deref(), args.harness));
+    // Claude Code gets an effort level by default; everything else about the
+    // model is the CLI's own unless set, so a logged-in CLI just works.
     let effort = match args.harness {
         HarnessKind::Claude => Some(args.effort.unwrap_or_else(|| "medium".to_string())),
         _ => args.effort,
@@ -564,9 +578,7 @@ fn infer_provider(base_url: Option<&str>, harness: HarnessKind) -> String {
 mod tests {
     use super::HarnessKind;
     use super::{default_mcp_url, infer_provider, lookup_model_window, resolve_compact_window};
-    use super::{
-        Args, COMPACT_WINDOW_CAP, COMPACT_WINDOW_FALLBACK, HOSTED_ENGINE,
-    };
+    use super::{Args, COMPACT_WINDOW_CAP, COMPACT_WINDOW_FALLBACK, HOSTED_ENGINE};
     use clap::{CommandFactory, Parser};
 
     #[test]
@@ -662,20 +674,68 @@ mod tests {
         Args::command().debug_assert();
     }
 
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    struct MockModelsConfig {
+        windows: HashMap<String, u64>,
+        require_auth: bool,
+    }
+
     async fn mock_models_api(max_input: Option<u64>) -> String {
-        use axum::{routing::get, Json, Router};
-        let app = Router::new().route(
-            "/v1/models/{*rest}",
-            get(move || async move {
-                match max_input {
-                    Some(n) => Json(serde_json::json!({
-                        "id": "claude-sonnet-4-20250514",
-                        "max_input_tokens": n,
-                    })),
-                    None => Json(serde_json::json!({"id": "unknown"})),
-                }
-            }),
-        );
+        let mut windows = HashMap::new();
+        if let Some(n) = max_input {
+            windows.insert("*".to_string(), n);
+        }
+        mock_models_api_ext(windows, false).await
+    }
+
+    async fn mock_models_api_ext(windows: HashMap<String, u64>, require_auth: bool) -> String {
+        use axum::{
+            extract::{Path, State},
+            http::{HeaderMap, StatusCode},
+            response::IntoResponse,
+            routing::get,
+            Json, Router,
+        };
+
+        let config = Arc::new(MockModelsConfig {
+            windows,
+            require_auth,
+        });
+
+        async fn handler(
+            State(config): State<Arc<MockModelsConfig>>,
+            Path(model_id): Path<String>,
+            headers: HeaderMap,
+        ) -> impl IntoResponse {
+            if config.require_auth
+                && !headers.contains_key("x-api-key")
+                && !headers.contains_key("authorization")
+            {
+                return (
+                    StatusCode::UNAUTHORIZED,
+                    Json(serde_json::json!({"error": "unauthorized"})),
+                )
+                    .into_response();
+            }
+            let window = config
+                .windows
+                .get(&model_id)
+                .or_else(|| config.windows.get("*"));
+            match window {
+                Some(&n) => Json(serde_json::json!({
+                    "id": model_id,
+                    "max_input_tokens": n,
+                }))
+                .into_response(),
+                None => Json(serde_json::json!({"id": model_id})).into_response(),
+            }
+        }
+
+        let app = Router::new()
+            .route("/v1/models/{model_id}", get(handler))
+            .with_state(config);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
@@ -685,21 +745,30 @@ mod tests {
     #[tokio::test]
     async fn lookup_model_window_returns_max_input_tokens() {
         let url = mock_models_api(Some(180_000)).await;
-        let w = lookup_model_window(&url, "claude-sonnet-4-20250514").await;
+        let w = lookup_model_window(&url, "claude-sonnet-4-20250514", None).await;
         assert_eq!(w, Some(180_000));
     }
 
     #[tokio::test]
     async fn lookup_model_window_returns_none_when_field_missing() {
         let url = mock_models_api(None).await;
-        let w = lookup_model_window(&url, "claude-sonnet-4-20250514").await;
+        let w = lookup_model_window(&url, "claude-sonnet-4-20250514", None).await;
         assert_eq!(w, None);
     }
 
     #[tokio::test]
     async fn lookup_model_window_returns_none_on_connection_error() {
-        let w = lookup_model_window("http://127.0.0.1:1", "x").await;
+        let w = lookup_model_window("http://127.0.0.1:1", "x", None).await;
         assert_eq!(w, None);
+    }
+
+    #[tokio::test]
+    async fn lookup_model_window_sends_auth_header() {
+        let url = mock_models_api_ext(HashMap::from([("*".to_string(), 180_000)]), true).await;
+        let without = lookup_model_window(&url, "claude-sonnet-4-20250514", None).await;
+        assert_eq!(without, None, "should fail without api key");
+        let with = lookup_model_window(&url, "claude-sonnet-4-20250514", Some("sk-test")).await;
+        assert_eq!(with, Some(180_000), "should succeed with api key");
     }
 
     #[tokio::test]
@@ -717,14 +786,9 @@ mod tests {
 
     #[tokio::test]
     async fn resolve_zero_disables_compaction() {
-        let args = Args::try_parse_from([
-            "nubi-agent",
-            "--token",
-            "nubi_x",
-            "--compact-window",
-            "0",
-        ])
-        .unwrap();
+        let args =
+            Args::try_parse_from(["nubi-agent", "--token", "nubi_x", "--compact-window", "0"])
+                .unwrap();
         assert_eq!(resolve_compact_window(&args).await, None);
     }
 
@@ -737,9 +801,20 @@ mod tests {
             "nubi_x",
             "--llm-base-url",
             &url,
+            "--model",
+            "claude-sonnet-4-20250514",
         ])
         .unwrap();
         assert_eq!(resolve_compact_window(&args).await, Some(180_000));
+    }
+
+    #[tokio::test]
+    async fn resolve_uses_fallback_when_no_model() {
+        let args = Args::try_parse_from(["nubi-agent", "--token", "nubi_x"]).unwrap();
+        assert_eq!(
+            resolve_compact_window(&args).await,
+            Some(COMPACT_WINDOW_FALLBACK)
+        );
     }
 
     #[tokio::test]
@@ -750,6 +825,8 @@ mod tests {
             "nubi_x",
             "--llm-base-url",
             "http://127.0.0.1:1",
+            "--model",
+            "claude-sonnet-4-20250514",
         ])
         .unwrap();
         assert_eq!(
@@ -767,6 +844,8 @@ mod tests {
             "nubi_x",
             "--llm-base-url",
             &url,
+            "--model",
+            "claude-sonnet-4-20250514",
         ])
         .unwrap();
         assert_eq!(
@@ -784,6 +863,8 @@ mod tests {
             "nubi_x",
             "--llm-base-url",
             &url,
+            "--model",
+            "claude-sonnet-4-20250514",
         ])
         .unwrap();
         assert_eq!(resolve_compact_window(&args).await, Some(100_000));
@@ -804,7 +885,14 @@ mod tests {
 
     #[tokio::test]
     async fn resolve_uses_min_of_primary_and_fallback_model() {
-        let url = mock_models_api(Some(180_000)).await;
+        let url = mock_models_api_ext(
+            HashMap::from([
+                ("claude-sonnet-4-20250514".to_string(), 180_000),
+                ("claude-haiku-4-5-20241022".to_string(), 150_000),
+            ]),
+            false,
+        )
+        .await;
         let args = Args::try_parse_from([
             "nubi-agent",
             "--token",
@@ -817,19 +905,13 @@ mod tests {
             "claude-haiku-4-5-20241022",
         ])
         .unwrap();
-        assert_eq!(resolve_compact_window(&args).await, Some(180_000));
+        assert_eq!(resolve_compact_window(&args).await, Some(150_000));
     }
 
     #[tokio::test]
     async fn resolve_returns_none_for_non_claude() {
-        let args = Args::try_parse_from([
-            "nubi-agent",
-            "--token",
-            "nubi_x",
-            "--harness",
-            "codex",
-        ])
-        .unwrap();
+        let args = Args::try_parse_from(["nubi-agent", "--token", "nubi_x", "--harness", "codex"])
+            .unwrap();
         assert_eq!(resolve_compact_window(&args).await, None);
     }
 }
