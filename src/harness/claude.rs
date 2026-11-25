@@ -133,14 +133,24 @@ impl Harness for Claude {
         Some(workspace.join(".claude").join("skills"))
     }
 
-    fn prepare(&self, settings: &Settings, _system_prompt: &str) -> anyhow::Result<()> {
+    fn prepare(
+        &self,
+        settings: &Settings,
+        _system_prompt: &str,
+        mandate_hash: Option<&str>,
+    ) -> anyhow::Result<()> {
         if let Some(ref mcp) = settings.mcp {
+            let mut headers =
+                serde_json::json!({ "Authorization": format!("Bearer {}", mcp.token) });
+            if let Some(hash) = mandate_hash {
+                headers["X-Nubi-Mandate-Hash"] = serde_json::Value::String(hash.to_string());
+            }
             let config = serde_json::json!({
                 "mcpServers": {
                     "nubi": {
                         "type": "http",
                         "url": mcp.url,
-                        "headers": { "Authorization": format!("Bearer {}", mcp.token) }
+                        "headers": headers
                     }
                 }
             });

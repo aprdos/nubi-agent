@@ -33,7 +33,7 @@ impl Harness for Gemini {
         "GEMINI.md"
     }
 
-    fn prepare(&self, settings: &Settings, system_prompt: &str) -> anyhow::Result<()> {
+    fn prepare(&self, settings: &Settings, system_prompt: &str, _mandate_hash: Option<&str>) -> anyhow::Result<()> {
         write_private(&Self::system_prompt_path(settings), system_prompt)?;
 
         // Loaded as the system settings tier, so the user's own

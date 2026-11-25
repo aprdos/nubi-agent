@@ -267,8 +267,14 @@ pub trait Harness: Send + Sync {
     }
 
     /// Write whatever config this CLI needs before the first run. Called once,
-    /// with the final system prompt.
-    fn prepare(&self, _settings: &Settings, _system_prompt: &str) -> anyhow::Result<()> {
+    /// with the final system prompt. `mandate_hash` is the K0 claim the MCP
+    /// server can use to skip a redundant `nubi_get_mandate`.
+    fn prepare(
+        &self,
+        _settings: &Settings,
+        _system_prompt: &str,
+        _mandate_hash: Option<&str>,
+    ) -> anyhow::Result<()> {
         Ok(())
     }
 
@@ -863,8 +869,9 @@ impl CliRuntime {
     /// again whenever the skills change: some CLIs (Gemini, OpenCode) read
     /// the prompt from a file written here rather than from each invocation.
     fn prepare_harness(&self) -> anyhow::Result<()> {
+        let (prompt, hash) = self.system_prompt_and_hash();
         self.harness
-            .prepare(&self.settings, &self.build_system_prompt())?;
+            .prepare(&self.settings, &prompt, hash.as_deref())?;
         self.prepared.store(true, Ordering::SeqCst);
         Ok(())
     }
@@ -1558,8 +1565,12 @@ impl AgentRuntime for CliRuntime {
         // run cannot pick up the new prompt before it is on disk.
         let mut skills = self.skills.write().unwrap();
         if self.prepared.load(Ordering::SeqCst) {
-            self.harness
-                .prepare(&self.settings, &self.render_system_prompt(&next))?;
+            let hash = next.mandate.as_ref().map(Mandate::computed_hash);
+            self.harness.prepare(
+                &self.settings,
+                &self.render_system_prompt(&next),
+                hash.as_deref(),
+            )?;
         }
         *skills = next;
         Ok(())
@@ -1992,6 +2003,41 @@ mod tests {
         assert_eq!(env(&inv, "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"), Some("60"));
         assert_eq!(env(&inv, "CLAUDE_CODE_AUTO_COMPACT_WINDOW"), Some("200000"));
         assert!(!has(&inv, "--resume") && !has(&inv, "--session-id"));
+    }
+
+    #[test]
+    fn claude_disallowed_tools_carries_exact_list() {
+        let inv = claude::Claude.invocation(&settings(), "SYS", "hi", None);
+        let flag = inv
+            .args
+            .iter()
+            .find(|a| a.starts_with("--disallowedTools="))
+            .expect("--disallowedTools flag must be present");
+        let tools: std::collections::HashSet<&str> = flag
+            .strip_prefix("--disallowedTools=")
+            .unwrap()
+            .split(',')
+            .collect();
+        // Host-only tools the agent must never call.
+        for t in [
+            "SendMessage",
+            "ListAgents",
+            "Workflow",
+            "ScheduleWakeup",
+            "CronCreate",
+            "CronDelete",
+            "CronList",
+            "EnterWorktree",
+            "ExitWorktree",
+            "ReportFindings",
+            "NotebookEdit",
+        ] {
+            assert!(tools.contains(t), "{t} must be disallowed");
+        }
+        // Tools the agent needs — must NOT be disallowed.
+        for t in ["Edit", "TaskStop", "Read", "Write", "Bash", "WebFetch"] {
+            assert!(!tools.contains(t), "{t} must stay allowed");
+        }
     }
 
     #[test]
@@ -2792,7 +2838,7 @@ mod tests {
         fn memory_file(&self) -> &'static str {
             "MEMORY.md"
         }
-        fn prepare(&self, _settings: &Settings, system_prompt: &str) -> anyhow::Result<()> {
+        fn prepare(&self, _settings: &Settings, system_prompt: &str, _mandate_hash: Option<&str>) -> anyhow::Result<()> {
             if self.fail.load(Ordering::SeqCst) {
                 anyhow::bail!("disk full");
             }
