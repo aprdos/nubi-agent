@@ -1039,6 +1039,27 @@ fn with_files(text: &str, files: &[FileRef]) -> String {
     }
 }
 
+/// Render a message that has some files downloaded (attachments) and
+/// possibly more that were not (the tail of `files` beyond the downloaded
+/// count). Downloaded files get their saved path; the rest get name-only.
+fn with_attachments_and_remaining(
+    text: &str,
+    attachments: &[Attachment],
+    files: &[FileRef],
+) -> String {
+    let mut out = with_attachments(text, attachments);
+    let remaining = files.get(attachments.len()..).unwrap_or(&[]);
+    if !remaining.is_empty() {
+        let names: Vec<String> = remaining
+            .iter()
+            .map(|f| format!("({}: {})", file_kind_word(&f.mime_type), one_line(&f.name)))
+            .collect();
+        out.push('\n');
+        out.push_str(&names.join("\n"));
+    }
+    out
+}
+
 /// A message being answered, followed by one line per attachment: where it
 /// was saved, so the model can open it with its file tools, or that it could
 /// not be fetched.
@@ -1172,7 +1193,15 @@ impl AgentRuntime for CliRuntime {
                         &msg.cc,
                         now
                     ),
-                    untrusted(&with_files(&msg.text, &msg.files))
+                    if msg.attachments.is_empty() {
+                        untrusted(&with_files(&msg.text, &msg.files))
+                    } else {
+                        untrusted(&with_attachments_and_remaining(
+                            &msg.text,
+                            &msg.attachments,
+                            &msg.files,
+                        ))
+                    }
                 ));
             }
             prompt.push('\n');
@@ -1211,7 +1240,15 @@ impl AgentRuntime for CliRuntime {
                         &msg.cc,
                         now
                     ),
-                    untrusted(&with_files(&msg.text, &msg.files))
+                    if msg.attachments.is_empty() {
+                        untrusted(&with_files(&msg.text, &msg.files))
+                    } else {
+                        untrusted(&with_attachments_and_remaining(
+                            &msg.text,
+                            &msg.attachments,
+                            &msg.files,
+                        ))
+                    }
                 );
                 if used + line.len() > self.settings.context_chars && !kept.is_empty() {
                     break;
@@ -1624,6 +1661,7 @@ mod tests {
             mentions: vec![],
             cc: Vec::new(),
             files: vec![],
+            attachments: vec![],
         }
     }
 
@@ -1793,6 +1831,128 @@ mod tests {
             prompt.contains("alice]\n(attached image cat.png: saved at /ws/a.png, open it to see it)\n\n[Your response]"),
             "{prompt}"
         );
+    }
+
+    #[test]
+    fn context_message_with_downloaded_attachments_shows_path() {
+        let rt = CliRuntime::new(HarnessKind::Claude, "bot");
+        let mut ctx = msg(5, "bob", "check this");
+        ctx.files = vec![file_ref("chart.png", "image/png")];
+        ctx.attachments = vec![Attachment {
+            name: "chart.png".into(),
+            mime_type: "image/png".into(),
+            path: Some("/ws/attachments/chart.png".into()),
+        }];
+
+        let prompt = rt.build_prompt(&turn(
+            "general",
+            vec![trigger(7, "alice", "hello")],
+            vec![ctx],
+        ));
+        assert!(
+            prompt.contains(
+                "(attached image chart.png: saved at /ws/attachments/chart.png, open it to see it)"
+            ),
+            "{prompt}"
+        );
+        assert!(!prompt.contains("(image: chart.png)"), "{prompt}");
+    }
+
+    #[test]
+    fn context_message_without_attachments_shows_name_only() {
+        let rt = CliRuntime::new(HarnessKind::Claude, "bot");
+        let mut ctx = msg(5, "bob", "check this");
+        ctx.files = vec![file_ref("chart.png", "image/png")];
+        // attachments stays empty — not downloaded
+
+        let prompt = rt.build_prompt(&turn(
+            "general",
+            vec![trigger(7, "alice", "hello")],
+            vec![ctx],
+        ));
+        assert!(prompt.contains("(image: chart.png)"), "{prompt}");
+        assert!(!prompt.contains("saved at"), "{prompt}");
+    }
+
+    #[test]
+    fn context_attachments_cap_renders_mixed() {
+        let rt = CliRuntime::new(HarnessKind::Claude, "bot");
+        // Older message: has file but no attachment (beyond the cap)
+        let mut old = msg(1, "bob", "old");
+        old.files = vec![file_ref("old.png", "image/png")];
+        // Newer message: has file and attachment (within the cap)
+        let mut recent = msg(5, "carol", "recent");
+        recent.files = vec![file_ref("new.png", "image/png")];
+        recent.attachments = vec![Attachment {
+            name: "new.png".into(),
+            mime_type: "image/png".into(),
+            path: Some("/ws/attachments/new.png".into()),
+        }];
+
+        let prompt = rt.build_prompt(&turn(
+            "general",
+            vec![trigger(7, "alice", "hi")],
+            vec![old, recent],
+        ));
+        // Old message: name only
+        assert!(prompt.contains("(image: old.png)"), "{prompt}");
+        // Recent message: saved path
+        assert!(
+            prompt.contains("saved at /ws/attachments/new.png"),
+            "{prompt}"
+        );
+    }
+
+    #[test]
+    fn context_attachment_failed_download_shows_could_not() {
+        let rt = CliRuntime::new(HarnessKind::Claude, "bot");
+        let mut ctx = msg(5, "bob", "");
+        ctx.files = vec![file_ref("doc.pdf", "application/pdf")];
+        ctx.attachments = vec![Attachment {
+            name: "doc.pdf".into(),
+            mime_type: "application/pdf".into(),
+            path: None,
+        }];
+
+        let prompt = rt.build_prompt(&turn("general", vec![trigger(7, "alice", "hi")], vec![ctx]));
+        assert!(prompt.contains("could not be downloaded"), "{prompt}");
+    }
+
+    #[test]
+    fn context_partial_message_shows_downloaded_and_name_only() {
+        let rt = CliRuntime::new(HarnessKind::Claude, "bot");
+        let mut ctx = msg(5, "bob", "here are files");
+        ctx.files = vec![
+            file_ref("a.png", "image/png"),
+            file_ref("b.png", "image/png"),
+            file_ref("c.png", "image/png"),
+        ];
+        // Only first 2 downloaded (simulating cap = 2)
+        ctx.attachments = vec![
+            Attachment {
+                name: "a.png".into(),
+                mime_type: "image/png".into(),
+                path: Some("/ws/attachments/a.png".into()),
+            },
+            Attachment {
+                name: "b.png".into(),
+                mime_type: "image/png".into(),
+                path: Some("/ws/attachments/b.png".into()),
+            },
+        ];
+
+        let prompt = rt.build_prompt(&turn("general", vec![trigger(7, "alice", "hi")], vec![ctx]));
+        // Downloaded files show paths
+        assert!(
+            prompt.contains("saved at /ws/attachments/a.png"),
+            "{prompt}"
+        );
+        assert!(
+            prompt.contains("saved at /ws/attachments/b.png"),
+            "{prompt}"
+        );
+        // Third file rendered name-only
+        assert!(prompt.contains("(image: c.png)"), "{prompt}");
     }
 
     #[test]

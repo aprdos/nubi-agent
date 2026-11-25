@@ -66,6 +66,9 @@ const MAX_ATTACHMENT_BYTES: u64 = 10 * 1024 * 1024;
 
 /// How long a downloaded attachment stays in the workspace.
 const ATTACHMENT_TTL: Duration = Duration::from_secs(7 * 24 * 3600);
+
+/// At most this many files across context messages are downloaded per turn.
+const MAX_CONTEXT_ATTACHMENTS: usize = 8;
 const MANDATE_BACKOFF_START: Duration = Duration::from_secs(1);
 const MANDATE_BACKOFF_MAX: Duration = Duration::from_secs(60);
 
@@ -1020,6 +1023,27 @@ fn adhoc_skills(skills: &[Skill], mandate: Option<&Mandate>, allow_local: bool) 
         .collect()
 }
 
+/// Decide which files to fetch for context messages, newest first.
+/// Returns `(message_index, file_count)` pairs. Only the first
+/// `file_count` files of each message are fetched; the rest are
+/// rendered name-only by the harness.
+fn context_fetch_plan(context: &[BufferedMessage], cap: usize) -> Vec<(usize, usize)> {
+    let mut remaining = cap;
+    let mut plan = Vec::new();
+    for (i, msg) in context.iter().enumerate().rev() {
+        if remaining == 0 {
+            break;
+        }
+        if msg.files.is_empty() {
+            continue;
+        }
+        let take = msg.files.len().min(remaining);
+        plan.push((i, take));
+        remaining -= take;
+    }
+    plan
+}
+
 fn attachments_dir(workspace: &Path) -> PathBuf {
     workspace.join(".nubi").join("attachments")
 }
@@ -1512,6 +1536,17 @@ impl Shared {
             });
         }
         out
+    }
+
+    /// Download files on context messages so the model can open them.
+    /// Only the newest `MAX_CONTEXT_ATTACHMENTS` files across all context
+    /// messages are fetched; older ones keep their name-only rendering.
+    async fn fetch_context_attachments(&self, room_id: &str, context: &mut [BufferedMessage]) {
+        let plan = context_fetch_plan(context, MAX_CONTEXT_ATTACHMENTS);
+        for (idx, take) in plan {
+            let files = &context[idx].files[..take];
+            context[idx].attachments = self.fetch_attachments(room_id, files).await;
+        }
     }
 
     /// Record a delivered entry. False when the room already got it.
@@ -2373,6 +2408,7 @@ impl Shared {
                 let last = self.session_last_index(room_id);
                 context.retain(|m| m.global_index > last);
             }
+            self.fetch_context_attachments(room_id, &mut context).await;
             let parent_context = match &thread {
                 Some(t) => self.parent_context(room_id, t, resumed).await,
                 None => Vec::new(),
@@ -5969,5 +6005,55 @@ done
         prune_attachments(dir.path(), ATTACHMENT_TTL);
         assert!(!old.exists());
         assert!(new.exists());
+    }
+
+    fn bmsg(files: usize) -> BufferedMessage {
+        let mut m = BufferedMessage::plain(0, "", "", 0);
+        m.files = (0..files)
+            .map(|i| FileRef {
+                upload_id: format!("up_{i}"),
+                name: format!("f{i}.png"),
+                mime_type: "image/png".into(),
+                size: 100,
+            })
+            .collect();
+        m
+    }
+
+    #[test]
+    fn fetch_plan_newest_first() {
+        let ctx = vec![bmsg(2), bmsg(3), bmsg(1)];
+        let plan = context_fetch_plan(&ctx, 10);
+        // All files fit: newest (index 2) first in the plan
+        assert_eq!(plan, vec![(2, 1), (1, 3), (0, 2)]);
+    }
+
+    #[test]
+    fn fetch_plan_cap_spans_messages() {
+        let ctx = vec![bmsg(3), bmsg(3), bmsg(3)];
+        // Cap 5: newest gets 3, middle gets 2, oldest gets 0
+        let plan = context_fetch_plan(&ctx, 5);
+        assert_eq!(plan, vec![(2, 3), (1, 2)]);
+    }
+
+    #[test]
+    fn fetch_plan_partial_message() {
+        let ctx = vec![bmsg(10)];
+        let plan = context_fetch_plan(&ctx, 4);
+        assert_eq!(plan, vec![(0, 4)]);
+    }
+
+    #[test]
+    fn fetch_plan_cap_zero() {
+        let ctx = vec![bmsg(5)];
+        let plan = context_fetch_plan(&ctx, 0);
+        assert!(plan.is_empty());
+    }
+
+    #[test]
+    fn fetch_plan_skips_empty_messages() {
+        let ctx = vec![bmsg(2), bmsg(0), bmsg(3)];
+        let plan = context_fetch_plan(&ctx, 10);
+        assert_eq!(plan, vec![(2, 3), (0, 2)]);
     }
 }
