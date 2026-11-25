@@ -2374,7 +2374,7 @@ mod tests {
     fn gemini_settings_never_hold_the_token() {
         let mut s = settings();
         s.agent_id = "gemini-test-bot".into();
-        gemini::Gemini.prepare(&s, "SYS").unwrap();
+        gemini::Gemini.prepare(&s, "SYS", None).unwrap();
         let written = std::fs::read_to_string(s.state_dir().join("gemini-settings.json")).unwrap();
         assert!(written.contains("${NUBI_MCP_TOKEN}"));
         assert!(!written.contains("nubi_secret"));
@@ -2400,7 +2400,7 @@ mod tests {
         let mut s = settings();
         let ws = std::env::temp_dir().join(format!("nubi-cursor-{}", uuid::Uuid::new_v4()));
         s.workspace = Some(ws.clone());
-        cursor::Cursor.prepare(&s, "SYS").unwrap();
+        cursor::Cursor.prepare(&s, "SYS", None).unwrap();
         let written = std::fs::read_to_string(ws.join(".cursor/mcp.json")).unwrap();
         assert!(written.contains("${env:NUBI_MCP_TOKEN}"));
         let inv = cursor::Cursor.invocation(&s, "SYS", "hi", None);
@@ -2445,7 +2445,7 @@ mod tests {
         token_only_in_env(&inv);
 
         s.model = Some("sonnet".into());
-        assert!(opencode::OpenCode.prepare(&s, "SYS").is_err());
+        assert!(opencode::OpenCode.prepare(&s, "SYS", None).is_err());
     }
 
     #[test]
