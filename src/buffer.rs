@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::{Duration, Instant};
 
+use crate::runtime::Attachment;
 use crate::types::{FileRef, LogEntry};
 
 const DEFAULT_BUFFER_SIZE: usize = 100;
@@ -18,9 +19,10 @@ pub struct BufferedMessage {
     pub mentions: Vec<String>,
     /// `metadata.cc`: copied, not asked to act.
     pub cc: Vec<String>,
-    /// Names of the files it carries. Context only lists them; the files
-    /// themselves are fetched for messages the agent answers.
+    /// Names of the files it carries.
     pub files: Vec<FileRef>,
+    /// Downloaded files, populated when a trigger fires for the same turn.
+    pub attachments: Vec<Attachment>,
 }
 
 impl BufferedMessage {
@@ -35,6 +37,7 @@ impl BufferedMessage {
             mentions: vec![],
             cc: Vec::new(),
             files: vec![],
+            attachments: vec![],
         }
     }
 
@@ -47,6 +50,7 @@ impl BufferedMessage {
             mentions: entry.mention_list(),
             cc: entry.cc_list(),
             files: entry.files(),
+            attachments: vec![],
         }
     }
 }
