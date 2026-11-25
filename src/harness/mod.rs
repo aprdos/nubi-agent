@@ -76,7 +76,7 @@ pub const DEFAULT_TURN_TIMEOUT: Duration = Duration::from_secs(900);
 
 /// Roughly how much room history goes into a prompt, in characters (about
 /// four per token). The newest messages win.
-pub const DEFAULT_CONTEXT_CHARS: usize = 24_000;
+pub const DEFAULT_CONTEXT_CHARS: usize = 16_000;
 
 /// Run settings shared by every harness.
 #[derive(Debug, Clone)]
@@ -267,8 +267,14 @@ pub trait Harness: Send + Sync {
     }
 
     /// Write whatever config this CLI needs before the first run. Called once,
-    /// with the final system prompt.
-    fn prepare(&self, _settings: &Settings, _system_prompt: &str) -> anyhow::Result<()> {
+    /// with the final system prompt. `mandate_hash` is the K0 claim the MCP
+    /// server can use to skip a redundant `nubi_get_mandate`.
+    fn prepare(
+        &self,
+        _settings: &Settings,
+        _system_prompt: &str,
+        _mandate_hash: Option<&str>,
+    ) -> anyhow::Result<()> {
         Ok(())
     }
 
@@ -863,8 +869,9 @@ impl CliRuntime {
     /// again whenever the skills change: some CLIs (Gemini, OpenCode) read
     /// the prompt from a file written here rather than from each invocation.
     fn prepare_harness(&self) -> anyhow::Result<()> {
+        let (prompt, hash) = self.system_prompt_and_hash();
         self.harness
-            .prepare(&self.settings, &self.build_system_prompt())?;
+            .prepare(&self.settings, &prompt, hash.as_deref())?;
         self.prepared.store(true, Ordering::SeqCst);
         Ok(())
     }
@@ -1558,8 +1565,12 @@ impl AgentRuntime for CliRuntime {
         // run cannot pick up the new prompt before it is on disk.
         let mut skills = self.skills.write().unwrap();
         if self.prepared.load(Ordering::SeqCst) {
-            self.harness
-                .prepare(&self.settings, &self.render_system_prompt(&next))?;
+            let hash = next.mandate.as_ref().map(Mandate::computed_hash);
+            self.harness.prepare(
+                &self.settings,
+                &self.render_system_prompt(&next),
+                hash.as_deref(),
+            )?;
         }
         *skills = next;
         Ok(())
@@ -1995,6 +2006,41 @@ mod tests {
     }
 
     #[test]
+    fn claude_disallowed_tools_carries_exact_list() {
+        let inv = claude::Claude.invocation(&settings(), "SYS", "hi", None);
+        let flag = inv
+            .args
+            .iter()
+            .find(|a| a.starts_with("--disallowedTools="))
+            .expect("--disallowedTools flag must be present");
+        let tools: std::collections::HashSet<&str> = flag
+            .strip_prefix("--disallowedTools=")
+            .unwrap()
+            .split(',')
+            .collect();
+        // Host-only tools the agent must never call.
+        for t in [
+            "SendMessage",
+            "ListAgents",
+            "Workflow",
+            "ScheduleWakeup",
+            "CronCreate",
+            "CronDelete",
+            "CronList",
+            "EnterWorktree",
+            "ExitWorktree",
+            "ReportFindings",
+            "NotebookEdit",
+        ] {
+            assert!(tools.contains(t), "{t} must be disallowed");
+        }
+        // Tools the agent needs — must NOT be disallowed.
+        for t in ["Edit", "TaskStop", "Read", "Write", "Bash", "WebFetch"] {
+            assert!(!tools.contains(t), "{t} must stay allowed");
+        }
+    }
+
+    #[test]
     fn claude_compaction_window_reaches_live_sessions_too() {
         // The percentage alone is ignored by Claude Code, so both go out
         // together, on per-turn and live invocations alike.
@@ -2328,7 +2374,7 @@ mod tests {
     fn gemini_settings_never_hold_the_token() {
         let mut s = settings();
         s.agent_id = "gemini-test-bot".into();
-        gemini::Gemini.prepare(&s, "SYS").unwrap();
+        gemini::Gemini.prepare(&s, "SYS", None).unwrap();
         let written = std::fs::read_to_string(s.state_dir().join("gemini-settings.json")).unwrap();
         assert!(written.contains("${NUBI_MCP_TOKEN}"));
         assert!(!written.contains("nubi_secret"));
@@ -2354,7 +2400,7 @@ mod tests {
         let mut s = settings();
         let ws = std::env::temp_dir().join(format!("nubi-cursor-{}", uuid::Uuid::new_v4()));
         s.workspace = Some(ws.clone());
-        cursor::Cursor.prepare(&s, "SYS").unwrap();
+        cursor::Cursor.prepare(&s, "SYS", None).unwrap();
         let written = std::fs::read_to_string(ws.join(".cursor/mcp.json")).unwrap();
         assert!(written.contains("${env:NUBI_MCP_TOKEN}"));
         let inv = cursor::Cursor.invocation(&s, "SYS", "hi", None);
@@ -2399,7 +2445,7 @@ mod tests {
         token_only_in_env(&inv);
 
         s.model = Some("sonnet".into());
-        assert!(opencode::OpenCode.prepare(&s, "SYS").is_err());
+        assert!(opencode::OpenCode.prepare(&s, "SYS", None).is_err());
     }
 
     #[test]
@@ -2792,7 +2838,12 @@ mod tests {
         fn memory_file(&self) -> &'static str {
             "MEMORY.md"
         }
-        fn prepare(&self, _settings: &Settings, system_prompt: &str) -> anyhow::Result<()> {
+        fn prepare(
+            &self,
+            _settings: &Settings,
+            system_prompt: &str,
+            _mandate_hash: Option<&str>,
+        ) -> anyhow::Result<()> {
             if self.fail.load(Ordering::SeqCst) {
                 anyhow::bail!("disk full");
             }

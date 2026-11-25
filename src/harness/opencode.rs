@@ -87,7 +87,12 @@ impl Harness for OpenCode {
         true
     }
 
-    fn prepare(&self, settings: &Settings, system_prompt: &str) -> anyhow::Result<()> {
+    fn prepare(
+        &self,
+        settings: &Settings,
+        system_prompt: &str,
+        _mandate_hash: Option<&str>,
+    ) -> anyhow::Result<()> {
         let has_provider = settings.model.as_deref().is_some_and(|m| m.contains('/'));
         if (settings.llm_base_url.is_some() || settings.llm_api_key.is_some()) && !has_provider {
             anyhow::bail!(

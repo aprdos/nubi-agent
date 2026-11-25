@@ -4,6 +4,14 @@ use std::path::{Path, PathBuf};
 use super::{write_private, Harness, Invocation, OutputWatch, Parsed, Settings, REPLY_SCHEMA};
 use crate::runtime::{Session, TokenUsage};
 
+/// Tools the agent must never call: they are either host-only (the agent
+/// runtime manages them) or cannot work inside a headless `-p` run.
+const DISALLOWED_TOOLS: &str = "\
+    SendMessage,ListAgents,Workflow,ScheduleWakeup,\
+    CronCreate,CronDelete,CronList,\
+    EnterWorktree,ExitWorktree,\
+    ReportFindings,NotebookEdit";
+
 /// Anthropic Claude Code: `claude -p`.
 pub struct Claude;
 
@@ -52,6 +60,7 @@ impl Claude {
                 // variadic flag from swallowing the next argument.
                 .arg("--allowedTools=mcp__nubi");
         }
+        inv.arg(format!("--disallowedTools={DISALLOWED_TOOLS}"));
         if let Some(pct) = settings.compact_at_pct {
             // Claude Code's own auto-compaction, as a share of the context
             // window; the default waits until the window is nearly full.
@@ -124,14 +133,24 @@ impl Harness for Claude {
         Some(workspace.join(".claude").join("skills"))
     }
 
-    fn prepare(&self, settings: &Settings, _system_prompt: &str) -> anyhow::Result<()> {
+    fn prepare(
+        &self,
+        settings: &Settings,
+        _system_prompt: &str,
+        mandate_hash: Option<&str>,
+    ) -> anyhow::Result<()> {
         if let Some(ref mcp) = settings.mcp {
+            let mut headers =
+                serde_json::json!({ "Authorization": format!("Bearer {}", mcp.token) });
+            if let Some(hash) = mandate_hash {
+                headers["X-Nubi-Mandate-Hash"] = serde_json::Value::String(hash.to_string());
+            }
             let config = serde_json::json!({
                 "mcpServers": {
                     "nubi": {
                         "type": "http",
                         "url": mcp.url,
-                        "headers": { "Authorization": format!("Bearer {}", mcp.token) }
+                        "headers": headers
                     }
                 }
             });
@@ -438,4 +457,63 @@ pub(super) fn add_usage(total: &mut TokenUsage, u: &TokenUsage) {
     add(&mut total.output, u.output);
     add(&mut total.cache_read, u.cache_read);
     add(&mut total.cache_write, u.cache_write);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::harness::McpServer;
+    use std::path::PathBuf;
+
+    fn test_settings(workspace: PathBuf) -> Settings {
+        Settings {
+            agent_id: "test-agent".to_string(),
+            mcp: Some(McpServer {
+                url: "http://localhost:8089/mcp".to_string(),
+                token: "nubi_test_token".to_string(),
+            }),
+            workspace: Some(workspace),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn prepare_writes_mandate_hash_header_when_present() {
+        let dir = tempfile::tempdir().unwrap();
+        let settings = test_settings(dir.path().to_path_buf());
+        std::fs::create_dir_all(settings.state_dir()).unwrap();
+
+        Claude
+            .prepare(&settings, "SYS", Some("sha256:abc"))
+            .unwrap();
+
+        let path = Claude::mcp_config_path(&settings);
+        let config: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+        let headers = &config["mcpServers"]["nubi"]["headers"];
+        assert_eq!(headers["X-Nubi-Mandate-Hash"].as_str(), Some("sha256:abc"),);
+        assert!(headers["Authorization"]
+            .as_str()
+            .unwrap()
+            .starts_with("Bearer "),);
+    }
+
+    #[test]
+    fn prepare_omits_mandate_hash_header_when_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let settings = test_settings(dir.path().to_path_buf());
+        std::fs::create_dir_all(settings.state_dir()).unwrap();
+
+        Claude.prepare(&settings, "SYS", None).unwrap();
+
+        let path = Claude::mcp_config_path(&settings);
+        let config: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+        let headers = &config["mcpServers"]["nubi"]["headers"];
+        assert!(headers["X-Nubi-Mandate-Hash"].is_null());
+        assert!(headers["Authorization"]
+            .as_str()
+            .unwrap()
+            .starts_with("Bearer "),);
+    }
 }

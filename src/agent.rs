@@ -47,7 +47,7 @@ const SESSION_MAX_IDLE: Duration = Duration::from_secs(2 * 3600);
 const JOURNAL_LINES: usize = 5;
 
 /// How many lines [Your other conversations] holds, running turns included.
-const ELSEWHERE_LINES: usize = 8;
+const ELSEWHERE_LINES: usize = 4;
 
 /// How far back recent turns in other rooms count: the thread/parent family
 /// a day, unrelated rooms an hour.

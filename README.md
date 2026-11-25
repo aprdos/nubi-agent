@@ -155,11 +155,11 @@ nubi-agent --url http://localhost:9099 --token nubi_xxx \
 | `--llm-base-url` | `NUBI_LLM_BASE_URL` | — | LLM API the CLI talks to (`ANTHROPIC_BASE_URL` for Claude Code) |
 | `--llm-key` | `NUBI_LLM_KEY` | — | API key for that LLM API |
 | `--llm-provider` | `NUBI_LLM_PROVIDER` | read off the base URL | Who serves the model, recorded with each reply's token usage |
-| `--context-size` | — | `30` | Most recent messages as context (the newest also win a ~24k character budget) |
+| `--context-size` | — | `30` | Most recent messages as context (the newest also win a ~16k character budget) |
 | `--rate-limit-ms` | — | `5000` | Cooldown per room |
 | `--heartbeat-secs` | — | `5` | Typing-indicator refresh interval while a turn runs (0 = set once) |
 | `--compact-at-pct` | `NUBI_COMPACT_AT_PCT` | `50` | Compact the CLI's conversation at this share of the context window (Claude Code; 0 = CLI default) |
-| `--compact-window` | `NUBI_COMPACT_WINDOW` | `200000` | Context window, in tokens, that compaction is measured against; Claude Code ignores `--compact-at-pct` without one (Claude Code; 0 = CLI default) |
+| `--compact-window` | `NUBI_COMPACT_WINDOW` | unset (auto) | Context window, in tokens; unset = Models API lookup capped at 200k, explicit N = used as-is, 0 = compaction off (Claude Code) |
 | `--tool-search` | `NUBI_TOOL_SEARCH` | off | Keep Claude Code's tool search on behind `--llm-base-url`, so tool definitions are not sent with every model call. Only for a gateway that passes `tool_reference` blocks through (the Anthropic API does, a Kiro gateway does not) |
 | `--turn-timeout-secs` | `NUBI_TURN_TIMEOUT_SECS` | `900` | Kill a run that takes longer and tell the room |
 | `--max-parallel-turns` | `NUBI_MAX_PARALLEL_TURNS` | `1` | Turns running at once across rooms; 1 answers in arrival order |
