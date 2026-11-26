@@ -235,7 +235,7 @@ struct Args {
 
     /// The context window, in tokens, that compaction is measured against
     /// (Claude Code only). Unset: looked up from the Models API at startup,
-    /// capped at 200k. Explicit N: used as-is, uncapped. 0: compaction off.
+    /// fallback 200k if unreachable. Explicit N: used as-is. 0: compaction off.
     #[arg(long, env = "NUBI_COMPACT_WINDOW", help_heading = "Tuning")]
     compact_window: Option<u32>,
 
@@ -341,8 +341,6 @@ fn run_hook(argv: Vec<std::ffi::OsString>) -> i32 {
 }
 
 const COMPACT_WINDOW_FALLBACK: u32 = 200_000;
-// Temporary until WS-M re-measure; explicit env bypasses.
-const COMPACT_WINDOW_CAP: u32 = 200_000;
 
 async fn lookup_model_window(base_url: &str, model: &str, api_key: Option<&str>) -> Option<u32> {
     let url = format!("{}/v1/models/{}", base_url.trim_end_matches('/'), model);
@@ -403,9 +401,9 @@ async fn resolve_compact_window(args: &Args) -> Option<u32> {
         primary
     };
     let w = window.unwrap_or(COMPACT_WINDOW_FALLBACK);
-    let capped = w.min(COMPACT_WINDOW_CAP);
-    eprintln!("[nubi-agent] compact window: {capped} (api: {w}, cap: {COMPACT_WINDOW_CAP})");
-    Some(capped)
+    let source = if window.is_some() { "api" } else { "fallback" };
+    eprintln!("[nubi-agent] compact window: {w} ({source})");
+    Some(w)
 }
 
 #[tokio::main]
@@ -578,7 +576,7 @@ fn infer_provider(base_url: Option<&str>, harness: HarnessKind) -> String {
 mod tests {
     use super::HarnessKind;
     use super::{default_mcp_url, infer_provider, lookup_model_window, resolve_compact_window};
-    use super::{Args, COMPACT_WINDOW_CAP, COMPACT_WINDOW_FALLBACK, HOSTED_ENGINE};
+    use super::{Args, COMPACT_WINDOW_FALLBACK, HOSTED_ENGINE};
     use clap::{CommandFactory, Parser};
 
     #[test]
@@ -836,7 +834,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn resolve_caps_large_api_window() {
+    async fn resolve_large_api_window_passes_through() {
         let url = mock_models_api(Some(1_000_000)).await;
         let args = Args::try_parse_from([
             "nubi-agent",
@@ -848,14 +846,11 @@ mod tests {
             "claude-sonnet-4-20250514",
         ])
         .unwrap();
-        assert_eq!(
-            resolve_compact_window(&args).await,
-            Some(COMPACT_WINDOW_CAP)
-        );
+        assert_eq!(resolve_compact_window(&args).await, Some(1_000_000));
     }
 
     #[tokio::test]
-    async fn resolve_api_below_cap_passes_through() {
+    async fn resolve_small_api_window_passes_through() {
         let url = mock_models_api(Some(100_000)).await;
         let args = Args::try_parse_from([
             "nubi-agent",
@@ -871,7 +866,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn resolve_explicit_bypasses_cap() {
+    async fn resolve_explicit_used_as_is() {
         let args = Args::try_parse_from([
             "nubi-agent",
             "--token",
